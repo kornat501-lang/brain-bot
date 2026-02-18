@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-🧠 МОЗГ ИЗ БУДУЩЕГО 3.0
+🧠 УМНОЕ ЗДОРОВЬЕ ДЛЯ ТЕБЯ
 Telegram бот для циркадной синхронизации и здоровья мозга
 
 ЧАТ 6: Умная система отслеживания факторов сна
@@ -4943,6 +4943,8 @@ async def generate_weekly_report(telegram_id: int) -> str:
         vo2_diff = chrono_age - vo2max_data[1]
         emoji = "🟢" if vo2_diff >= 0 else "🔴"
         report += f"   🏃 По VO2max: {vo2max_data[1]} лет ({vo2_diff:+d}) {emoji}\n"
+        # ПОПРАВКА #132: Напоминание о погрешности
+        report += f"   _(погрешность устройства: см. меню VO2max)_\n"
     
     # Общий
     if hrv_bio_age and vo2max_data:
@@ -5373,7 +5375,7 @@ async def calculate_monthly_bio_age(telegram_id: int, data_type: str = "current"
         return None
     
     age_group = user.get("age_group", "30-39")
-    age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60+": 65}
+    age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
     passport_age = age_map.get(age_group, 40)
     
     # Упрощённый расчёт биовозраста на основе штрафов
@@ -5521,7 +5523,7 @@ async def generate_monthly_report(telegram_id: int) -> str:
     bio_age_current = await calculate_monthly_bio_age(telegram_id, "current")
     
     age_group = user.get("age_group", "30-39")
-    age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60+": 65}
+    age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
     passport_age = age_map.get(age_group, 40)
     
     # Формируем отчёт
@@ -5915,6 +5917,8 @@ class MorningStates(StatesGroup):
     waiting_bp_systolic = State()
     waiting_bp_diastolic = State()
     waiting_bp_pulse = State()
+    # ПОПРАВКА #134: HRV в утреннем чекине
+    waiting_hrv_rmssd = State()
 
 
 class EveningStates(StatesGroup):
@@ -17626,13 +17630,13 @@ SYNDROME_PROTOCOLS = {
 def detect_apathy_syndrome(user_data: dict) -> dict:
     """Определяет синдром "Апатичный бизнесмен" """
     
-    energy_score = user_data.get('energy_score', 5)
+    energy_score = user_data.get('energy_level') or user_data.get('energy_score', 5)
     if energy_score > 10:
-        energy_score = energy_score / 10  # Нормализация если 0-100
+        energy_score = energy_score / 10
     
     ahs_score = user_data.get('ahs_total', 0) or user_data.get('ahs_stage', 1) * 10
     hpa_stage = user_data.get('hpa_stage', 1)
-    pss_score = user_data.get('pss_score', 0) or user_data.get('pss_total', 0)
+    pss_score = user_data.get('pss_total') or user_data.get('pss_score', 0)
     
     # ОСНОВНЫЕ КРИТЕРИИ
     main_criteria = 0
@@ -17672,9 +17676,10 @@ def detect_apathy_syndrome(user_data: dict) -> dict:
 def detect_cognitive_syndrome(user_data: dict) -> dict:
     """Определяет синдром "Когнитивный спад" """
     
-    fog_score = user_data.get('fog_score', 0)
-    if fog_score > 10:
-        fog_score = fog_score / 10
+    fog_score = user_data.get('brain_fog_level') or user_data.get('fog_score', 0)
+    # brain_fog_level (1-10) — приоритет, fog_score (1-5) — legacy
+    if fog_score <= 5 and fog_score > 0:
+        fog_score = fog_score * 2  # конвертация 1-5 → 2-10
     
     sleep_score = user_data.get('sleep_score', 30)
     age_group = user_data.get('age_group', '30-39')
@@ -17718,7 +17723,7 @@ def detect_cognitive_syndrome(user_data: dict) -> dict:
 def detect_stress_bomb_syndrome(user_data: dict) -> dict:
     """Определяет синдром "Стресс-бомба" """
     
-    pss_score = user_data.get('pss_score', 0) or user_data.get('pss_total', 0)
+    pss_score = user_data.get('pss_total') or user_data.get('pss_score', 0)
     hpa_stage = user_data.get('hpa_stage', 1)
     ahs_score = user_data.get('ahs_total', 0) or hpa_stage * 10
     sleep_score = user_data.get('sleep_score', 30)
@@ -17762,7 +17767,7 @@ def detect_inflammation_syndrome(user_data: dict) -> dict:
     """Определяет синдром "Хроническое воспаление" """
     
     # Симптомы воспаления
-    energy_score = user_data.get('energy_score', 5)
+    energy_score = user_data.get('energy_level') or user_data.get('energy_score', 5)
     if energy_score > 10:
         energy_score = energy_score / 10
     
@@ -17788,7 +17793,7 @@ def detect_inflammation_syndrome(user_data: dict) -> dict:
     
     if user_data.get('sleep_score', 30) < 20:
         support_criteria += 1
-    if user_data.get('pss_score', 0) >= 20:
+    if (user_data.get('pss_total') or user_data.get('pss_score', 0)) >= 20:
         support_criteria += 1
     
     total_score = (main_criteria * 2) + support_criteria
@@ -18498,9 +18503,9 @@ def calculate_sed_index(user_data: dict) -> dict:
     Формула: (E_norm + БГС_norm + К_norm + С_norm) / 4 × 100
     """
     # Энергия (1-5 или 1-10)
-    energy = user_data.get('energy_score') or user_data.get('energy_level', 5)
-    if energy > 5:  # Если шкала 1-10, конвертируем
-        energy = energy / 2
+    energy = user_data.get('energy_level') or user_data.get('energy_score', 5)
+    if energy > 5:  # Шкала 1-10 → конвертация в 1-5
+        energy = round((energy - 1) / 9 * 4 + 1)
     
     energy_norm_map = {5: 1.0, 4: 0.8, 3: 0.6, 2: 0.4, 1: 0.2}
     e_norm = energy_norm_map.get(int(energy), 0.6)
@@ -18806,9 +18811,9 @@ def calculate_sgd_index(user_data: dict) -> dict:
         l_norm = 0.15
     
     # Энергия утром (1-5 или 1-10)
-    energy = user_data.get('energy_score') or user_data.get('energy_level', 5)
-    if energy > 5:
-        energy = energy / 2
+    energy = user_data.get('energy_level') or user_data.get('energy_score', 5)
+    if energy > 5:  # Шкала 1-10 → конвертация в 1-5
+        energy = round((energy - 1) / 9 * 4 + 1)
     
     energy_norm_map = {5: 1.0, 4: 0.8, 3: 0.55, 2: 0.35, 1: 0.15}
     e_norm = energy_norm_map.get(int(energy), 0.55)
@@ -19991,13 +19996,12 @@ def get_menu_keyboard(onboarding_phase: int = 0, current_mode: str = "home"):
 # ═══════════════════════════════════════════════════════════════
 
 def get_day_menu_keyboard():
-    """Подменю 'Мой день' — ежедневные действия + кнопка Выходной"""
+    """ПОПРАВКА #135: Подменю 'Мой день' — ежедневные действия"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌅 Утренний чек-ин", callback_data="morning_checkin")],
         [InlineKeyboardButton(text="☀️ Дневной чек-ин", callback_data="day_checkin")],
         [InlineKeyboardButton(text="🌙 Вечерний чек-ин", callback_data="evening_checkin")],
         [InlineKeyboardButton(text="📋 Мои задания", callback_data="my_tasks")],
-        [InlineKeyboardButton(text="📊 Недельный отчёт", callback_data="weekly_report")],
         [
             InlineKeyboardButton(text="🌴 Выходной", callback_data="holiday_button"),
             InlineKeyboardButton(text="🆘 SOS", callback_data="sos_menu"),
@@ -20007,14 +20011,14 @@ def get_day_menu_keyboard():
 
 
 def get_diagnosis_menu_keyboard():
-    """Подменю 'Диагностика' — все тесты — ПОПРАВКА #126: добавлен Тест Состояний"""
-    # ПОПРАВКА #122: Это статическая версия, для динамической используйте get_diagnosis_menu_with_locks
+    """ПОПРАВКА #135: Подменю 'Диагностика' — все тесты и замеры"""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Карта состояния", callback_data="integrated_assessment")],
         [InlineKeyboardButton(text="📝 Мини-тест (5 мин)", callback_data="mini_test_start")],
-        [InlineKeyboardButton(text="🧪 Месячные тесты", callback_data="monthly_tests_menu")],  # ПОПРАВКА #122
+        [InlineKeyboardButton(text="🧪 Месячные тесты", callback_data="monthly_tests_menu")],
         [InlineKeyboardButton(text="🕐 Тест хронотипа", callback_data="chronotype_test_menu")],
         [InlineKeyboardButton(text="🎯 Тест Состояний", callback_data="syndrome_questions_start")],
+        [InlineKeyboardButton(text="❤️ HRV (вариабельность)", callback_data="hrv_menu")],
+        [InlineKeyboardButton(text="🏃 VO2max", callback_data="vo2max_menu")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_menu")]
     ])
 
@@ -20032,26 +20036,26 @@ def get_practices_menu_keyboard():
 
 
 def get_progress_menu_keyboard():
-    """Подменю 'Мой прогресс' — трекеры, достижения"""
+    """ПОПРАВКА #135: Подменю 'Мой прогресс' — отчёты, трекеры, достижения"""
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Сводный отчёт", callback_data="summary_report")],
+        [InlineKeyboardButton(text="📊 Недельный отчёт", callback_data="weekly_report")],
         [InlineKeyboardButton(text="📈 Ежемесячный отчёт", callback_data="monthly_report")],
-        [InlineKeyboardButton(text="📊 Карта состояния", callback_data="integrated_assessment")],
-        [InlineKeyboardButton(text="📸 Фото прогресса", callback_data="progress_photos_menu")],  # ПОПРАВКА #123
+        [InlineKeyboardButton(text="🧬 Биовозраст", callback_data="bio_age_menu")],
         [InlineKeyboardButton(text="🪞 Трекер изменений", callback_data="rejuvenation_menu")],
         [InlineKeyboardButton(text="🧠 Когнитивный трекер", callback_data="cognitive_menu")],
-        [InlineKeyboardButton(text="🧬 Биовозраст", callback_data="bio_age_menu")],
+        [InlineKeyboardButton(text="📸 Фото прогресса", callback_data="progress_photos_menu")],
         [InlineKeyboardButton(text="🏆 Достижения", callback_data="milestones_menu")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_menu")]
     ])
 
 
 def get_advanced_menu_keyboard():
-    """Подменю 'Продвинутое' — HRV, генетика"""
+    """ПОПРАВКА #135: Подменю 'Продвинутое' — персонализация"""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❤️ HRV (вариабельность пульса)", callback_data="hrv_menu")],
-        [InlineKeyboardButton(text="🏃 VO2max", callback_data="vo2max_menu")],
-        [InlineKeyboardButton(text="🧬 Генетика", callback_data="genetics_menu")],
-        [InlineKeyboardButton(text="💚 О программе", callback_data="about_program")],
+        [InlineKeyboardButton(text="🧬 Генетика (13 генов)", callback_data="genetics_menu")],
+        [InlineKeyboardButton(text="🧬 Эпигенетика", callback_data="epigenetics_menu")],
+        [InlineKeyboardButton(text="🧘 Персональные медитации", callback_data="meditation_menu")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_menu")]
     ])
 
@@ -20837,13 +20841,10 @@ def get_scenario_keyboard():
 
 
 def get_settings_keyboard():
-    """Клавиатура настроек — ПОПРАВКА #118: добавлена генетика + ОЧЕРЕДЬ 3: цикл"""
+    """ПОПРАВКА #135: Клавиатура настроек — конфигурация бота"""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧬 Генетическая персонализация", callback_data="genetics_menu")],
+        [InlineKeyboardButton(text="💚 О программе", callback_data="about_program")],
         [InlineKeyboardButton(text="🩸 Женский цикл", callback_data="cycle_settings")],
-        [InlineKeyboardButton(text="🎯 Цель сна", callback_data="set_sleep_goal")],
-        [InlineKeyboardButton(text="🌅 Утреннее время", callback_data="set_morning")],
-        [InlineKeyboardButton(text="🌙 Вечернее время", callback_data="set_evening")],
         [InlineKeyboardButton(text="🔔 Вкл/Выкл напоминания", callback_data="toggle_reminders")],
         [InlineKeyboardButton(text="📊 Научные данные", callback_data="toggle_research_consent")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
@@ -24480,19 +24481,16 @@ async def show_advanced_menu(callback: CallbackQuery):
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-Инструменты для глубокого анализа:
+Персонализация на основе ваших данных:
 
-❤️ *HRV* — баланс нервной системы
-🏃 *VO2max* — кардио-резерв
-🧬 *Генетика* — персонализация
+🧬 *Генетика* — 13 генов, влияющих на
+    ванны, добавки, стресс-протокол
 
-━━━━━━━━━━━━━━━━━━━━━
+🧬 *Эпигенетика* — метилирование, теломеры,
+    биологический возраст клеток
 
-⚠️ Для начала достаточно 
-базовых тестов и практик.
-
-Продвинутые инструменты — 
-когда освоите базу."""
+🧘 *Медитации* — подобраны под ваш
+    генотип COMT и текущее состояние"""
 
     await callback.message.edit_text(
         text,
@@ -24501,10 +24499,45 @@ async def show_advanced_menu(callback: CallbackQuery):
     )
 
 
+# ПОПРАВКА #135: Заглушка модуля медитаций
+@router.callback_query(F.data == "meditation_menu")
+async def meditation_menu_handler(callback: CallbackQuery):
+    """Персональные медитации — в разработке"""
+    await callback.answer()
+    
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    
+    text = f"""🧘 *{name}, ПЕРСОНАЛЬНЫЕ МЕДИТАЦИИ*
 
-# ═══════════════════════════════════════════════════════════════
-# ПОПРАВКА #138: МОДУЛЬ ДЫХАТЕЛЬНЫХ ПРАКТИК (АУДИО)
-# ═══════════════════════════════════════════════════════════════
+━━━━━━━━━━━━━━━━━━━━━
+
+🔧 *Модуль в разработке*
+
+Здесь будут медитации, подобранные
+под ваш генотип COMT и текущее
+состояние:
+
+🟢 *COMT быстрый* → фокус-медитации
+🔴 *COMT медленный* → calming-практики
+🟡 *Средний* → гибкий набор
+
+━━━━━━━━━━━━━━━━━━━━━
+
+А пока — дыхательные практики
+доступны в меню *Мои практики* 🌬"""
+    
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌬 Дыхательные практики", callback_data="breathing_menu")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="advanced_menu")]
+        ])
+    )
+
+
+
 
 # ── Вспомогательные функции ──
 
@@ -26289,6 +26322,7 @@ async def sos_main_menu(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🤯 Перегрузка / не могу думать", callback_data="sos_overload")],
             [InlineKeyboardButton(text="🍫 Тянет заесть / выпить", callback_data="sos_craving")],
             [InlineKeyboardButton(text="🤕 Голова болит", callback_data="sos_headache")],
+            [InlineKeyboardButton(text="😴 Не могу уснуть", callback_data="sos_insomnia")],
             [InlineKeyboardButton(text="⚡ Быстрая техника (1-2 мин)", callback_data="sos_quick")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
         ])
@@ -26608,7 +26642,6 @@ async def sos_help_needed(callback: CallbackQuery, state: FSMContext):
 8-800-2000-122 (бесплатно, 24/7)
 
 Там выслушают и помогут.
-Звонок анонимный.
 
 _Я буду здесь, когда вернёшься 💚_"""
 
@@ -26858,6 +26891,37 @@ async def sos_breathing_better(callback: CallbackQuery, state: FSMContext):
     text = """💙 *Отлично! Ты справился(ась).*
 
 Тревога — это просто кортизол.
+Ты только что сказал(а) телу "опасности нет".
+
+━━━━━━━━━━━━━━━━━━━━━
+
+*Что дальше:*
+├── Выпей воды
+├── Если можешь — выйди на воздух на 5 мин
+└── Вечером — ванна или магний
+
+*Ты молодец!* 💪"""
+    
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💙 Спасибо", callback_data="back_to_menu")]
+        ])
+    )
+
+
+# ПОПРАВКА #131 Баг I: Фоллбэк "Лучше" без привязки к состоянию
+# (для когерентного аудио и sos_overwhelmed, где SOSStates.after_breathing не устанавливается)
+@router.callback_query(F.data == "sos_breathing_better")
+async def sos_breathing_better_fallback(callback: CallbackQuery, state: FSMContext):
+    """Фоллбэк: стало лучше (без привязки к SOSStates)"""
+    await callback.answer()
+    await update_sos_feeling_after(callback.from_user.id, "better")
+    await state.clear()
+    
+    text = """💙 *Отлично! Дыхание помогло.*
+
 Ты только что сказал(а) телу "опасности нет".
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -27270,6 +27334,7 @@ _Сейчас — только простые действия._
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🧊 Холодная вода на лицо", callback_data="sos_overload_cold")],
+            [InlineKeyboardButton(text="🫁 Дыхание (без воды)", callback_data="sos_box_breathing")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="sos_help")]
         ])
     )
@@ -28255,9 +28320,9 @@ async def onb_process_age(callback: CallbackQuery, state: FSMContext):
     """ОНБОРДИНГ 2.0: Возраст → Рост+Вес"""
     await callback.answer()
     age_map = {
-        "onb_age_18_25": "18-25", "onb_age_26_35": "26-35",
-        "onb_age_36_45": "36-45", "onb_age_46_55": "46-55",
-        "onb_age_56_65": "56-65", "onb_age_66plus": "66+",
+        "onb_age_18_25": "18-29", "onb_age_26_35": "30-39",
+        "onb_age_36_45": "40-49", "onb_age_46_55": "50-59",
+        "onb_age_56_65": "60-69", "onb_age_66plus": "70+",
     }
     age = age_map.get(callback.data, "30-39")
     await state.update_data(age_group=age)
@@ -30133,8 +30198,8 @@ async def morning_breakfast(callback: CallbackQuery, state: FSMContext):
     has_tonometer = user.get("has_tonometer", 0) if user else 0
     
     if has_tonometer == -1:
-        # Уже сказал "нет тонометра" → пропускаем
-        await _complete_morning_checkin(callback, state)
+        # Уже сказал "нет тонометра" → спрашиваем HRV
+        await _ask_morning_hrv(callback, state)
         return
     
     if has_tonometer == 1:
@@ -30167,7 +30232,7 @@ async def morning_bp_no_tonometer(callback: CallbackQuery, state: FSMContext):
         await callback.message.delete()
     except:
         pass
-    await _complete_morning_checkin(callback, state)
+    await _ask_morning_hrv(callback, state)
 
 
 @router.callback_query(F.data == "morning_bp_skip")
@@ -30178,7 +30243,7 @@ async def morning_bp_skip(callback: CallbackQuery, state: FSMContext):
         await callback.message.delete()
     except:
         pass
-    await _complete_morning_checkin(callback, state)
+    await _ask_morning_hrv(callback, state)
 
 
 @router.callback_query(F.data == "morning_bp_enter")
@@ -30311,8 +30376,209 @@ async def morning_bp_pulse(message: Message, state: FSMContext):
     if bp_warning:
         await message.answer(bp_warning)
     
-    # Завершаем чек-ин (используем callback-подобный вызов)
+    # ПОПРАВКА #134: Спрашиваем HRV перед завершением
+    await _ask_morning_hrv_from_message(message, state)
+
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #134: HRV В УТРЕННЕМ ЧЕК-ИНЕ
+# ═══════════════════════════════════════════════════════════════
+
+async def _ask_morning_hrv(callback, state: FSMContext):
+    """Спросить про HRV после давления (callback-контекст)"""
+    user = await get_user(callback.from_user.id)
+    has_hrv = user.get("has_hrv_device", 0) if user else 0
+    
+    if has_hrv == -1:
+        await _complete_morning_checkin(callback, state)
+        return
+    
+    if has_hrv == 1:
+        await callback.message.answer(
+            "❤️ Измерил(а) HRV сегодня утром?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Ввести RMSSD", callback_data="morning_hrv_manual")],
+                [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="morning_hrv_skip")]
+            ])
+        )
+    else:
+        await callback.message.answer(
+            "❤️ *HRV — вариабельность пульса*\n\n"
+            "Утро после пробуждения — лучшее время для замера.\n"
+            "Если есть Polar H10 или часы с HRV:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Ввести RMSSD", callback_data="morning_hrv_manual")],
+                [InlineKeyboardButton(text="🚫 Нет HRV-устройства", callback_data="morning_hrv_no_device")],
+                [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="morning_hrv_skip")]
+            ])
+        )
+
+
+async def _ask_morning_hrv_from_message(message: Message, state: FSMContext):
+    """Спросить про HRV после давления (message-контекст)"""
+    user = await get_user(message.from_user.id)
+    has_hrv = user.get("has_hrv_device", 0) if user else 0
+    
+    if has_hrv == -1:
+        await _complete_morning_checkin_from_message(message, state)
+        return
+    
+    if has_hrv == 1:
+        await message.answer(
+            "❤️ Измерил(а) HRV сегодня утром?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Ввести RMSSD", callback_data="morning_hrv_manual")],
+                [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="morning_hrv_skip")]
+            ])
+        )
+    else:
+        await message.answer(
+            "❤️ *HRV — вариабельность пульса*\n\n"
+            "Утро после пробуждения — лучшее время для замера.\n"
+            "Если есть Polar H10 или часы с HRV:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Ввести RMSSD", callback_data="morning_hrv_manual")],
+                [InlineKeyboardButton(text="🚫 Нет HRV-устройства", callback_data="morning_hrv_no_device")],
+                [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="morning_hrv_skip")]
+            ])
+        )
+
+
+@router.callback_query(F.data == "morning_hrv_no_device")
+async def morning_hrv_no_device(callback: CallbackQuery, state: FSMContext):
+    """Нет HRV-устройства — запоминаем, больше не спрашиваем"""
+    await callback.answer()
+    await save_user(callback.from_user.id, {"has_hrv_device": -1})
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await _complete_morning_checkin(callback, state)
+
+
+@router.callback_query(F.data == "morning_hrv_skip")
+async def morning_hrv_skip(callback: CallbackQuery, state: FSMContext):
+    """Пропустить HRV сегодня"""
+    await callback.answer()
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await _complete_morning_checkin(callback, state)
+
+
+@router.callback_query(F.data == "morning_hrv_manual")
+async def morning_hrv_manual(callback: CallbackQuery, state: FSMContext):
+    """Ввести RMSSD вручную из утреннего чекина"""
+    await callback.answer()
+    await save_user(callback.from_user.id, {"has_hrv_device": 1})
+    
+    await callback.message.edit_text(
+        "❤️ *Введи RMSSD* (в мс)\n\n"
+        "Это главный показатель восстановления.\n"
+        "Обычно от 15 до 100+ мс.\n\n"
+        "📱 Где найти:\n"
+        "├── Polar → Ортостатический тест → RMSSD\n"
+        "├── Elite HRV → Morning Reading\n"
+        "├── Kubios → Results → RMSSD\n"
+        "└── Apple Watch → HRV (через приложение)\n\n"
+        "Введи число:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="morning_hrv_skip")]
+        ])
+    )
+    await state.set_state(MorningStates.waiting_hrv_rmssd)
+
+
+@router.message(MorningStates.waiting_hrv_rmssd)
+async def morning_hrv_got_rmssd(message: Message, state: FSMContext):
+    """Получили RMSSD → сохраняем → завершаем утренний чекин"""
+    try:
+        value = float(message.text.strip().replace(",", "."))
+        if value < 5 or value > 300:
+            await message.answer(
+                "⚠️ RMSSD обычно от 10 до 150 мс.\n"
+                "Проверь значение и введи ещё раз:"
+            )
+            return
+    except ValueError:
+        await message.answer("⚠️ Введи число! Например: 45")
+        return
+    
+    # Сохраняем в hrv_records (только RMSSD, остальное NULL)
+    today = date.today().isoformat()
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO hrv_records (telegram_id, date, time_of_day, rmssd)
+                VALUES (?, ?, 'morning', ?)
+            """, (message.from_user.id, today, value))
+            await db.commit()
+    except Exception as e:
+        print(f"❌ Ошибка сохранения HRV: {e}")
+    
+    # Обновляем baseline RMSSD
+    try:
+        await _update_hrv_rmssd_baseline(message.from_user.id, value)
+    except:
+        pass
+    
+    await state.update_data(morning_hrv_rmssd=value)
+    
+    # Простая интерпретация
+    if value >= 50:
+        emoji, text_interp = "🟢", "отличное восстановление"
+    elif value >= 30:
+        emoji, text_interp = "🟡", "нормальное восстановление"
+    elif value >= 20:
+        emoji, text_interp = "🟠", "восстановление ниже среднего"
+    else:
+        emoji, text_interp = "🔴", "низкое восстановление — мягкий день"
+    
+    await message.answer(
+        f"✅ HRV записан!\n\n"
+        f"❤️ RMSSD: {value:.0f} мс — {emoji} {text_interp}\n\n"
+        f"_Полная статистика — в меню HRV_",
+        parse_mode="Markdown"
+    )
+    
     await _complete_morning_checkin_from_message(message, state)
+
+
+async def _update_hrv_rmssd_baseline(telegram_id: int, rmssd: float):
+    """ПОПРАВКА #134: Обновить baseline HRV только по RMSSD"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT rmssd_baseline, measurements_count FROM hrv_baseline WHERE telegram_id = ?",
+            (telegram_id,)
+        )
+        existing = await cursor.fetchone()
+        
+        if existing:
+            # Пересчитываем среднее RMSSD из всех записей
+            cursor = await db.execute(
+                "SELECT AVG(rmssd), COUNT(*) FROM hrv_records WHERE telegram_id = ? AND rmssd IS NOT NULL",
+                (telegram_id,)
+            )
+            row = await cursor.fetchone()
+            if row and row[0]:
+                await db.execute("""
+                    UPDATE hrv_baseline SET
+                        rmssd_baseline = ?,
+                        measurements_count = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE telegram_id = ?
+                """, (row[0], row[1], telegram_id))
+        else:
+            await db.execute("""
+                INSERT INTO hrv_baseline (telegram_id, rmssd_baseline, measurements_count)
+                VALUES (?, ?, 1)
+            """, (telegram_id, rmssd))
+        
+        await db.commit()
 
 
 async def _complete_morning_checkin(callback, state: FSMContext):
@@ -34864,62 +35130,108 @@ async def show_detailed_analytics(callback: CallbackQuery):
 
 @router.callback_query(F.data == "about_program")
 async def about_program_handler(callback: CallbackQuery):
-    """О программе — с wellness-дисклеймером"""
+    """ПОПРАВКА #135а: О программе — описание + навигация"""
     await callback.answer()
     
-    text = """💚 *О ПРОГРАММЕ "МОЗГ ИЗ БУДУЩЕГО"*
+    text = """💚 *О ПРОГРАММЕ "УМНОЕ ЗДОРОВЬЕ ДЛЯ ТЕБЯ"*
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-*Что это:*
+Wellness-программа для восстановления
+сна, энергии и нервной системы.
 
-Wellness-программа для восстановления:
-✓ Сна и циркадных ритмов
-✓ Энергии и ясности мышления
-✓ Нервной системы и стрессоустойчивости
-
-*Автор программы:*
-Реабилитолог, инструктор ЛФК с опытом 
-восстановления здоровья через образ жизни.
+*Автор:* Реабилитолог, инструктор ЛФК
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-⚠️ *ВАЖНО ПОНИМАТЬ:*
+⚠️ *ВАЖНО:*
 
-Мы помогаем:
-✅ Наладить сон и режим
-✅ Сформировать здоровые привычки
-✅ Использовать капиллярную терапию
-✅ Отслеживать прогресс
+✅ Помогаем наладить сон, привычки,
+    капиллярную терапию, прогресс
 
-Мы НЕ:
-❌ Не ставим медицинские диагнозы
-❌ Не назначаем лечение
-❌ Не заменяем врача
+❌ Не ставим диагнозы, не назначаем
+    лечение, не заменяем врача
+
+При хронических заболеваниях или приёме
+лекарств — консультация врача обязательна.
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-Если у вас есть хронические заболевания, 
-вы принимаете лекарства или беременны — 
-проконсультируйтесь с врачом перед началом 
-любых изменений в образе жизни.
-
-При острых состояниях обращайтесь к врачу!
-
-━━━━━━━━━━━━━━━━━━━━━
-
-💚 Я Аврора, и я буду рядом на каждом 
+💚 Я Аврора, и я буду рядом на каждом
 этапе вашего пути к здоровью!"""
-    
-    keyboard = [
-        [InlineKeyboardButton(text="📊 Карта состояния", callback_data="integrated_assessment")],
-        [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
-    ]
-    
+
     await callback.message.edit_text(
         text,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📍 Где что искать", callback_data="about_navigation")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="settings")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "about_navigation")
+async def about_navigation_handler(callback: CallbackQuery):
+    """ПОПРАВКА #135а: Навигация — где что лежит в боте"""
+    await callback.answer()
+    
+    text = """📍 *ГДЕ ЧТО ИСКАТЬ*
+
+━━━━━━━━━━━━━━━━━━━━━
+
+📊 *Мой день* — ежедневные действия
+   Утренний, дневной, вечерний чек-ины.
+   Задания на сегодня. SOS-помощь.
+
+🧪 *Диагностика* — тесты и замеры
+   Мини-тест, месячные тесты, хронотип.
+   HRV и VO2max — ввод данных с часов.
+
+🛁 *Мои практики* — что применять
+   Ванны, дыхание, добавки, питание.
+   Циркадный трекинг — режим сна.
+
+📈 *Мой прогресс* — как я меняюсь
+   Сводный отчёт — полная картина.
+   Недельный и месячный отчёты.
+   Биовозраст, когнитивный трекер.
+   Фото прогресса, достижения.
+
+🔬 *Продвинутое* — персонализация
+   Генетика — 13 генов, влияющих на
+   ваши протоколы и добавки.
+   Эпигенетика и медитации.
+
+⚙️ *Настройки* — вы здесь!
+   Напоминания, женский цикл.
+
+━━━━━━━━━━━━━━━━━━━━━
+
+💡 *ПОДСКАЗКИ:*
+
+🆘 SOS — в главном меню и в "Мой день".
+    Не нужно искать — всегда рядом.
+
+❤️ HRV — утром бот сам спросит.
+    Полный ввод — Диагностика → HRV.
+
+🏃 VO2max — раз в месяц.
+    Диагностика → VO2max.
+
+🛁 Ванны — бот напомнит вечером.
+    Детали — Практики → Ванны.
+
+⏰ Режим сна — автоматический!
+    Бот сам рассчитывает по хронотипу.
+    Изменить: Практики → Циркадный трекинг."""
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💚 О программе", callback_data="about_program")],
+            [InlineKeyboardButton(text="◀️ К настройкам", callback_data="settings")]
+        ])
     )
 
 
@@ -34972,10 +35284,6 @@ async def show_settings(callback: CallbackQuery):
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-🎯 *Цель сна:* {target_bed} → {target_wake}{cycle_info}
-
-━━━━━━━━━━━━━━━━━━━━━
-
 🔔 *Напоминания:* {reminders}
 
 *Утро:*
@@ -34986,11 +35294,16 @@ async def show_settings(callback: CallbackQuery):
    🛁 Ванна: {bath_time}
    📱 Экраны: {screens_time}
    😴 Пора спать: {bedtime_rem}
+{cycle_info}
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-💡 _Времена рассчитываются 
-автоматически от цели сна_"""
+💡 _Все времена рассчитываются
+автоматически от вашего хронотипа
+и цели сна_
+
+_Изменить цель вручную:
+Практики → Циркадный трекинг_"""
 
     await callback.message.edit_text(
         text,
@@ -38577,6 +38890,56 @@ VO2MAX_NORMS_FEMALE = {
     "70+": {"poor": 16, "below": 20, "average": 26, "good": 32, "excellent": 38},
 }
 
+# ПОПРАВКА #132: Погрешность VO2max по устройствам
+# Источник: PubMed мета-анализы, Perplexity research 18.02.2026
+VO2MAX_DEVICE_ERROR = {
+    "polar_h10_fitness": 3.0,
+    "polar_watch_fitness": 4.0,
+    "garmin": 5.2,
+    "apple": 1.3,
+    "cooper": 3.0,
+    "lab": 1.0,
+    "samsung": None,
+    "coros": None,
+    "other": 5.0,
+}
+
+VO2MAX_DEVICE_NOTES = {
+    "polar_h10_fitness": "Polar H10 (грудной) + тест лёжа — лучший вариант для 55+, без нагрузки, высшая точность HR",
+    "polar_watch_fitness": "Polar часы + тест лёжа — хорошо, но оптический датчик менее точен, чем H10",
+    "garmin": "⚠️ Garmin завышает VO2max — используйте для отслеживания ДИНАМИКИ, не абсолютного значения",
+    "apple": "Apple Watch — самый точный среди массовых устройств",
+    "cooper": "Cooper Test — бесплатно, но для 55+ рекомендуем консультацию врача перед тестом",
+    "lab": "Лабораторный тест — золотой стандарт",
+    "samsung": "⚠️ Samsung — нет научной валидации, не используем для биовозраста",
+    "coros": "⚠️ COROS — нет научной валидации, не используем для биовозраста",
+    "other": "⚠️ Точность неизвестна — используйте для динамики",
+}
+
+# ПОПРАВКА #132: Красивые имена устройств для отображения
+VO2MAX_DEVICE_DISPLAY = {
+    "polar_h10_fitness": "Polar H10 нагрудный (тест лёжа)",
+    "polar_watch_fitness": "Polar часы (тест лёжа)",
+    "apple": "Apple Watch",
+    "garmin": "Garmin",
+    "samsung": "Samsung",
+    "coros": "COROS",
+    "cooper": "Cooper Test",
+    "lab": "Лаборатория",
+    "other": "Другое устройство",
+}
+
+# ПОПРАВКА #132: Маппинг старых записей → новые ключи
+LEGACY_SOURCE_MAP = {
+    "Garmin": "garmin",
+    "Polar": "polar_watch_fitness",
+    "Apple Watch": "apple",
+    "Умные часы": "other",
+    "Cooper Test": "cooper",
+    "Лаборатория": "lab",
+    "Скриншот": "other",
+}
+
 # Средние VO2max по возрастам для расчёта биовозраста
 VO2MAX_AGE_REFERENCE_MALE = {
     25: 45, 30: 43, 35: 41, 40: 39, 45: 37,
@@ -38606,19 +38969,45 @@ def get_vo2max_interpretation(value: float, age_group: str, sex: str) -> str:
         return "🔴 Нужна работа"
 
 
-def calculate_cardio_bio_age(vo2max: float, chronological_age: int, sex: str) -> int:
-    """Расчёт кардио-биологического возраста по VO2max"""
+def calculate_cardio_bio_age(vo2max: float, chronological_age: int, sex: str, 
+                              device: str = "other") -> dict:
+    """
+    ПОПРАВКА #132: Расчёт кардио-биовозраста с учётом устройства.
+    Возвращает dict с точечной оценкой и диапазоном.
+    """
     reference = VO2MAX_AGE_REFERENCE_MALE if sex == "male" else VO2MAX_AGE_REFERENCE_FEMALE
+    error = VO2MAX_DEVICE_ERROR.get(device, 5.0)
     
-    # Находим возраст, соответствующий текущему VO2max
-    bio_age = chronological_age
-    for age, norm in sorted(reference.items()):
-        if vo2max >= norm:
-            bio_age = age
-        else:
-            break
+    def _bio_age_from_vo2(value):
+        bio = chronological_age
+        for age, norm in sorted(reference.items()):
+            if value >= norm:
+                bio = age
+            else:
+                break
+        return bio
     
-    return bio_age
+    bio_age = _bio_age_from_vo2(vo2max)
+    
+    if error is not None:
+        bio_age_low = _bio_age_from_vo2(vo2max + error)
+        bio_age_high = _bio_age_from_vo2(vo2max - error)
+    else:
+        bio_age_low = None
+        bio_age_high = None
+    
+    return {
+        "bio_age": bio_age,
+        "bio_age_low": bio_age_low,
+        "bio_age_high": bio_age_high,
+        "device": device,
+        "error": error,
+        "vo2max_range": (
+            round(vo2max - error, 1) if error else None,
+            round(vo2max + error, 1) if error else None,
+        ),
+        "note": VO2MAX_DEVICE_NOTES.get(device, ""),
+    }
 
 
 def get_bio_age_interpretation(difference: int) -> str:
@@ -38711,17 +39100,59 @@ async def vo2max_how(callback: CallbackQuery):
 
 @router.callback_query(F.data == "vo2max_add")
 async def vo2max_add_start(callback: CallbackQuery, state: FSMContext):
-    """Начать добавление VO2max вручную"""
+    """ПОПРАВКА #132: Начать добавление VO2max с проверкой частоты"""
     await callback.answer()
     
+    # Проверяем дату последнего замера
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT date FROM vo2max_records WHERE telegram_id = ? ORDER BY date DESC LIMIT 1",
+            (callback.from_user.id,)
+        )
+        last = await cursor.fetchone()
+    
+    if last:
+        last_date = date.fromisoformat(last[0])
+        days_ago = (date.today() - last_date).days
+        
+        if days_ago < 25:
+            days_left = 30 - days_ago
+            await callback.message.edit_text(
+                f"📊 *Последний замер: {days_ago} дней назад*\n\n"
+                "VO2max — месячный показатель.\n"
+                "Он меняется медленно (1-2 мл/кг/мин за месяц).\n\n"
+                "Частые замеры создают \"шум\" в данных\n"
+                "и ложные тренды в графиках.\n\n"
+                f"💡 Следующий замер через ~{days_left} дней\n"
+                "будет показательнее.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✏️ Всё равно добавить", callback_data="vo2max_add_force")],
+                    [InlineKeyboardButton(text="◀️ Назад", callback_data="vo2max_menu")]
+                ])
+            )
+            return
+    
+    await _show_vo2max_input(callback, state)
+
+
+@router.callback_query(F.data == "vo2max_add_force")
+async def vo2max_add_force(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #132: Добавить VO2max досрочно (пользователь настоял)"""
+    await callback.answer()
+    await _show_vo2max_input(callback, state)
+
+
+async def _show_vo2max_input(callback, state):
+    """Показать экран ввода VO2max"""
     await callback.message.edit_text(
         "🏃 *ДОБАВИТЬ VO2max*\n\n"
         "Введите значение VO2max в мл/кг/мин.\n\n"
         "📱 *Где найти:*\n"
-        "• Garmin Connect → Статистика → VO2max\n"
-        "• Polar Flow → Тесты → Running Index\n"
-        "• Apple Health → Кардио → VO2max\n\n"
-        "Введите число (например: 42):",
+        "• Polar Flow → Тесты → Fitness Test\n"
+        "• Apple Health → Кардио → VO2max\n"
+        "• Garmin Connect → Статистика → VO2max\n\n"
+        "Введите число (например: 35):",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Отмена", callback_data="vo2max_menu")]
@@ -38736,9 +39167,49 @@ async def vo2max_add_start(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "vo2max_upload")
 async def vo2max_upload_start(callback: CallbackQuery, state: FSMContext):
-    """Начало загрузки скриншота VO2max"""
+    """ПОПРАВКА #132: Начало загрузки скриншота с проверкой частоты"""
     await callback.answer()
     
+    # Проверяем дату последнего замера
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT date FROM vo2max_records WHERE telegram_id = ? ORDER BY date DESC LIMIT 1",
+            (callback.from_user.id,)
+        )
+        last = await cursor.fetchone()
+    
+    if last:
+        last_date = date.fromisoformat(last[0])
+        days_ago = (date.today() - last_date).days
+        
+        if days_ago < 25:
+            days_left = 30 - days_ago
+            await callback.message.edit_text(
+                f"📊 *Последний замер: {days_ago} дней назад*\n\n"
+                "VO2max — месячный показатель.\n"
+                "Частые замеры создают \"шум\" в данных.\n\n"
+                f"💡 Следующий замер через ~{days_left} дней\n"
+                "будет показательнее.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📸 Всё равно загрузить", callback_data="vo2max_upload_force")],
+                    [InlineKeyboardButton(text="◀️ Назад", callback_data="vo2max_menu")]
+                ])
+            )
+            return
+    
+    await _show_vo2max_upload(callback, state)
+
+
+@router.callback_query(F.data == "vo2max_upload_force")
+async def vo2max_upload_force(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #132: Загрузить скриншот досрочно"""
+    await callback.answer()
+    await _show_vo2max_upload(callback, state)
+
+
+async def _show_vo2max_upload(callback, state):
+    """Показать экран загрузки скриншота VO2max"""
     text = """📸 *ЗАГРУЗКА VO2max СО СКРИНШОТА*
 
 Отправь скриншот из приложения часов:
@@ -38941,64 +39412,63 @@ async def vo2max_confirm_ocr(callback: CallbackQuery, state: FSMContext):
     age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
     chrono_age = age_map.get(age_group, 35)
     
-    # Рассчитываем биологический возраст
-    bio_age = calculate_cardio_bio_age(vo2max, chrono_age, sex)
-    age_diff = chrono_age - bio_age
-    
-    # Маппинг источников
-    source_map = {
-        'Garmin': 'Garmin',
-        'Polar': 'Polar',
-        'Apple': 'Apple Watch',
-        'Samsung': 'Samsung Health',
-        'Strava': 'Strava',
-        'COROS': 'COROS',
-        'Suunto': 'Suunto',
-        'Amazfit': 'Amazfit',
-    }
-    
-    # Определяем источник
-    source = 'Скриншот'
+    # ПОПРАВКА #132: Маппинг detected_source → device key
+    device_key = "other"
     if detected_source:
-        for key, value in source_map.items():
-            if key.lower() in detected_source.lower():
-                source = value
-                break
+        ds = detected_source.lower()
+        if "polar" in ds:
+            is_h10 = "h10" in ds or "chest" in ds or "нагрудн" in ds
+            device_key = "polar_h10_fitness" if is_h10 else "polar_watch_fitness"
+        elif "garmin" in ds:
+            device_key = "garmin"
+        elif "apple" in ds:
+            device_key = "apple"
+        elif "samsung" in ds:
+            device_key = "samsung"
+        elif "coros" in ds:
+            device_key = "coros"
+    
+    # Рассчитываем биологический возраст с учётом устройства
+    result_calc = calculate_cardio_bio_age(vo2max, chrono_age, sex, device=device_key)
+    bio_age = result_calc["bio_age"]
+    age_diff = chrono_age - bio_age
     
     # Сохраняем
     await save_vo2max_record(
         telegram_id=callback.from_user.id,
         vo2max=vo2max,
-        source=source,
-        bio_age_cardio=bio_age
+        source=device_key,
+        bio_age_cardio=bio_age if result_calc["error"] is not None else None
     )
     
     # Формируем ответ
     mets = vo2max / 3.5
+    device_name = VO2MAX_DEVICE_DISPLAY.get(device_key, device_key)
     
-    if age_diff > 0:
-        age_text = f"🟢 Сердце моложе на *{age_diff}* лет!"
-    elif age_diff < 0:
-        age_text = f"🔴 Сердце старше на *{abs(age_diff)}* лет"
+    result = f"✅ *VO2max СОХРАНЁН!*\n\n"
+    result += f"📊 VO2max: *{vo2max:.1f}* мл/кг/мин\n"
+    result += f"⚡ METs: *{mets:.1f}*\n"
+    result += f"📱 Источник: {device_name}\n"
+    
+    if result_calc["error"] is not None:
+        vo2_low, vo2_high = result_calc["vo2max_range"]
+        result += f"🔍 Диапазон: {vo2_low}–{vo2_high} мл/кг/мин (±{result_calc['error']})\n"
+    
+    result += "\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    if result_calc["bio_age_low"] is not None:
+        result += f"🎂 *КАРДИО-БИОВОЗРАСТ: {bio_age} лет*\n"
+        result += f"📅 Паспортный: ~{chrono_age} лет ({age_diff:+d})\n"
+        if result_calc["bio_age_low"] != result_calc["bio_age_high"]:
+            result += f"📊 Диапазон: {result_calc['bio_age_low']}–{result_calc['bio_age_high']} лет\n"
     else:
-        age_text = "⚪ Сердце соответствует возрасту"
+        result += f"📊 *VO2max записан для динамики*\n"
+        result += f"⚠️ {device_name} — точность не подтверждена\n"
     
-    result = f"""✅ *VO2max СОХРАНЁН!*
-
-━━━━━━━━━━━━━━━━━━━━━
-
-📊 VO2max: *{vo2max:.1f}* мл/кг/мин
-⚡ METs: *{mets:.1f}*
-📱 Источник: {source}
-
-━━━━━━━━━━━━━━━━━━━━━
-
-🎂 *КАРДИО-БИОВОЗРАСТ: {bio_age} лет*
-{age_text}
-
-━━━━━━━━━━━━━━━━━━━━━
-
-💡 Следующее измерение через 2-4 недели."""
+    result += "\n💡 Следующее измерение через 2-4 недели."
+    
+    if result_calc["note"]:
+        result += f"\n\n💡 _{result_calc['note']}_"
     
     await callback.message.edit_text(
         result,
@@ -39035,12 +39505,14 @@ async def vo2max_got_value(message: Message, state: FSMContext):
         "✅ Значение принято!\n\n"
         "Откуда данные?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⌚ Garmin", callback_data="vo2src_garmin")],
-            [InlineKeyboardButton(text="⌚ Polar", callback_data="vo2src_polar")],
+            [InlineKeyboardButton(text="❤️ Polar H10 нагрудный (тест лёжа)", callback_data="vo2src_polar_h10_fit")],
+            [InlineKeyboardButton(text="⌚ Polar часы (тест лёжа)", callback_data="vo2src_polar_watch_fit")],
             [InlineKeyboardButton(text="⌚ Apple Watch", callback_data="vo2src_apple")],
-            [InlineKeyboardButton(text="⌚ Другие часы", callback_data="vo2src_other_watch")],
+            [InlineKeyboardButton(text="⌚ Garmin", callback_data="vo2src_garmin")],
+            [InlineKeyboardButton(text="⌚ Samsung", callback_data="vo2src_samsung")],
             [InlineKeyboardButton(text="🏃 Cooper Test", callback_data="vo2src_cooper")],
             [InlineKeyboardButton(text="🔬 Лаборатория", callback_data="vo2src_lab")],
+            [InlineKeyboardButton(text="⌚ Другое", callback_data="vo2src_other")],
         ])
     )
     await state.set_state(VO2maxStates.waiting_source)
@@ -39048,16 +39520,18 @@ async def vo2max_got_value(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("vo2src_"), VO2maxStates.waiting_source)
 async def vo2max_got_source(callback: CallbackQuery, state: FSMContext):
-    """Получили источник — сохраняем всё"""
+    """ПОПРАВКА #132: Получили источник — сохраняем с учётом погрешности устройства"""
     source_map = {
-        "vo2src_garmin": "Garmin",
-        "vo2src_polar": "Polar",
-        "vo2src_apple": "Apple Watch",
-        "vo2src_other_watch": "Умные часы",
-        "vo2src_cooper": "Cooper Test",
-        "vo2src_lab": "Лаборатория",
+        "vo2src_polar_h10_fit": "polar_h10_fitness",
+        "vo2src_polar_watch_fit": "polar_watch_fitness",
+        "vo2src_apple": "apple",
+        "vo2src_garmin": "garmin",
+        "vo2src_samsung": "samsung",
+        "vo2src_cooper": "cooper",
+        "vo2src_lab": "lab",
+        "vo2src_other": "other",
     }
-    source = source_map.get(callback.data, "Другое")
+    source = source_map.get(callback.data, "other")
     
     data = await state.get_data()
     vo2max = data.get("vo2max")
@@ -39067,12 +39541,46 @@ async def vo2max_got_source(callback: CallbackQuery, state: FSMContext):
     age_group = user.get("age_group", "30-39") if user else "30-39"
     sex = user.get("sex", "male") if user else "male"
     
-    # Получаем возраст числом для расчёта биовозраста
     age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
     chrono_age = age_map.get(age_group, 35)
     
-    # Рассчитываем биологический возраст
-    bio_age = calculate_cardio_bio_age(vo2max, chrono_age, sex)
+    # ПОПРАВКА #132: Невалидированные устройства — сохраняем, но без биовозраста
+    if source in ("samsung", "coros"):
+        device_name = VO2MAX_DEVICE_DISPLAY.get(source, source)
+        
+        await save_vo2max_record(
+            telegram_id=callback.from_user.id,
+            vo2max=vo2max,
+            source=source,
+            bio_age_cardio=None
+        )
+        await update_vo2max_baseline(callback.from_user.id, vo2max, source)
+        
+        await callback.message.edit_text(
+            f"📊 *VO2max записан: {vo2max:.1f} мл/кг/мин*\n"
+            f"📱 Источник: {device_name}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"⚠️ *{device_name}* не прошёл научную валидацию.\n"
+            "Мы сохранили значение для отслеживания динамики,\n"
+            "но *не можем рассчитать кардио-биовозраст* —\n"
+            "результат был бы ненадёжным.\n\n"
+            "💡 *Для точного биовозраста рекомендуем:*\n"
+            "├── Polar H10 (~5000₽) — тест лёжа, без нагрузки\n"
+            "├── Apple Watch — самый точный из массовых\n"
+            "└── Cooper Test — бесплатно, если здоровье позволяет",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📊 Моя динамика", callback_data="vo2max_progress")],
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+            ])
+        )
+        await state.clear()
+        await callback.answer()
+        return
+    
+    # Рассчитываем биологический возраст с учётом устройства
+    result = calculate_cardio_bio_age(vo2max, chrono_age, sex, device=source)
+    bio_age = result["bio_age"]
     age_diff = chrono_age - bio_age
     
     # Сохраняем в базу
@@ -39082,37 +39590,50 @@ async def vo2max_got_source(callback: CallbackQuery, state: FSMContext):
         source=source,
         bio_age_cardio=bio_age
     )
-    
-    # Обновляем baseline
     await update_vo2max_baseline(callback.from_user.id, vo2max, source)
     
     # Формируем ответ
     interp = get_vo2max_interpretation(vo2max, age_group, sex)
     bio_interp = get_bio_age_interpretation(age_diff)
-    
-    # METs для понимания
     mets = vo2max / 3.5
     
-    text = "✅ VO2max СОХРАНЁН!\n\n"
-    text += f"🏃 VO2max: {vo2max:.1f} мл/кг/мин — {interp}\n"
-    text += f"âš¡ METs: {mets:.1f}\n"
-    text += f"📱 Источник: {source}\n\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += f"🧬 КАРДИО-БИОВОЗРАСТ: {bio_age} лет\n"
-    text += f"📅 Паспортный возраст: ~{chrono_age} лет\n"
-    text += f"📊 Разница: {age_diff:+d} лет\n\n"
+    text = "✅ *VO2max СОХРАНЁН!*\n\n"
+    text += f"🏃 VO2max: *{vo2max:.1f}* мл/кг/мин — {interp}\n"
+    text += f"⚡ METs: {mets:.1f}\n"
+    text += f"📱 Источник: {VO2MAX_DEVICE_DISPLAY.get(source, source)}\n"
+    
+    if result["error"] is not None:
+        vo2_low, vo2_high = result["vo2max_range"]
+        text += f"🔍 Реальный диапазон: {vo2_low}–{vo2_high} мл/кг/мин (±{result['error']})\n"
+    
+    text += "\n━━━━━━━━━━━━━━━━━━━━━━\n"
+    
+    if result["bio_age_low"] is not None:
+        text += f"🧬 *КАРДИО-БИОВОЗРАСТ: {bio_age} лет*\n"
+        text += f"📅 Паспортный: ~{chrono_age} лет ({age_diff:+d})\n"
+        if result["bio_age_low"] != result["bio_age_high"]:
+            text += f"📊 Диапазон: {result['bio_age_low']}–{result['bio_age_high']} лет\n"
+    
+    text += "\n"
     text += bio_interp
     
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="vo2max_stats")],
-        [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
-    ]))
+    if result["note"]:
+        text += f"\n\n💡 _{result['note']}_"
+    
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="vo2max_stats")],
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+        ])
+    )
     await state.clear()
     await callback.answer()
 
 
-async def save_vo2max_record(telegram_id: int, vo2max: float, source: str, bio_age_cardio: int):
-    """Сохранить запись VO2max"""
+async def save_vo2max_record(telegram_id: int, vo2max: float, source: str, bio_age_cardio=None):
+    """Сохранить запись VO2max (ПОПРАВКА #132: bio_age_cardio может быть None для невалидированных)"""
     today = date.today().isoformat()
     
     async with aiosqlite.connect(DB_PATH) as db:
@@ -39268,7 +39789,7 @@ async def vo2max_progress(callback: CallbackQuery):
         text += f"🏃 VO2max: {latest[0]:.1f} — без изменений 🟡\n\n"
     
     # METs
-    text += f"âš¡ METs: {mets_change:+.1f}\n"
+    text += f"⚡ METs: {mets_change:+.1f}\n"
     
     # Влияние на смертность
     if mets_change > 0:
@@ -40422,10 +40943,10 @@ async def onb_process_fog(callback: CallbackQuery, state: FSMContext):
     
     await callback.message.edit_text(
         f"✅ {name}, отлично! Знакомство завершено.{insights_text}\n\n"
-        "Теперь — тесты. Они покажут картину точнее.\n"
-        "7 тестов + 2 трекера, ~25 минут.\n\n"
-        "Можно пройти сейчас или частями —\n"
-        "бот запомнит, где остановились.",
+        "Теперь — тесты. Они покажут точную картину.\n"
+        "7 тестов, ~15 минут.\n\n"
+        "Можно пройти сейчас или позже —\n"
+        "просто вернитесь в чат и нажмите кнопку.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="▶️ Начать тесты", callback_data="onb_start_tests")],
             [InlineKeyboardButton(text="⏰ Пройду позже", callback_data="onb_tests_later")],
@@ -40450,8 +40971,8 @@ async def onb_tests_later(callback: CallbackQuery, state: FSMContext):
     
     await callback.message.edit_text(
         f"👌 Хорошо, {name}!\n\n"
-        "Прогресс сохранён. В меню будет кнопка\n"
-        "«Продолжить диагностику».\n\n"
+        "Тесты будут ждать. Когда будете готовы —\n"
+        "нажмите «📋 Продолжить диагностику» в меню.\n\n"
         "Напомню через пару часов."
     )
     
@@ -40465,124 +40986,19 @@ async def onb_tests_later(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "onb_start_tests")
 async def onb_start_tests(callback: CallbackQuery, state: FSMContext):
-    """ОНБОРДИНГ 2.0: Начать/Продолжить тесты — ПОПРАВКА #128: дата + правильный порядок"""
+    """ОНБОРДИНГ 2.0: Начать тесты → PSS-10"""
     await callback.answer()
     
-    user = await get_user(callback.from_user.id)
-    tid = callback.from_user.id
+    await save_user(callback.from_user.id, {"onboarding_phase": 3})
     
-    await save_user(tid, {"onboarding_phase": 3})
-    
-    # Дата регистрации (чтобы не считать старые тесты)
-    onb_start = None
-    if user:
-        onb_start = user.get("created_at", None)
-    
-    has_stress = False
-    has_circadian = False
-    has_chronotype = False
-    has_sqs = False
-    has_bgs = False
-    has_syndrome = False
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            date_filter = ""
-            params_base = (tid,)
-            if onb_start:
-                date_filter = " AND created_at >= ?"
-                params_base = (tid, onb_start)
-            
-            for table, key in [
-                ("stress_records", "stress"),
-                ("circadian_tests", "circadian"),
-                ("sleep_assessment", "sqs"),
-                ("ahs_records", "bgs"),
-                ("syndrome_results", "syndrome"),
-            ]:
-                try:
-                    cursor = await db.execute(
-                        f"SELECT 1 FROM {table} WHERE telegram_id = ?{date_filter} LIMIT 1",
-                        params_base
-                    )
-                    if await cursor.fetchone():
-                        if key == "stress": has_stress = True
-                        elif key == "circadian": has_circadian = True
-                        elif key == "sqs": has_sqs = True
-                        elif key == "bgs": has_bgs = True
-                        elif key == "syndrome": has_syndrome = True
-                except Exception as e:
-                    print(f"⚠️ Ошибка проверки {table}: {e}")
-    except Exception as e:
-        print(f"⚠️ Ошибка подключения к БД: {e}")
-    
-    # Хронотип — в профиле
-    if user and user.get("chronotype"):
-        has_chronotype = True
-    
-    name = user.get("name", "друг") if user else "друг"
-    
-    # Следующий тест — В ПРАВИЛЬНОМ ПОРЯДКЕ онбординга
-    if not has_stress:
-        await callback.message.edit_text(
-            "💡 Начнём с теста на стресс.\n\n"
-            "10 вопросов, ~3 минуты.\n"
-            "Отвечайте за последний месяц.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➡️ Начать", callback_data="stress_test_start")]
-            ])
-        )
-    elif not has_circadian:
-        await callback.message.edit_text(
-            "✅ Стресс и тревожность — готово!\n\n"
-            "💡 Следующий: тест циркадных ритмов.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➡️ Тест: Циркадные ритмы", callback_data="circadian_test_menu")]
-            ])
-        )
-    elif not has_chronotype:
-        await callback.message.edit_text(
-            "✅ Стресс, циркадка — готово!\n\n"
-            "💡 Следующий: определим хронотип.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➡️ Тест: Хронотип", callback_data="chronotype_test_menu")]
-            ])
-        )
-    elif not has_sqs:
-        await callback.message.edit_text(
-            "✅ Стресс, циркадка, хронотип — готово!\n\n"
-            "💡 Следующий: тест качества сна.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➡️ Тест сна", callback_data="sleep_test_menu")]
-            ])
-        )
-    elif not has_bgs:
-        await callback.message.edit_text(
-            "✅ Почти всё! Остался тест надпочечников\n"
-            "и тест состояний.\n\n"
-            "💡 Следующий: тест БГС.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➡️ Тест БГС", callback_data="ahs_test_menu")]
-            ])
-        )
-    elif not has_syndrome:
-        await callback.message.edit_text(
-            "✅ Почти всё! Остался тест состояний.\n\n"
-            "💡 7 быстрых вопросов.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➡️ Тест Состояний", callback_data="syndrome_questions_start")]
-            ])
-        )
-    else:
-        # Все тесты пройдены
-        await save_user(tid, {"onboarding_phase": 4})
-        await callback.message.edit_text(
-            f"🎉 {name}, все тесты пройдены!\n\n"
-            "Сейчас покажу общую картину.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 Сводный отчёт", callback_data="show_full_report")]
-            ])
-        )
+    await callback.message.edit_text(
+        "💡 Начнём с теста на стресс.\n\n"
+        "10 вопросов, ~3 минуты.\n"
+        "Отвечайте за последний месяц.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Начать", callback_data="stress_test_start")]
+        ])
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -40591,7 +41007,7 @@ async def onb_start_tests(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "onb_test_pause_1")
 async def onb_test_pause_1(callback: CallbackQuery, state: FSMContext):
-    """ОНБОРДИНГ 2.0: Микро-пауза 1 (после хронотипа, 3 из 9)"""
+    """ОНБОРДИНГ 2.0: Микро-пауза 1 (после хронотипа)"""
     await callback.answer()
     
     await callback.message.edit_text(
@@ -40599,7 +41015,6 @@ async def onb_test_pause_1(callback: CallbackQuery, state: FSMContext):
         "Осталось ещё 4, ~10 минут.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➡️ Продолжить", callback_data="sleep_test_menu")],
-            [InlineKeyboardButton(text="⏰ Перерыв, продолжу позже", callback_data="onb_test_break")],
         ])
     )
 
@@ -40618,60 +41033,6 @@ async def onb_test_pause_2(callback: CallbackQuery, state: FSMContext):
         ])
     )
 
-
-@router.callback_query(F.data == "onb_test_break")
-async def onb_test_break(callback: CallbackQuery, state: FSMContext):
-    """ОНБОРДИНГ 2.0: Перерыв — сохраняем прогресс"""
-    await callback.answer()
-    
-    user = await get_user(callback.from_user.id)
-    name = user.get("name", "друг") if user else "друг"
-    
-    # ПОПРАВКА #128: Правильные имена таблиц + хронотип + фильтр по дате
-    test_progress = {}
-    onb_start = user.get("created_at", None) if user else None
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        date_filter = ""
-        params_base = (callback.from_user.id,)
-        if onb_start:
-            date_filter = " AND created_at >= ?"
-            params_base = (callback.from_user.id, onb_start)
-        
-        for table, key in [("stress_records", "pss"), ("circadian_tests", "circadian"), 
-                           ("sleep_assessment", "sqs"), ("ahs_records", "bgs"),
-                           ("syndrome_results", "syndrome")]:
-            try:
-                cursor = await db.execute(
-                    f"SELECT 1 FROM {table} WHERE telegram_id = ?{date_filter} LIMIT 1",
-                    params_base
-                )
-                if await cursor.fetchone():
-                    test_progress[key] = True
-            except:
-                pass
-    
-    # Хронотип в профиле
-    if user and user.get("chronotype"):
-        test_progress["chronotype"] = True
-    
-    await save_user(callback.from_user.id, {
-        "onboarding_test_progress": json.dumps(test_progress),
-    })
-    
-    done = len(test_progress)
-    remaining = 7 - done
-    
-    await callback.message.edit_text(
-        f"Хорошо, {name}! Прогресс сохранён.\n\n"
-        f"Пройдено тестов: {done} из 7\n"
-        f"Осталось: {remaining}\n\n"
-        "Когда будете готовы — нажмите\n"
-        "«📋 Продолжить диагностику» в меню.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")]
-        ])
-    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -40991,11 +41352,11 @@ def get_pss_keyboard(question_num: int):
     if is_reverse:
         # Обратный вопрос - позитивный ответ = меньше стресса
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="0️⃣ Очень часто ✓", callback_data=f"pss{question_num}_0")],
+            [InlineKeyboardButton(text="0️⃣ Очень часто", callback_data=f"pss{question_num}_0")],
             [InlineKeyboardButton(text="1️⃣ Довольно часто", callback_data=f"pss{question_num}_1")],
             [InlineKeyboardButton(text="2️⃣ Иногда", callback_data=f"pss{question_num}_2")],
             [InlineKeyboardButton(text="3️⃣ Почти никогда", callback_data=f"pss{question_num}_3")],
-            [InlineKeyboardButton(text="4️⃣ Никогда ✗", callback_data=f"pss{question_num}_4")],
+            [InlineKeyboardButton(text="4️⃣ Никогда", callback_data=f"pss{question_num}_4")],
         ])
     else:
         # Прямой вопрос - негативный ответ = больше стресса
@@ -53275,7 +53636,7 @@ async def why_important_now_handler(callback: CallbackQuery):
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
-🧠 *ЭТО И ЕСТЬ "МОЗГ ИЗ БУДУЩЕГО"*
+🧠 *ЭТО И ЕСТЬ "УМНОЕ ЗДОРОВЬЕ"*
 
 Не мозг, который "взломали" биохакеры.
 Не мозг, который "разогнали" стимуляторами.
@@ -58299,7 +58660,7 @@ async def save_bio_age_snapshot(telegram_id: int, source: str = "manual"):
             return
         
         age_group = user.get("age_group", "30-39")
-        age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60+": 65}
+        age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
         passport_age = age_map.get(age_group, 40)
         
         # 1. Расчётный биовозраст (L1)
@@ -58403,7 +58764,7 @@ async def get_bio_age_from_all_sources(telegram_id: int) -> dict:
         return {}
     
     age_group = user.get("age_group", "30-39")
-    age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60+": 65}
+    age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
     passport_age = age_map.get(age_group, 40)
     
     result = {
@@ -65729,116 +66090,97 @@ async def meditation_gratitude_handler(callback: CallbackQuery):
 if __name__ == "__main__":
     # ═══════════════════════════════════════════════════════════════
     # ПОПРАВКА #128: ФОЛЛБЭКИ ДЛЯ СИНДРОМОВ (если state потерян после перезапуска)
-    # Регистрируются в __main__ чтобы гарантированно быть ПОСЛЕ основных хэндлеров
+    # Регистрируются ПОСЛЕ основных хэндлеров → срабатывают только как fallback
     # ═══════════════════════════════════════════════════════════════
-    
+
     @router.callback_query(F.data.startswith("syndrome_energy_"))
     async def syndrome_energy_fallback(callback: CallbackQuery, state: FSMContext):
-        """Fallback: энергия → показываем апатию"""
         await callback.answer()
-        print(f"⚠️ FALLBACK syndrome_energy для user {callback.from_user.id}")
+        print(f"⚠️ FALLBACK syndrome_energy user={callback.from_user.id}")
         try:
             score = int(callback.data.split("_")[-1])
             await state.update_data(energy_level=score)
             await state.set_state(SyndromeStates.waiting_apathy)
             q = SYNDROME_QUESTIONS['apathy']
-            await callback.message.edit_text(
-                f"{q['emoji']} {q['title']}\n\n{q['text']}",
-                reply_markup=get_syndrome_question_keyboard('apathy')
-            )
+            await callback.message.edit_text(f"{q['emoji']} {q['title']}\n\n{q['text']}",
+                reply_markup=get_syndrome_question_keyboard('apathy'))
         except Exception as e:
-            print(f"⚠️ ОШИБКА в syndrome_energy_fallback: {e}")
+            print(f"⚠️ ОШИБКА: {e}")
 
     @router.callback_query(F.data.startswith("syndrome_apathy_"))
     async def syndrome_apathy_fallback(callback: CallbackQuery, state: FSMContext):
-        """Fallback: апатия → показываем мозговой туман"""
         await callback.answer()
-        print(f"⚠️ FALLBACK syndrome_apathy для user {callback.from_user.id}")
+        print(f"⚠️ FALLBACK syndrome_apathy user={callback.from_user.id}")
         try:
             score = int(callback.data.split("_")[-1])
             await state.update_data(apathy_level=score)
             await state.set_state(SyndromeStates.waiting_brain_fog)
             q = SYNDROME_QUESTIONS['brain_fog']
-            await callback.message.edit_text(
-                f"{q['emoji']} {q['title']}\n\n{q['text']}",
-                reply_markup=get_syndrome_question_keyboard('brain_fog')
-            )
+            await callback.message.edit_text(f"{q['emoji']} {q['title']}\n\n{q['text']}",
+                reply_markup=get_syndrome_question_keyboard('brain_fog'))
         except Exception as e:
-            print(f"⚠️ ОШИБКА в syndrome_apathy_fallback: {e}")
+            print(f"⚠️ ОШИБКА: {e}")
 
     @router.callback_query(F.data.startswith("syndrome_brain_fog_"))
     async def syndrome_brain_fog_fallback(callback: CallbackQuery, state: FSMContext):
-        """Fallback: мозговой туман → показываем забывчивость"""
         await callback.answer()
-        print(f"⚠️ FALLBACK syndrome_brain_fog для user {callback.from_user.id}")
+        print(f"⚠️ FALLBACK syndrome_brain_fog user={callback.from_user.id}")
         try:
             score = int(callback.data.split("_")[-1])
             await state.update_data(brain_fog_level=score)
             await state.set_state(SyndromeStates.waiting_forgetfulness)
             q = SYNDROME_QUESTIONS['forgetfulness']
-            await callback.message.edit_text(
-                f"{q['emoji']} {q['title']}\n\n{q['text']}",
-                reply_markup=get_syndrome_question_keyboard('forgetfulness')
-            )
+            await callback.message.edit_text(f"{q['emoji']} {q['title']}\n\n{q['text']}",
+                reply_markup=get_syndrome_question_keyboard('forgetfulness'))
         except Exception as e:
-            print(f"⚠️ ОШИБКА в syndrome_brain_fog_fallback: {e}")
+            print(f"⚠️ ОШИБКА: {e}")
 
     @router.callback_query(F.data.startswith("syndrome_forgetfulness_"))
     async def syndrome_forgetfulness_fallback(callback: CallbackQuery, state: FSMContext):
-        """Fallback: забывчивость → показываем концентрацию"""
         await callback.answer()
-        print(f"⚠️ FALLBACK syndrome_forgetfulness для user {callback.from_user.id}")
+        print(f"⚠️ FALLBACK syndrome_forgetfulness user={callback.from_user.id}")
         try:
             score = int(callback.data.split("_")[-1])
             await state.update_data(forgetfulness_level=score)
             await state.set_state(SyndromeStates.waiting_concentration)
             q = SYNDROME_QUESTIONS['concentration']
-            await callback.message.edit_text(
-                f"{q['emoji']} {q['title']}\n\n{q['text']}",
-                reply_markup=get_syndrome_question_keyboard('concentration')
-            )
+            await callback.message.edit_text(f"{q['emoji']} {q['title']}\n\n{q['text']}",
+                reply_markup=get_syndrome_question_keyboard('concentration'))
         except Exception as e:
-            print(f"⚠️ ОШИБКА в syndrome_forgetfulness_fallback: {e}")
+            print(f"⚠️ ОШИБКА: {e}")
 
     @router.callback_query(F.data.startswith("syndrome_concentration_"))
     async def syndrome_concentration_fallback(callback: CallbackQuery, state: FSMContext):
-        """Fallback: концентрация → показываем боли"""
         await callback.answer()
-        print(f"⚠️ FALLBACK syndrome_concentration для user {callback.from_user.id}")
+        print(f"⚠️ FALLBACK syndrome_concentration user={callback.from_user.id}")
         try:
             score = int(callback.data.split("_")[-1])
             await state.update_data(concentration_level=score)
             await state.set_state(SyndromeStates.waiting_pain)
             q = SYNDROME_QUESTIONS['pain']
-            await callback.message.edit_text(
-                f"{q['emoji']} {q['title']}\n\n{q['text']}",
-                reply_markup=get_syndrome_question_keyboard('pain')
-            )
+            await callback.message.edit_text(f"{q['emoji']} {q['title']}\n\n{q['text']}",
+                reply_markup=get_syndrome_question_keyboard('pain'))
         except Exception as e:
-            print(f"⚠️ ОШИБКА в syndrome_concentration_fallback: {e}")
+            print(f"⚠️ ОШИБКА: {e}")
 
     @router.callback_query(F.data.startswith("syndrome_pain_"))
     async def syndrome_pain_fallback(callback: CallbackQuery, state: FSMContext):
-        """Fallback: боли → показываем кожу"""
         await callback.answer()
-        print(f"⚠️ FALLBACK syndrome_pain для user {callback.from_user.id}")
+        print(f"⚠️ FALLBACK syndrome_pain user={callback.from_user.id}")
         try:
             score = int(callback.data.split("_")[-1])
             await state.update_data(pain_level=score)
             await state.set_state(SyndromeStates.waiting_skin)
             q = SYNDROME_QUESTIONS['skin']
-            await callback.message.edit_text(
-                f"{q['emoji']} {q['title']}\n\n{q['text']}",
-                reply_markup=get_syndrome_question_keyboard('skin')
-            )
+            await callback.message.edit_text(f"{q['emoji']} {q['title']}\n\n{q['text']}",
+                reply_markup=get_syndrome_question_keyboard('skin'))
         except Exception as e:
-            print(f"⚠️ ОШИБКА в syndrome_pain_fallback: {e}")
+            print(f"⚠️ ОШИБКА: {e}")
 
     @router.callback_query(F.data.startswith("syndrome_skin_"))
     async def syndrome_skin_fallback(callback: CallbackQuery, state: FSMContext):
-        """Fallback: кожа → завершаем тест"""
         await callback.answer()
-        print(f"⚠️ FALLBACK syndrome_skin для user {callback.from_user.id}")
+        print(f"⚠️ FALLBACK syndrome_skin user={callback.from_user.id}")
         try:
             score = int(callback.data.split("_")[-1])
             await save_user(callback.from_user.id, {'skin_problems_level': score})
@@ -65848,8 +66190,7 @@ if __name__ == "__main__":
             "✅ Тест состояний завершён!\n\nИдём дальше.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➡️ Тест: Капилляры", callback_data="capillary_test_menu")]
-            ])
-        )
+            ]))
 
     while True:
         try:

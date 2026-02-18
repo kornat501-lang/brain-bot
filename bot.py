@@ -29080,7 +29080,7 @@ async def process_h6(callback: CallbackQuery, state: FSMContext):
     age_group = user.get("age_group", "30-39") if user else data.get("age_group", "30-39")
     
     # Женщины 18-55 → Цикл
-    if gender == "female" and age_group not in ("56-65", "66+"):
+    if gender == "female" and age_group not in ("60-69", "70+"):
         await callback.message.edit_text(
             "Хотите учитывать менструальный цикл?\n\n"
             "(HRV, энергия и настроение меняются\n"

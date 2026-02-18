@@ -40465,14 +40465,18 @@ async def onb_tests_later(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "onb_start_tests")
 async def onb_start_tests(callback: CallbackQuery, state: FSMContext):
-    """ОНБОРДИНГ 2.0: Начать/Продолжить тесты — ПОПРАВКА #127: проверка прогресса"""
+    """ОНБОРДИНГ 2.0: Начать/Продолжить тесты — ПОПРАВКА #128: дата + правильный порядок"""
     await callback.answer()
     
-    await save_user(callback.from_user.id, {"onboarding_phase": 3})
-    
-    # ПОПРАВКА #127: Проверяем какие тесты уже пройдены
     user = await get_user(callback.from_user.id)
     tid = callback.from_user.id
+    
+    await save_user(tid, {"onboarding_phase": 3})
+    
+    # Дата регистрации (чтобы не считать старые тесты)
+    onb_start = None
+    if user:
+        onb_start = user.get("created_at", None)
     
     has_stress = False
     has_circadian = False
@@ -40483,36 +40487,43 @@ async def onb_start_tests(callback: CallbackQuery, state: FSMContext):
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            # PSS+GAD
-            cursor = await db.execute("SELECT 1 FROM stress_records WHERE telegram_id = ? LIMIT 1", (tid,))
-            if await cursor.fetchone():
-                has_stress = True
-            # Circadian
-            cursor = await db.execute("SELECT 1 FROM circadian_tests WHERE telegram_id = ? LIMIT 1", (tid,))
-            if await cursor.fetchone():
-                has_circadian = True
-            # SQS
-            cursor = await db.execute("SELECT 1 FROM sleep_assessment WHERE telegram_id = ? LIMIT 1", (tid,))
-            if await cursor.fetchone():
-                has_sqs = True
-            # BGS
-            cursor = await db.execute("SELECT 1 FROM ahs_records WHERE telegram_id = ? LIMIT 1", (tid,))
-            if await cursor.fetchone():
-                has_bgs = True
-            # Syndrome
-            cursor = await db.execute("SELECT 1 FROM syndrome_results WHERE telegram_id = ? LIMIT 1", (tid,))
-            if await cursor.fetchone():
-                has_syndrome = True
+            date_filter = ""
+            params_base = (tid,)
+            if onb_start:
+                date_filter = " AND created_at >= ?"
+                params_base = (tid, onb_start)
+            
+            for table, key in [
+                ("stress_records", "stress"),
+                ("circadian_tests", "circadian"),
+                ("sleep_assessment", "sqs"),
+                ("ahs_records", "bgs"),
+                ("syndrome_results", "syndrome"),
+            ]:
+                try:
+                    cursor = await db.execute(
+                        f"SELECT 1 FROM {table} WHERE telegram_id = ?{date_filter} LIMIT 1",
+                        params_base
+                    )
+                    if await cursor.fetchone():
+                        if key == "stress": has_stress = True
+                        elif key == "circadian": has_circadian = True
+                        elif key == "sqs": has_sqs = True
+                        elif key == "bgs": has_bgs = True
+                        elif key == "syndrome": has_syndrome = True
+                except Exception as e:
+                    print(f"⚠️ Ошибка проверки {table}: {e}")
     except Exception as e:
-        print(f"⚠️ Ошибка проверки прогресса: {e}")
+        print(f"⚠️ Ошибка подключения к БД: {e}")
     
-    # Хронотип
+    # Хронотип — в профиле
     if user and user.get("chronotype"):
         has_chronotype = True
     
-    # Определяем следующий тест
+    name = user.get("name", "друг") if user else "друг"
+    
+    # Следующий тест — В ПРАВИЛЬНОМ ПОРЯДКЕ онбординга
     if not has_stress:
-        # Начинаем с PSS
         await callback.message.edit_text(
             "💡 Начнём с теста на стресс.\n\n"
             "10 вопросов, ~3 минуты.\n"
@@ -40529,9 +40540,17 @@ async def onb_start_tests(callback: CallbackQuery, state: FSMContext):
                 [InlineKeyboardButton(text="➡️ Тест: Циркадные ритмы", callback_data="circadian_test_menu")]
             ])
         )
-    elif not has_sqs:
+    elif not has_chronotype:
         await callback.message.edit_text(
             "✅ Стресс, циркадка — готово!\n\n"
+            "💡 Следующий: определим хронотип.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➡️ Тест: Хронотип", callback_data="chronotype_test_menu")]
+            ])
+        )
+    elif not has_sqs:
+        await callback.message.edit_text(
+            "✅ Стресс, циркадка, хронотип — готово!\n\n"
             "💡 Следующий: тест качества сна.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➡️ Тест сна", callback_data="sleep_test_menu")]
@@ -40539,8 +40558,9 @@ async def onb_start_tests(callback: CallbackQuery, state: FSMContext):
         )
     elif not has_bgs:
         await callback.message.edit_text(
-            "✅ Стресс, циркадка, сон — готово!\n\n"
-            "💡 Следующий: тест БГС (надпочечники).",
+            "✅ Почти всё! Остался тест надпочечников\n"
+            "и тест состояний.\n\n"
+            "💡 Следующий: тест БГС.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➡️ Тест БГС", callback_data="ahs_test_menu")]
             ])
@@ -40548,18 +40568,19 @@ async def onb_start_tests(callback: CallbackQuery, state: FSMContext):
     elif not has_syndrome:
         await callback.message.edit_text(
             "✅ Почти всё! Остался тест состояний.\n\n"
-            "💡 6 быстрых вопросов.",
+            "💡 7 быстрых вопросов.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➡️ Тест Состояний", callback_data="syndrome_questions_start")]
             ])
         )
     else:
         # Все тесты пройдены
+        await save_user(tid, {"onboarding_phase": 4})
         await callback.message.edit_text(
-            "🎉 Все тесты пройдены!\n\n"
-            "Результаты сохранены.",
+            f"🎉 {name}, все тесты пройдены!\n\n"
+            "Сейчас покажу общую картину.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")]
+                [InlineKeyboardButton(text="📋 Сводный отчёт", callback_data="show_full_report")]
             ])
         )
 
@@ -40606,24 +40627,31 @@ async def onb_test_break(callback: CallbackQuery, state: FSMContext):
     user = await get_user(callback.from_user.id)
     name = user.get("name", "друг") if user else "друг"
     
-    # ПОПРАВКА #127: Исправлены имена таблиц + добавлены доп. проверки
+    # ПОПРАВКА #128: Правильные имена таблиц + хронотип + фильтр по дате
     test_progress = {}
+    onb_start = user.get("created_at", None) if user else None
+    
     async with aiosqlite.connect(DB_PATH) as db:
-        # Проверяем какие тесты пройдены (ПРАВИЛЬНЫЕ имена таблиц!)
+        date_filter = ""
+        params_base = (callback.from_user.id,)
+        if onb_start:
+            date_filter = " AND created_at >= ?"
+            params_base = (callback.from_user.id, onb_start)
+        
         for table, key in [("stress_records", "pss"), ("circadian_tests", "circadian"), 
                            ("sleep_assessment", "sqs"), ("ahs_records", "bgs"),
                            ("syndrome_results", "syndrome")]:
             try:
                 cursor = await db.execute(
-                    f"SELECT 1 FROM {table} WHERE telegram_id = ? LIMIT 1",
-                    (callback.from_user.id,)
+                    f"SELECT 1 FROM {table} WHERE telegram_id = ?{date_filter} LIMIT 1",
+                    params_base
                 )
                 if await cursor.fetchone():
                     test_progress[key] = True
             except:
                 pass
     
-    # Проверяем хронотип в users
+    # Хронотип в профиле
     if user and user.get("chronotype"):
         test_progress["chronotype"] = True
     
@@ -40632,7 +40660,7 @@ async def onb_test_break(callback: CallbackQuery, state: FSMContext):
     })
     
     done = len(test_progress)
-    remaining = 7 - done  # 7 основных тестов
+    remaining = 7 - done
     
     await callback.message.edit_text(
         f"Хорошо, {name}! Прогресс сохранён.\n\n"
@@ -60667,14 +60695,14 @@ async def syndrome_skin_final(callback: CallbackQuery, state: FSMContext):
         # Получаем все данные
         data = await state.get_data()
         await state.clear()
-    
+        
         # Сохраняем в БД
         save_data = {
             'energy_level': data.get('energy_level'),
             'apathy_level': data.get('apathy_level'),
             'brain_fog_level': data.get('brain_fog_level'),
             'forgetfulness_level': data.get('forgetfulness_level'),
-            'concentration_level': data.get('concentration_level'),  # ПОПРАВКА #127
+            'concentration_level': data.get('concentration_level'),
             'pain_level': data.get('pain_level'),
             'skin_problems_level': data.get('skin_problems_level'),
         }
@@ -60697,7 +60725,7 @@ async def syndrome_skin_final(callback: CallbackQuery, state: FSMContext):
                 'syndrome_confidence': analysis['primary_confidence']
             })
         
-        # Формируем текст — ПОПРАВКА #126: добавлен заголовок
+        # Формируем текст
         if analysis['primary_syndrome'] != 'NONE':
             syndrome_name = analysis['primary_name']
             confidence = analysis['primary_confidence']
@@ -60721,7 +60749,6 @@ async def syndrome_skin_final(callback: CallbackQuery, state: FSMContext):
 
 ✅ Записала! Идём дальше."""
         
-        # ПОПРАВКА #126: Только кнопка "Дальше", без "В меню"
         await callback.message.edit_text(
             text,
             parse_mode="Markdown",
@@ -60733,7 +60760,6 @@ async def syndrome_skin_final(callback: CallbackQuery, state: FSMContext):
         print(f"⚠️ ОШИБКА в syndrome_skin_final: {e}")
         import traceback
         traceback.print_exc()
-        # Fallback — показываем кнопку для продолжения
         try:
             await callback.message.edit_text(
                 "✅ Тест состояний завершён!\n\nИдём дальше.",
@@ -60743,28 +60769,6 @@ async def syndrome_skin_final(callback: CallbackQuery, state: FSMContext):
             )
         except:
             pass
-
-
-# ПОПРАВКА #127: Fallback — если state потерян, но кнопка нажата
-@router.callback_query(F.data.startswith("syndrome_skin_"))
-async def syndrome_skin_fallback(callback: CallbackQuery, state: FSMContext):
-    """Fallback для кнопок кожи если state потерян"""
-    await callback.answer()
-    print(f"⚠️ syndrome_skin_fallback: state потерян для user {callback.from_user.id}")
-    
-    try:
-        score = int(callback.data.split("_")[-1])
-        await save_user(callback.from_user.id, {'skin_problems_level': score})
-    except:
-        pass
-    
-    # Перенаправляем на следующий тест
-    await callback.message.edit_text(
-        "✅ Тест состояний завершён!\n\nИдём дальше.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➡️ Тест: Капилляры", callback_data="capillary_test_menu")]
-        ])
-    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -65723,6 +65727,130 @@ async def meditation_gratitude_handler(callback: CallbackQuery):
 
 
 if __name__ == "__main__":
+    # ═══════════════════════════════════════════════════════════════
+    # ПОПРАВКА #128: ФОЛЛБЭКИ ДЛЯ СИНДРОМОВ (если state потерян после перезапуска)
+    # Регистрируются в __main__ чтобы гарантированно быть ПОСЛЕ основных хэндлеров
+    # ═══════════════════════════════════════════════════════════════
+    
+    @router.callback_query(F.data.startswith("syndrome_energy_"))
+    async def syndrome_energy_fallback(callback: CallbackQuery, state: FSMContext):
+        """Fallback: энергия → показываем апатию"""
+        await callback.answer()
+        print(f"⚠️ FALLBACK syndrome_energy для user {callback.from_user.id}")
+        try:
+            score = int(callback.data.split("_")[-1])
+            await state.update_data(energy_level=score)
+            await state.set_state(SyndromeStates.waiting_apathy)
+            q = SYNDROME_QUESTIONS['apathy']
+            await callback.message.edit_text(
+                f"{q['emoji']} {q['title']}\n\n{q['text']}",
+                reply_markup=get_syndrome_question_keyboard('apathy')
+            )
+        except Exception as e:
+            print(f"⚠️ ОШИБКА в syndrome_energy_fallback: {e}")
+
+    @router.callback_query(F.data.startswith("syndrome_apathy_"))
+    async def syndrome_apathy_fallback(callback: CallbackQuery, state: FSMContext):
+        """Fallback: апатия → показываем мозговой туман"""
+        await callback.answer()
+        print(f"⚠️ FALLBACK syndrome_apathy для user {callback.from_user.id}")
+        try:
+            score = int(callback.data.split("_")[-1])
+            await state.update_data(apathy_level=score)
+            await state.set_state(SyndromeStates.waiting_brain_fog)
+            q = SYNDROME_QUESTIONS['brain_fog']
+            await callback.message.edit_text(
+                f"{q['emoji']} {q['title']}\n\n{q['text']}",
+                reply_markup=get_syndrome_question_keyboard('brain_fog')
+            )
+        except Exception as e:
+            print(f"⚠️ ОШИБКА в syndrome_apathy_fallback: {e}")
+
+    @router.callback_query(F.data.startswith("syndrome_brain_fog_"))
+    async def syndrome_brain_fog_fallback(callback: CallbackQuery, state: FSMContext):
+        """Fallback: мозговой туман → показываем забывчивость"""
+        await callback.answer()
+        print(f"⚠️ FALLBACK syndrome_brain_fog для user {callback.from_user.id}")
+        try:
+            score = int(callback.data.split("_")[-1])
+            await state.update_data(brain_fog_level=score)
+            await state.set_state(SyndromeStates.waiting_forgetfulness)
+            q = SYNDROME_QUESTIONS['forgetfulness']
+            await callback.message.edit_text(
+                f"{q['emoji']} {q['title']}\n\n{q['text']}",
+                reply_markup=get_syndrome_question_keyboard('forgetfulness')
+            )
+        except Exception as e:
+            print(f"⚠️ ОШИБКА в syndrome_brain_fog_fallback: {e}")
+
+    @router.callback_query(F.data.startswith("syndrome_forgetfulness_"))
+    async def syndrome_forgetfulness_fallback(callback: CallbackQuery, state: FSMContext):
+        """Fallback: забывчивость → показываем концентрацию"""
+        await callback.answer()
+        print(f"⚠️ FALLBACK syndrome_forgetfulness для user {callback.from_user.id}")
+        try:
+            score = int(callback.data.split("_")[-1])
+            await state.update_data(forgetfulness_level=score)
+            await state.set_state(SyndromeStates.waiting_concentration)
+            q = SYNDROME_QUESTIONS['concentration']
+            await callback.message.edit_text(
+                f"{q['emoji']} {q['title']}\n\n{q['text']}",
+                reply_markup=get_syndrome_question_keyboard('concentration')
+            )
+        except Exception as e:
+            print(f"⚠️ ОШИБКА в syndrome_forgetfulness_fallback: {e}")
+
+    @router.callback_query(F.data.startswith("syndrome_concentration_"))
+    async def syndrome_concentration_fallback(callback: CallbackQuery, state: FSMContext):
+        """Fallback: концентрация → показываем боли"""
+        await callback.answer()
+        print(f"⚠️ FALLBACK syndrome_concentration для user {callback.from_user.id}")
+        try:
+            score = int(callback.data.split("_")[-1])
+            await state.update_data(concentration_level=score)
+            await state.set_state(SyndromeStates.waiting_pain)
+            q = SYNDROME_QUESTIONS['pain']
+            await callback.message.edit_text(
+                f"{q['emoji']} {q['title']}\n\n{q['text']}",
+                reply_markup=get_syndrome_question_keyboard('pain')
+            )
+        except Exception as e:
+            print(f"⚠️ ОШИБКА в syndrome_concentration_fallback: {e}")
+
+    @router.callback_query(F.data.startswith("syndrome_pain_"))
+    async def syndrome_pain_fallback(callback: CallbackQuery, state: FSMContext):
+        """Fallback: боли → показываем кожу"""
+        await callback.answer()
+        print(f"⚠️ FALLBACK syndrome_pain для user {callback.from_user.id}")
+        try:
+            score = int(callback.data.split("_")[-1])
+            await state.update_data(pain_level=score)
+            await state.set_state(SyndromeStates.waiting_skin)
+            q = SYNDROME_QUESTIONS['skin']
+            await callback.message.edit_text(
+                f"{q['emoji']} {q['title']}\n\n{q['text']}",
+                reply_markup=get_syndrome_question_keyboard('skin')
+            )
+        except Exception as e:
+            print(f"⚠️ ОШИБКА в syndrome_pain_fallback: {e}")
+
+    @router.callback_query(F.data.startswith("syndrome_skin_"))
+    async def syndrome_skin_fallback(callback: CallbackQuery, state: FSMContext):
+        """Fallback: кожа → завершаем тест"""
+        await callback.answer()
+        print(f"⚠️ FALLBACK syndrome_skin для user {callback.from_user.id}")
+        try:
+            score = int(callback.data.split("_")[-1])
+            await save_user(callback.from_user.id, {'skin_problems_level': score})
+        except:
+            pass
+        await callback.message.edit_text(
+            "✅ Тест состояний завершён!\n\nИдём дальше.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➡️ Тест: Капилляры", callback_data="capillary_test_menu")]
+            ])
+        )
+
     while True:
         try:
             asyncio.run(main())

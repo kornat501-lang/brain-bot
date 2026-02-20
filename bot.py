@@ -3872,9 +3872,7 @@ PRACTICE_CARDS["hypoxia_mild"] = {
     ),
 }
 
-# Теги для ротации
-PRACTICE_TAGS["hypoxia_whm"] = {"comt_type": "warrior", "time_of_day": "morning", "sound_type": None}
-PRACTICE_TAGS["hypoxia_mild"] = {"comt_type": "worrier", "time_of_day": "morning", "sound_type": None}
+# Теги для ротации — перенесены после определения PRACTICE_TAGS (строка ~4467)
 
 # ПОПРАВКА #154: Утренний энергетический комбо (ADORA2A-оптимизирован)
 PRACTICE_CARDS["energy_morning_combo"] = {
@@ -3897,7 +3895,6 @@ PRACTICE_CARDS["energy_morning_combo"] = {
         "💡 Без кофеина: мышцы ↑, сон не страдает."
     ),
 }
-PRACTICE_TAGS["energy_morning_combo"] = {"comt_type": "all", "time_of_day": "morning", "sound_type": None}
 
 # ── Гипоксический модуль: данные и логика ──
 
@@ -4510,6 +4507,11 @@ PRACTICE_TAGS = {
     "body_scan_express":  {"comt_type": "all",     "time_of_day": "evening", "sound_type": None},
     "visualization_5min": {"comt_type": "warrior", "time_of_day": "evening", "sound_type": None},
 }
+
+# Теги для гипоксии и утреннего комбо (перенесены сюда — после определения PRACTICE_TAGS)
+PRACTICE_TAGS["hypoxia_whm"] = {"comt_type": "warrior", "time_of_day": "morning", "sound_type": None}
+PRACTICE_TAGS["hypoxia_mild"] = {"comt_type": "worrier", "time_of_day": "morning", "sound_type": None}
+PRACTICE_TAGS["energy_morning_combo"] = {"comt_type": "all", "time_of_day": "morning", "sound_type": None}
 
 
 # ═══════════════════════════════════════════════════════════════

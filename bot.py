@@ -4125,21 +4125,7 @@ def format_hypoxia_card(protocol: dict) -> str:
     return text
 
 
-# Добавить hypoxia в GENE_PRACTICE_BOOST
-GENE_PRACTICE_BOOST[("mthfr", "TT")]["practices"].append("hypoxia_mild")
-GENE_PRACTICE_BOOST[("mthfr", "CT")]["practices"].append("hypoxia_mild")
-GENE_PRACTICE_BOOST[("sod2", "Val/Val")]["practices"].append("hypoxia_whm")
-GENE_PRACTICE_BOOST[("bdnf", "Met/Met")]["practices"].append("hypoxia_whm")
-GENE_PRACTICE_BOOST[("bdnf", "Val/Met")]["practices"].append("hypoxia_whm")
-GENE_PRACTICE_BOOST[("comt", "Met/Met")]["practices"].append("hypoxia_mild")
-GENE_PRACTICE_BOOST[("comt", "Val/Val")]["practices"].append("hypoxia_whm")
-GENE_PRACTICE_BOOST[("comt", "Val/Met")]["practices"].append("hypoxia_whm")
-GENE_PRACTICE_BOOST[("apoe", "e3/e4")]["practices"].append("hypoxia_whm")
-GENE_PRACTICE_BOOST[("apoe", "e4/e4")]["practices"].append("hypoxia_whm")
-GENE_PRACTICE_BOOST[("mtor", "high")]["practices"].append("hypoxia_whm")
-GENE_PRACTICE_BOOST[("sirt1", "reduced")]["practices"].append("hypoxia_whm")
-GENE_PRACTICE_BOOST[("il6", "AA")]["practices"].append("hypoxia_mild")
-GENE_PRACTICE_BOOST[("crh", "AA")]["practices"].append("hypoxia_mild")
+# Добавить hypoxia в GENE_PRACTICE_BOOST — перенесено после определения (~строка 4922)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -4920,6 +4906,22 @@ GENE_PRACTICE_BOOST = {
         "note": "🧬 mTOR high → Приоритет: ходьба + дыхание с задержкой + холод (AMPK↑ → mTOR↓ → аутофагия↑)",
     },
 }
+
+# Добавить hypoxia в GENE_PRACTICE_BOOST (перенесено сюда — после определения)
+GENE_PRACTICE_BOOST[("mthfr", "TT")]["practices"].append("hypoxia_mild")
+GENE_PRACTICE_BOOST[("mthfr", "CT")]["practices"].append("hypoxia_mild")
+GENE_PRACTICE_BOOST[("sod2", "Val/Val")]["practices"].append("hypoxia_whm")
+GENE_PRACTICE_BOOST[("bdnf", "Met/Met")]["practices"].append("hypoxia_whm")
+GENE_PRACTICE_BOOST[("bdnf", "Val/Met")]["practices"].append("hypoxia_whm")
+GENE_PRACTICE_BOOST[("comt", "Met/Met")]["practices"].append("hypoxia_mild")
+GENE_PRACTICE_BOOST[("comt", "Val/Val")]["practices"].append("hypoxia_whm")
+GENE_PRACTICE_BOOST[("comt", "Val/Met")]["practices"].append("hypoxia_whm")
+GENE_PRACTICE_BOOST[("apoe", "e3/e4")]["practices"].append("hypoxia_whm")
+GENE_PRACTICE_BOOST[("apoe", "e4/e4")]["practices"].append("hypoxia_whm")
+GENE_PRACTICE_BOOST[("mtor", "high")]["practices"].append("hypoxia_whm")
+GENE_PRACTICE_BOOST[("sirt1", "reduced")]["practices"].append("hypoxia_whm")
+GENE_PRACTICE_BOOST[("il6", "AA")]["practices"].append("hypoxia_mild")
+GENE_PRACTICE_BOOST[("crh", "AA")]["practices"].append("hypoxia_mild")
 
 
 # ═══════════════════════════════════════════════════════════════

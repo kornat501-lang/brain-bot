@@ -1358,6 +1358,15 @@ async def init_db():
             await db.execute("ALTER TABLE hydro_profile ADD COLUMN last_assessment_date TEXT")
         except:
             pass
+        # Добавляем недостающие колонки в cognitive_baseline
+        try:
+            await db.execute("ALTER TABLE cognitive_baseline ADD COLUMN dreams_recall INTEGER")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE cognitive_baseline ADD COLUMN creativity INTEGER")
+        except:
+            pass
         try:
             await db.execute("ALTER TABLE hydro_profile ADD COLUMN last_assessment_week INTEGER")
         except:
@@ -2617,6 +2626,8 @@ async def init_db():
             ('partial_tests_reminder_sent', 'INTEGER DEFAULT 0'),
             ('onb_tests_reminder_count', 'INTEGER DEFAULT 0'),
             ('hrv_deferred_today', 'INTEGER DEFAULT 0'),
+            ('exact_age', 'INTEGER'),
+            ('evening_checkin_missed', 'INTEGER DEFAULT 0'),
         ]
         for col_name, col_type in queue3_fields:
             try:
@@ -2829,6 +2840,18 @@ def is_quiet_hours(now: datetime, user: dict) -> bool:
             return quiet_start_min <= current_min < quiet_end_min
     except Exception:
         return now.hour >= 22 or now.hour < 9
+
+
+def get_age_group(exact_age: int) -> str:
+    """Вычислить возрастную группу из точного возраста"""
+    if not exact_age or exact_age < 18:
+        return "30-39"  # fallback
+    if exact_age < 30: return "18-29"
+    elif exact_age < 40: return "30-39"
+    elif exact_age < 50: return "40-49"
+    elif exact_age < 60: return "50-59"
+    elif exact_age < 70: return "60-69"
+    else: return "70+"
 
 
 CATEGORY_LABELS = {
@@ -7550,15 +7573,30 @@ async def save_morning_checkin(telegram_id: int, data: dict):
 
 
 async def save_evening_checkin(telegram_id: int, data: dict):
-    """Сохранить вечерний чек-ин"""
+    """Сохранить вечерний чек-ин (с debounce — не дублировать за один день)"""
     async with aiosqlite.connect(DB_PATH) as db:
         today = date.today().isoformat()
+        
+        # БАГФИКС: Debounce — проверяем дубль
+        cursor = await db.execute(
+            "SELECT id FROM daily_checkins WHERE telegram_id = ? AND date = ? AND checkin_type = 'evening'",
+            (telegram_id, today)
+        )
+        if await cursor.fetchone():
+            return  # Уже записан, пропускаем
+        
         await db.execute('''
             INSERT INTO daily_checkins (telegram_id, date, checkin_type, stress, energy, mood, sleepiness, scenario)
             VALUES (?, ?, 'evening', ?, ?, ?, ?, ?)
         ''', (telegram_id, today, data.get("stress"), data.get("energy"), 
               data.get("mood"), data.get("sleepiness"), data.get("scenario")))
         await db.commit()
+    
+    # Сбрасываем статус + missed
+    await save_user(telegram_id, {
+        'evening_checkin_status': 'not_started',
+        'evening_checkin_missed': 0,
+    })
 
 
 # ════════════════════════════════════════════════════════════════
@@ -7833,8 +7871,9 @@ async def generate_weekly_report(telegram_id: int) -> str:
     # Получаем данные пользователя
     user = await get_user(telegram_id)
     age_group = user.get("age_group", "30-39") if user else "30-39"
+    exact_age = user.get("exact_age") if user else None
     age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
-    chrono_age = age_map.get(age_group, 35)
+    chrono_age = exact_age if exact_age else age_map.get(age_group, 35)
     
     report = "📊 НЕДЕЛЬНЫЙ ОТЧЁТ\n\n"
     
@@ -8403,7 +8442,7 @@ async def calculate_monthly_bio_age(telegram_id: int, data_type: str = "current"
     
     age_group = user.get("age_group", "30-39")
     age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
-    passport_age = age_map.get(age_group, 40)
+    passport_age = user.get("exact_age") or age_map.get(age_group, 40)
     
     # Упрощённый расчёт биовозраста на основе штрафов
     penalties = 0
@@ -8551,7 +8590,7 @@ async def generate_monthly_report(telegram_id: int) -> str:
     
     age_group = user.get("age_group", "30-39")
     age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
-    passport_age = age_map.get(age_group, 40)
+    passport_age = user.get("exact_age") or age_map.get(age_group, 40)
     
     # Формируем отчёт
     report = f"""📊 *{name}, ТВОЙ ПРОГРЕСС*
@@ -8843,6 +8882,7 @@ async def show_detailed_stats(callback: CallbackQuery):
 class OnboardingStates(StatesGroup):
     waiting_name = State()
     waiting_age = State()
+    waiting_exact_age = State()  # Ввод точного возраста числом
     waiting_gender = State()
     waiting_city = State()
     waiting_timezone = State()
@@ -8955,6 +8995,8 @@ class MorningStates(StatesGroup):
     waiting_yesterday_mood = State()
     waiting_yesterday_alcohol = State()
     waiting_yesterday_exercise = State()
+    # Ретроспективный вопрос о времени засыпания
+    waiting_retro_bedtime = State()
 
 
 class EveningStates(StatesGroup):
@@ -12337,20 +12379,29 @@ PROTOCOL_SUPPLEMENTS = {
 # ═══════════════════════════════════════════════════════════════
 
 async def get_users_for_reminder(reminder_type: str) -> list:
-    """Получить пользователей для напоминания"""
+    """Получить пользователей для напоминания (с учётом timezone_offset)"""
     try:
-        current_time = datetime.now().strftime("%H:%M")
+        now_utc = datetime.utcnow()
         
         if reminder_type == "morning":
-            # Утренний — по morning_time
+            # Утренний — по morning_time (пользовательское время)
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute(
-                    "SELECT * FROM users WHERE morning_time = ? AND reminders_enabled = 1 AND onboarding_completed = 1",
-                    (current_time,)
+                    "SELECT * FROM users WHERE reminders_enabled = 1 AND onboarding_completed = 1 AND morning_time IS NOT NULL"
                 )
                 rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+                
+                result = []
+                for row in rows:
+                    user = dict(row)
+                    offset = user.get('timezone_offset', 3) or 3
+                    user_now = now_utc + timedelta(hours=offset)
+                    user_time = user_now.strftime("%H:%M")
+                    
+                    if user_time == user.get('morning_time', '07:30'):
+                        result.append(user)
+                return result
         
         elif reminder_type == "evening":
             # Вечерний — за 2 ЧАСА до target_bedtime (ПОПРАВКА #139)
@@ -12367,16 +12418,18 @@ async def get_users_for_reminder(reminder_type: str) -> list:
                 result = []
                 for row in rows:
                     user = dict(row)
-                    # Берём target_bedtime, если нет — evening_time как fallback
+                    offset = user.get('timezone_offset', 3) or 3
+                    user_now = now_utc + timedelta(hours=offset)
+                    user_time = user_now.strftime("%H:%M")
+                    
                     sleep_time = user.get('target_bedtime') or user.get('evening_time')
                     if sleep_time:
                         try:
                             sleep_dt = datetime.strptime(sleep_time, "%H:%M")
-                            # ПОПРАВКА #139: Вечерний чекин за 2 ЧАСА до сна
                             checkin_dt = sleep_dt - timedelta(hours=2)
                             checkin_time = checkin_dt.strftime("%H:%M")
                             
-                            if checkin_time == current_time:
+                            if checkin_time == user_time:
                                 result.append(user)
                         except:
                             pass
@@ -12388,10 +12441,33 @@ async def get_users_for_reminder(reminder_type: str) -> list:
         return []
 
 
+async def get_users_at_local_hour(target_hour: int, target_minute: int = 0) -> list:
+    """
+    БАГФИКС TIMEZONE: Получить пользователей, у которых сейчас target_hour:target_minute
+    по их локальному времени (UTC + timezone_offset).
+    """
+    now_utc = datetime.utcnow()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM users WHERE reminders_enabled = 1 AND onboarding_completed = 1"
+        )
+        rows = await cursor.fetchall()
+    
+    result = []
+    for row in rows:
+        user = dict(row)
+        offset = user.get('timezone_offset', 3) or 3
+        user_now = now_utc + timedelta(hours=offset)
+        if user_now.hour == target_hour and user_now.minute == target_minute:
+            result.append(user)
+    return result
+
+
 async def get_users_for_bedtime_reminder() -> list:
-    """Получить пользователей для напоминания перед сном"""
+    """Получить пользователей для напоминания перед сном (с учётом timezone_offset)"""
     try:
-        current_time = datetime.now().strftime("%H:%M")
+        now_utc = datetime.utcnow()
         
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -12406,6 +12482,10 @@ async def get_users_for_bedtime_reminder() -> list:
             result = []
             for row in rows:
                 user = dict(row)
+                offset = user.get('timezone_offset', 3) or 3
+                user_now = now_utc + timedelta(hours=offset)
+                user_time = user_now.strftime("%H:%M")
+                
                 target = user.get('target_bedtime')
                 if target:
                     try:
@@ -12413,14 +12493,13 @@ async def get_users_for_bedtime_reminder() -> list:
                         reminder_dt = target_dt - timedelta(minutes=30)
                         reminder_time = reminder_dt.strftime("%H:%M")
                         
-                        if reminder_time == current_time:
+                        if reminder_time == user_time:
                             result.append(user)
                     except:
                         pass
             
             return result
     except Exception as e:
-        # Таблица может не существовать при первом запуске
         return []
 
 
@@ -12480,20 +12559,57 @@ async def send_morning_reminders():
                 )
                 evening_done = await cursor2.fetchone()
             
+            # Также проверяем, записано ли время засыпания
+            has_bedtime = False
+            async with aiosqlite.connect(DB_PATH) as db3:
+                cursor3 = await db3.execute(
+                    "SELECT actual_bedtime FROM circadian_log WHERE telegram_id = ? AND date = ? AND actual_bedtime IS NOT NULL",
+                    (tid, yesterday)
+                )
+                has_bedtime = bool(await cursor3.fetchone())
+            
+            # Сбрасываем флаг missed
+            if user.get('evening_checkin_missed'):
+                await save_user(tid, {'evening_checkin_missed': 0})
+            
             # Формируем текст с учётом пропущенного вечернего
             if not evening_done:
-                msg = await bot.send_message(
-                    chat_id=tid,
-                    text=f"🌅 Доброе утро, {name}!\n\n"
-                         f"Вижу, вчера вечерний чек-ин не прошли.\n"
-                         f"Быстро за минуту — 5 вопросов?\n\n"
-                         f"_(Это поможет точнее отслеживать динамику)_",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="✅ Заполню за вчера", callback_data="quick_yesterday_checkin")],
-                        [InlineKeyboardButton(text="⏭ Пропустить → утренний", callback_data="morning_checkin")],
-                    ])
-                )
+                if not has_bedtime:
+                    # Пропущен И вечерний чекин, И время засыпания → ретроспектива
+                    msg = await bot.send_message(
+                        chat_id=tid,
+                        text=f"🌅 Доброе утро, {name}!\n\n"
+                             f"Ты вчера не заполнила вечерний чекин.\n"
+                             f"Давай быстро вспомним:\n\n"
+                             f"🕐 Во сколько ты легла?",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [
+                                InlineKeyboardButton(text="21:00", callback_data="retro_bed_21:00"),
+                                InlineKeyboardButton(text="22:00", callback_data="retro_bed_22:00"),
+                                InlineKeyboardButton(text="23:00", callback_data="retro_bed_23:00"),
+                            ],
+                            [
+                                InlineKeyboardButton(text="00:00", callback_data="retro_bed_00:00"),
+                                InlineKeyboardButton(text="01:00", callback_data="retro_bed_01:00"),
+                                InlineKeyboardButton(text="02:00", callback_data="retro_bed_02:00"),
+                            ],
+                            [InlineKeyboardButton(text="⏭ Пропустить → утренний", callback_data="morning_checkin")],
+                        ])
+                    )
+                else:
+                    # Время засыпания есть, но вечерний чекин пропущен
+                    msg = await bot.send_message(
+                        chat_id=tid,
+                        text=f"🌅 Доброе утро, {name}!\n\n"
+                             f"Вижу, вчера вечерний чек-ин не прошли.\n"
+                             f"Быстро за минуту — 5 вопросов?\n\n"
+                             f"_(Это поможет точнее отслеживать динамику)_",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="✅ Заполню за вчера", callback_data="quick_yesterday_checkin")],
+                            [InlineKeyboardButton(text="⏭ Пропустить → утренний", callback_data="morning_checkin")],
+                        ])
+                    )
             else:
                 msg = await bot.send_message(
                     chat_id=tid,
@@ -12603,9 +12719,45 @@ async def send_evening_reminders():
             )
             # ПОПРАВКА #139: Сохраняем ID для удаления если не ответят
             await save_user(tid, {"evening_reminder_msg_id": msg.message_id})
+            
+            # Автоудаление через 2 часа если не ответили
+            asyncio.create_task(
+                _auto_delete_evening_checkin(tid, msg.message_id)
+            )
+            
             print(f"✅ Вечернее напоминание: {user['telegram_id']}")
         except Exception as e:
             print(f"❌ Ошибка отправки {user['telegram_id']}: {e}")
+
+
+async def _auto_delete_evening_checkin(telegram_id: int, message_id: int):
+    """Автоудаление вечернего чекина через 2 часа + флаг missed"""
+    await asyncio.sleep(7200)  # 2 часа
+    
+    try:
+        # Проверяем: ответили или нет (есть ли evening чекин за сегодня)
+        today = date.today().isoformat()
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT id FROM daily_checkins WHERE telegram_id = ? AND date = ? AND checkin_type = 'evening'",
+                (telegram_id, today)
+            )
+            done = await cursor.fetchone()
+        
+        if not done:
+            # Не ответили — удаляем сообщение + ставим флаг
+            try:
+                await bot.delete_message(chat_id=telegram_id, message_id=message_id)
+            except Exception:
+                pass
+            await save_user(telegram_id, {
+                'evening_checkin_missed': 1,
+                'evening_reminder_msg_id': None,
+                'evening_checkin_status': 'not_started',
+            })
+            print(f"🗑 Вечерний чекин удалён (не ответили): {telegram_id}")
+    except Exception as e:
+        print(f"❌ Ошибка auto_delete_evening: {e}")
 
 
 async def send_bedtime_reminders():
@@ -12651,15 +12803,14 @@ async def send_vo2max_reminders():
     Отправить напоминания о VO2max (раз в месяц).
     ИСПРАВЛЕНО: доступно для всех уровней + новичкам тоже.
     """
-    now = datetime.now()
-    if now.hour != 10 or now.minute != 0:
-        return
+    # БАГФИКС TIMEZONE: per-user local time check
+    now_utc = datetime.utcnow()
 
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("""
-                SELECT u.telegram_id, u.name, 
+                SELECT u.telegram_id, u.name, u.timezone_offset,
                        MAX(v.created_at) as last_vo2
                 FROM users u
                 LEFT JOIN vo2max_records v ON u.telegram_id = v.telegram_id
@@ -12673,6 +12824,11 @@ async def send_vo2max_reminders():
 
         for user in users:
             try:
+                offset = user['timezone_offset'] or 3
+                user_now = now_utc + timedelta(hours=offset)
+                if user_now.hour != 10 or user_now.minute != 0:
+                    continue
+                
                 telegram_id = user["telegram_id"]
                 name = user["name"] or "друг"
                 is_new = user["last_vo2"] is None
@@ -12723,17 +12879,14 @@ async def send_vo2max_reminders():
 
 
 async def send_sqs_reminders():
-    """Отправить напоминания о тесте качества сна SQS (раз в месяц)"""
-    now = datetime.now()
-    # Проверяем только в 11:00 (чтобы не пересекаться с VO2max в 10:00)
-    if now.hour != 11 or now.minute != 0:
-        return
+    """Отправить напоминания о тесте качества сна SQS (раз в месяц, per-user TZ)"""
+    now_utc = datetime.utcnow()
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             # Находим пользователей, у которых последний тест > 30 дней назад
             cursor = await db.execute("""
-                SELECT u.telegram_id, u.name, MAX(s.created_at) as last_sqs
+                SELECT u.telegram_id, u.name, u.timezone_offset, MAX(s.created_at) as last_sqs
                 FROM users u
                 LEFT JOIN sleep_assessment s ON u.telegram_id = s.telegram_id
                 WHERE u.reminders_enabled = 1
@@ -12745,8 +12898,14 @@ async def send_sqs_reminders():
         
         for user in users:
             try:
-                telegram_id, name, last_sqs = user
-                name = name or "друг"
+                telegram_id = user[0]
+                name = user[1] or "друг"
+                offset = user[2] or 3
+                last_sqs = user[3]
+                
+                user_now = now_utc + timedelta(hours=offset)
+                if user_now.hour != 11 or user_now.minute != 0:
+                    continue
                 
                 if last_sqs:
                     text = (f"🛏 {name}, прошёл месяц!\n\n"
@@ -12778,17 +12937,13 @@ async def send_sqs_reminders():
 
 
 async def send_ahs_reminders():
-    """Отправить напоминания о тесте БГС/AHS (раз в месяц)"""
-    now = datetime.now()
-    # Проверяем только в 12:00 (чтобы не пересекаться с VO2max в 10:00 и SQS в 11:00)
-    if now.hour != 12 or now.minute != 0:
-        return
+    """Отправить напоминания о тесте БГС/AHS (раз в месяц, per-user TZ)"""
+    now_utc = datetime.utcnow()
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            # Находим пользователей, у которых последний тест > 30 дней назад
             cursor = await db.execute("""
-                SELECT u.telegram_id, u.name, MAX(a.created_at) as last_ahs
+                SELECT u.telegram_id, u.name, u.timezone_offset, MAX(a.created_at) as last_ahs
                 FROM users u
                 LEFT JOIN ahs_records a ON u.telegram_id = a.telegram_id
                 WHERE u.reminders_enabled = 1
@@ -12800,8 +12955,14 @@ async def send_ahs_reminders():
         
         for user in users:
             try:
-                telegram_id, name, last_ahs = user
-                name = name or "друг"
+                telegram_id = user[0]
+                name = user[1] or "друг"
+                offset = user[2] or 3
+                last_ahs = user[3]
+                
+                user_now = now_utc + timedelta(hours=offset)
+                if user_now.hour != 12 or user_now.minute != 0:
+                    continue
                 
                 if last_ahs:
                     text = (f"⚡ {name}, прошёл месяц!\n\n"
@@ -12952,45 +13113,43 @@ async def setup_protocol_supplements(telegram_id: int, protocol: str):
 
 
 async def send_supplement_reminders():
-    """Отправить напоминания о приёме добавок"""
-    now = datetime.now()
-    current_hour = now.hour
-    
-    # Утренние напоминания: 08:00
-    # Вечерние напоминания: 21:00
-    if current_hour == 8:
-        time_of_day = "morning"
-        emoji = "🌅"
-        greeting = "Доброе утро"
-    elif current_hour == 21:
-        time_of_day = "evening"
-        emoji = "🌙"
-        greeting = "Добрый вечер"
-    else:
-        return
-    
-    if now.minute != 0:
-        return
+    """Отправить напоминания о приёме добавок (per-user TZ)"""
+    # БАГФИКС TIMEZONE: проверяем внутри user loop
+    now_utc = datetime.utcnow()
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
-            # Находим пользователей с активными добавками на это время
             cursor = await db.execute("""
-                SELECT DISTINCT u.telegram_id, u.name
+                SELECT DISTINCT u.telegram_id, u.name, u.timezone_offset
                 FROM users u
                 JOIN user_supplements s ON u.telegram_id = s.telegram_id
                 WHERE s.order_status = 'active' 
-                AND s.time_of_day = ?
                 AND u.reminders_enabled = 1
                 AND u.onboarding_completed = 1
-            """, (time_of_day,))
+            """)
             users = await cursor.fetchall()
         
         for user in users:
             try:
                 telegram_id = user['telegram_id']
                 name = user['name'] or "друг"
+                offset = user['timezone_offset'] or 3
+                user_now = now_utc + timedelta(hours=offset)
+                
+                if user_now.minute != 0:
+                    continue
+                
+                if user_now.hour == 8:
+                    time_of_day = "morning"
+                    emoji = "🌅"
+                    greeting = "Доброе утро"
+                elif user_now.hour == 21:
+                    time_of_day = "evening"
+                    emoji = "🌙"
+                    greeting = "Добрый вечер"
+                else:
+                    continue
                 
                 # Получаем добавки на это время
                 supps = await get_user_supplements(telegram_id, 'active')
@@ -13036,46 +13195,16 @@ async def send_supplement_reminders():
 async def send_aurora_checkins():
     """
     Отправляет чекины от Авроры пользователям в режиме checkin_mode.
-    Утренний: 8:00, Вечерний: 20:00
+    Утренний: 8:00, Вечерний: 20:00 (per-user TZ)
     """
-    now = datetime.now()
-    current_hour = now.hour
-    current_minute = now.minute
-    
-    # Утренний чекин в 8:00
-    if current_hour == 8 and current_minute == 0:
-        checkin_type = "morning"
-        emoji = "☀️"
-        text_template = """☀️ *Доброе утро, {name}!*
-
-Это Аврора 💚
-День {day} из 3.
-
-Время утреннего чекина!"""
-        button_text = "▶️ Начать чекин"
-        callback = "aurora_morning_checkin"
-    
-    # Вечерний чекин в 20:00
-    elif current_hour == 20 and current_minute == 0:
-        checkin_type = "evening"
-        emoji = "🌙"
-        text_template = """🌙 *Добрый вечер, {name}!*
-
-Это Аврора 💚
-День {day} из 3.
-
-Время вечернего чекина!"""
-        button_text = "▶️ Начать чекин"
-        callback = "aurora_evening_checkin"
-    else:
-        return
+    # БАГФИКС TIMEZONE: per-user local time
+    now_utc = datetime.utcnow()
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
-            # Находим пользователей в режиме чекинов
             cursor = await db.execute("""
-                SELECT telegram_id, name, checkin_day 
+                SELECT telegram_id, name, checkin_day, timezone_offset 
                 FROM users 
                 WHERE checkin_mode = 1 
                 AND checkin_day >= 1 
@@ -13089,6 +13218,35 @@ async def send_aurora_checkins():
             try:
                 telegram_id = user['telegram_id']
                 name = user['name'] or "друг"
+                offset = user['timezone_offset'] or 3
+                user_now = now_utc + timedelta(hours=offset)
+                
+                if user_now.minute != 0:
+                    continue
+                
+                if user_now.hour == 8:
+                    checkin_type = "morning"
+                    text_template = """☀️ *Доброе утро, {name}!*
+
+Это Аврора 💚
+День {day} из 3.
+
+Время утреннего чекина!"""
+                    button_text = "▶️ Начать чекин"
+                    callback = "aurora_morning_checkin"
+                elif user_now.hour == 20:
+                    checkin_type = "evening"
+                    text_template = """🌙 *Добрый вечер, {name}!*
+
+Это Аврора 💚
+День {day} из 3.
+
+Время вечернего чекина!"""
+                    button_text = "▶️ Начать чекин"
+                    callback = "aurora_evening_checkin"
+                else:
+                    continue
+                
                 checkin_day = user['checkin_day'] or 1
                 
                 # Проверяем, был ли уже чекин сегодня
@@ -13125,20 +13283,15 @@ async def send_aurora_checkins():
 
 async def send_blue_filter_reminder():
     """
-    Напоминание включить фильтр синего света в 19:00.
-    Для пользователей с активным планом.
+    Напоминание включить фильтр синего света в 19:00 (per-user TZ).
     """
-    now = datetime.now()
-    
-    if now.hour != 19 or now.minute != 0:
-        return
+    now_utc = datetime.utcnow()
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
-            # Пользователи с планом и включенными напоминаниями
             cursor = await db.execute("""
-                SELECT u.telegram_id, u.name
+                SELECT u.telegram_id, u.name, u.timezone_offset
                 FROM users u
                 JOIN user_plan p ON u.telegram_id = p.telegram_id
                 WHERE p.reminders_enabled = 1
@@ -13148,6 +13301,11 @@ async def send_blue_filter_reminder():
         
         for user in users:
             try:
+                offset = user['timezone_offset'] or 3
+                user_now = now_utc + timedelta(hours=offset)
+                if user_now.hour != 19 or user_now.minute != 0:
+                    continue
+                
                 telegram_id = user['telegram_id']
                 name = user['name'] or "друг"
                 
@@ -13174,22 +13332,16 @@ async def send_blue_filter_reminder():
 
 async def send_bath_reminder():
     """
-    Напоминание о ваннах во Вт/Чт/Вс в 19:30.
+    Напоминание о ваннах во Вт/Чт/Вс в 19:30 (per-user TZ).
     """
-    now = datetime.now()
-    
-    # Вт=1, Чт=3, Вс=6
-    if now.weekday() not in [1, 3, 6]:
-        return
-    
-    if now.hour != 19 or now.minute != 30:
-        return
+    # БАГФИКС TIMEZONE: per-user local time
+    now_utc = datetime.utcnow()
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("""
-                SELECT u.telegram_id, u.name
+                SELECT u.telegram_id, u.name, u.timezone_offset
                 FROM users u
                 JOIN user_plan p ON u.telegram_id = p.telegram_id
                 WHERE p.reminders_enabled = 1
@@ -13199,6 +13351,15 @@ async def send_bath_reminder():
         
         for user in users:
             try:
+                offset = user['timezone_offset'] or 3
+                user_now = now_utc + timedelta(hours=offset)
+                
+                # Вт=1, Чт=3, Вс=6
+                if user_now.weekday() not in [1, 3, 6]:
+                    continue
+                if user_now.hour != 19 or user_now.minute != 30:
+                    continue
+                
                 telegram_id = user['telegram_id']
                 name = user['name'] or "друг"
                 
@@ -13229,17 +13390,16 @@ async def send_bath_reminder():
 
 async def send_plan_bedtime_reminder():
     """
-    Напоминание готовиться ко сну за 30 мин до цели.
-    Берёт current_bed_goal из user_plan.
+    Напоминание готовиться ко сну за 30 мин до цели (per-user TZ).
     """
-    now = datetime.now()
-    current_time = now.strftime("%H:%M")
+    # БАГФИКС TIMEZONE
+    now_utc = datetime.utcnow()
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("""
-                SELECT u.telegram_id, u.name, p.current_bed_goal, p.current_week
+                SELECT u.telegram_id, u.name, u.timezone_offset, p.current_bed_goal, p.current_week
                 FROM users u
                 JOIN user_plan p ON u.telegram_id = p.telegram_id
                 WHERE p.reminders_enabled = 1
@@ -13252,6 +13412,9 @@ async def send_plan_bedtime_reminder():
             try:
                 telegram_id = user['telegram_id']
                 name = user['name'] or "друг"
+                offset = user['timezone_offset'] or 3
+                user_now = now_utc + timedelta(hours=offset)
+                current_time = user_now.strftime("%H:%M")
                 target = user['current_bed_goal']
                 week = user['current_week'] or 1
                 
@@ -13304,21 +13467,16 @@ async def send_plan_bedtime_reminder():
 async def send_weekly_reports():
     """
     ПОПРАВКА #123: Автоматическая отправка недельных отчётов.
-    Отправляется каждое воскресенье в 20:00.
+    Отправляется каждое воскресенье в 20:00 (per-user TZ).
     """
-    now = datetime.now()
-    
-    # Только воскресенье в 20:00
-    if now.weekday() != 6 or now.strftime("%H:%M") != "20:00":
-        return
-    
-    print("📊 Отправка недельных отчётов...")
+    # БАГФИКС TIMEZONE
+    now_utc = datetime.utcnow()
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("""
-                SELECT telegram_id, name, gender FROM users 
+                SELECT telegram_id, name, gender, timezone_offset FROM users 
                 WHERE reminders_enabled = 1
                 AND onboarding_completed = 1
             """)
@@ -13327,6 +13485,13 @@ async def send_weekly_reports():
         sent_count = 0
         for user in users:
             try:
+                offset = user['timezone_offset'] or 3
+                user_now = now_utc + timedelta(hours=offset)
+                
+                # Только воскресенье в 20:00 по локальному времени
+                if user_now.weekday() != 6 or user_now.strftime("%H:%M") != "20:00":
+                    continue
+                
                 telegram_id = user['telegram_id']
                 name = user['name'] or "друг"
                 gender = user['gender'] or "female"
@@ -13389,9 +13554,12 @@ async def generate_weekly_report_v2(telegram_id: int, name: str, gender: str) ->
     best_day = max(checkins, key=lambda x: x.get('morning_energy', 0))
     worst_day = min(checkins, key=lambda x: x.get('morning_energy', 0))
     
-    # Получаем даты недели
-    week_start = (datetime.now() - timedelta(days=6)).strftime("%d.%m")
-    week_end = datetime.now().strftime("%d.%m")
+    # Получаем даты недели (в таймзоне пользователя)
+    user = await get_user(telegram_id)
+    tz_offset = user.get('timezone_offset', 3) if user else 3
+    user_now = datetime.utcnow() + timedelta(hours=tz_offset)
+    week_start = (user_now - timedelta(days=6)).strftime("%d.%m")
+    week_end = user_now.strftime("%d.%m")
     
     # Формируем текст отчёта
     ending = "а" if gender == "female" else ""
@@ -13721,22 +13889,16 @@ def generate_weekly_recommendations(stats: dict, correlations: dict, checkins: l
 async def send_test_reminders():
     """
     ПОПРАВКА #123: Напоминания о месячных тестах.
-    За 5, 3, 1 день до конца подписки.
+    За 5, 3, 1 день до конца подписки (per-user TZ).
     """
-    now = datetime.now()
-    current_time = now.strftime("%H:%M")
-    
-    # Отправляем в 10:00
-    if current_time != "10:00":
-        return
-    
-    print("🔔 Проверка напоминаний о тестах...")
+    # БАГФИКС TIMEZONE
+    now_utc = datetime.utcnow()
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("""
-                SELECT telegram_id, name, subscription_end, tests_reminder_sent
+                SELECT telegram_id, name, timezone_offset, subscription_end, tests_reminder_sent
                 FROM users 
                 WHERE reminders_enabled = 1
                 AND onboarding_completed = 1
@@ -13746,10 +13908,18 @@ async def send_test_reminders():
         
         for user in users:
             try:
+                offset = user['timezone_offset'] or 3
+                user_now = now_utc + timedelta(hours=offset)
+                
+                # Отправляем в 10:00 по локальному времени
+                if user_now.strftime("%H:%M") != "10:00":
+                    continue
+                
                 telegram_id = user['telegram_id']
                 name = user['name'] or "друг"
                 sub_end = user['subscription_end']
                 reminder_sent = user['tests_reminder_sent'] or 0
+                now = user_now  # for days_left calc
                 
                 if not sub_end:
                     continue
@@ -13834,10 +14004,10 @@ async def send_test_reminders():
 async def send_vitamin_analysis_reminders():
     """
     Напоминание о пересдаче анализов через 6-8 недель после начала приёма витаминов.
-    Запускается ежедневно в 10:00.
+    БАГФИКС TIMEZONE: per-user TZ check.
     """
-    now = datetime.now()
     print("💊 Проверка напоминаний о пересдаче анализов...")
+    now = datetime.utcnow()
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -16675,7 +16845,7 @@ async def record_bath_v91(telegram_id: int, bath_data: dict) -> dict:
         if user:
             age_group = user.get('age_group', '40-49')
             age_map = {'18-29': 25, '30-39': 35, '40-49': 45, '50-59': 55, '60-69': 65, '70+': 75}
-            user_age = age_map.get(age_group, 50)
+            user_age = user.get('exact_age') or age_map.get(age_group, 50)
         
         # Рассчитываем дозировку
         dosage = ZalmanovCourseManager.get_current_dosage(course_number, baths_done, user_age)
@@ -17665,6 +17835,29 @@ CITY_TO_TIMEZONE = {
 def get_local_time(utc_time, timezone_offset: int):
     """Получить местное время пользователя"""
     return utc_time + timedelta(hours=timezone_offset)
+
+
+def get_user_local_now(timezone_offset: int = 3) -> datetime:
+    """Текущее datetime в таймзоне пользователя (UTC + offset)"""
+    return datetime.utcnow() + timedelta(hours=timezone_offset)
+
+
+def get_user_local_time_str(timezone_offset: int = 3) -> str:
+    """Текущее HH:MM в таймзоне пользователя"""
+    return get_user_local_now(timezone_offset).strftime("%H:%M")
+
+
+def _is_user_local_hour(user: dict, target_hour: int, target_minute: int = 0) -> bool:
+    """БАГФИКС TIMEZONE: Проверяет, что у пользователя сейчас target_hour:target_minute по его TZ"""
+    offset = user.get('timezone_offset', 3) or 3
+    user_now = datetime.utcnow() + timedelta(hours=offset)
+    return user_now.hour == target_hour and user_now.minute == target_minute
+
+
+def _get_user_local_now(user: dict) -> datetime:
+    """БАГФИКС TIMEZONE: Текущее время пользователя"""
+    offset = user.get('timezone_offset', 3) or 3
+    return datetime.utcnow() + timedelta(hours=offset)
 
 
 def get_notification_time_utc(local_hour: int, timezone_offset: int) -> int:
@@ -28852,9 +29045,10 @@ async def holiday_button_handler(callback: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════
 
 async def send_day_checkins():
-    """Отправляет дневной чек-ин в 13:00"""
-    now = datetime.now()
-    if now.hour != 13 or now.minute != 0:
+    """Отправляет дневной чек-ин в 13:00 (per-user timezone)"""
+    # БАГФИКС TIMEZONE: используем per-user local time
+    users_at_13 = await get_users_at_local_hour(13, 0)
+    if not users_at_13:
         return
     
     try:
@@ -30505,7 +30699,7 @@ async def send_breathing_478_reminders():
     ПОПРАВКА #138.1: Напоминает про 4-7-8 за 45 минут до target_bedtime.
     Учитывает индивидуальное время сна пользователя.
     """
-    now = datetime.now()
+    now_utc = datetime.utcnow()  # БАГФИКС TIMEZONE
     
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -30521,7 +30715,7 @@ async def send_breathing_478_reminders():
         try:
             telegram_id = user["telegram_id"]
             tz_offset = user["timezone_offset"] or 3
-            user_now = now + timedelta(hours=tz_offset - 3)  # Локальное время пользователя
+            user_now = now_utc + timedelta(hours=tz_offset)  # БАГФИКС TIMEZONE
             
             # Определяем время сна пользователя
             target_bedtime = user["target_bedtime"]
@@ -33739,34 +33933,48 @@ async def onb_process_gender(callback: CallbackQuery, state: FSMContext):
 
 
 async def show_age_screen(message, state: FSMContext, edit=False):
-    """ОНБОРДИНГ 2.0: Экран Возраст (2/10)"""
+    """ОНБОРДИНГ 2.0: Экран Возраст (2/10) — ввод числа"""
     text = (
         "[●●○○○○○○○○] 2/10\n\n"
-        "Ваш возраст:"
+        "Сколько тебе полных лет?"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="18-25", callback_data="onb_age_18_25"),
-            InlineKeyboardButton(text="26-35", callback_data="onb_age_26_35"),
-            InlineKeyboardButton(text="36-45", callback_data="onb_age_36_45"),
-        ],
-        [
-            InlineKeyboardButton(text="46-55", callback_data="onb_age_46_55"),
-            InlineKeyboardButton(text="56-65", callback_data="onb_age_56_65"),
-            InlineKeyboardButton(text="66+", callback_data="onb_age_66plus"),
-        ]
-    ])
     if edit:
-        await message.edit_text(text, reply_markup=kb)
+        await message.edit_text(text)
     else:
-        await message.answer(text, reply_markup=kb)
+        await message.answer(text)
+    await state.set_state(OnboardingStates.waiting_exact_age)
 
 
-# ── Возраст (2/10) ──
+# ── Возраст (2/10) — текстовый ввод ──
+
+@router.message(OnboardingStates.waiting_exact_age)
+async def onb_process_exact_age(message: Message, state: FSMContext):
+    """ОНБОРДИНГ 2.0: Точный возраст → Рост+Вес"""
+    text = message.text.strip() if message.text else ""
+    
+    # Пробуем извлечь число
+    try:
+        age = int(text)
+    except ValueError:
+        await message.answer("Введи возраст числом, например: 34")
+        return
+    
+    if age < 14 or age > 120:
+        await message.answer("Укажи возраст от 14 до 120 лет:")
+        return
+    
+    # Вычисляем age_group для обратной совместимости
+    age_group = get_age_group(age)
+    
+    await state.update_data(exact_age=age, age_group=age_group)
+    await show_height_weight_screen(message, state, edit=False)
+
+
+# ── Возраст (2/10) — старые кнопки (обратная совместимость) ──
 
 @router.callback_query(F.data.startswith("onb_age_"))
 async def onb_process_age(callback: CallbackQuery, state: FSMContext):
-    """ОНБОРДИНГ 2.0: Возраст → Рост+Вес"""
+    """ОНБОРДИНГ 2.0: Возраст (кнопки — deprecated, для обратной совместимости)"""
     await callback.answer()
     age_map = {
         "onb_age_18_25": "18-29", "onb_age_26_35": "30-39",
@@ -33936,6 +34144,8 @@ async def show_work_screen(message, state: FSMContext):
         "timezone_offset": data.get("timezone_offset", 3),
         "onboarding_phase": 1,
     }
+    if data.get("exact_age"):
+        save_data["exact_age"] = data["exact_age"]
     if data.get("height_cm"):
         save_data["height_cm"] = data["height_cm"]
     if data.get("weight_kg"):
@@ -37982,6 +38192,18 @@ async def evening_falling_asleep(callback: CallbackQuery, state: FSMContext):
 async def evening_relaxation_final(callback: CallbackQuery, state: FSMContext):
     """Расслабление — ФИНАЛ вечернего чек-ина"""
     await callback.answer()
+    
+    # БАГФИКС: Debounce — проверяем, не завершён ли уже
+    today = date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM daily_checkins WHERE telegram_id = ? AND date = ? AND checkin_type = 'evening'",
+            (callback.from_user.id, today)
+        )
+        if await cursor.fetchone():
+            await state.clear()
+            return  # Уже сохранён — выходим
+    
     relaxation = callback.data.replace("relax_", "")
     await state.update_data(relaxation=relaxation)
     
@@ -40644,7 +40866,46 @@ async def handle_action(callback: CallbackQuery):
             reply_markup=get_menu_keyboard()
         )
     else:  # sleep
-        current_time = datetime.now().strftime("%H:%M")
+        user = await get_user(callback.from_user.id)
+        tz_offset = user.get('timezone_offset', 3) if user else 3
+        now = datetime.utcnow() + timedelta(hours=tz_offset)
+        current_time = now.strftime("%H:%M")
+        
+        # БАГФИКС: Debounce — проверяем, не записано ли уже
+        today = date.today().isoformat()
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT actual_bedtime FROM circadian_log WHERE telegram_id = ? AND date = ? AND actual_bedtime IS NOT NULL",
+                (callback.from_user.id, today)
+            )
+            already_logged = await cursor.fetchone()
+        
+        if already_logged:
+            await callback.message.answer(
+                "😴 Уже записано! Спокойной ночи 💤",
+                reply_markup=get_menu_keyboard()
+            )
+            return
+        
+        # БАГФИКС: Если сейчас утро (6:00-18:00) — спросить реальное время
+        if 6 <= now.hour < 18:
+            await callback.message.answer(
+                "🕐 Вижу, ты заполняешь ретроспективно.\n"
+                "Во сколько ты легла вчера?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="21:00", callback_data="retro_bed_21:00"),
+                        InlineKeyboardButton(text="22:00", callback_data="retro_bed_22:00"),
+                        InlineKeyboardButton(text="23:00", callback_data="retro_bed_23:00"),
+                    ],
+                    [
+                        InlineKeyboardButton(text="00:00", callback_data="retro_bed_00:00"),
+                        InlineKeyboardButton(text="01:00", callback_data="retro_bed_01:00"),
+                        InlineKeyboardButton(text="02:00", callback_data="retro_bed_02:00"),
+                    ],
+                ])
+            )
+            return
         
         await log_circadian_day(
             telegram_id=callback.from_user.id,
@@ -40654,7 +40915,7 @@ async def handle_action(callback: CallbackQuery):
         
         await callback.message.answer(
             f"😴 Спокойной ночи!\n\n"
-            f"🕐 Записала: вы ложитесь в {current_time}\n\n"
+            f"🕐 Записала: ложишься в {current_time}\n\n"
             "Глимфатическая система запускается...\n"
             "Мозг будет очищаться следующие 7-8 часов.\n\n"
             "До завтра! ✨",
@@ -40667,7 +40928,43 @@ async def handle_bedtime_sleep(callback: CallbackQuery):
     """Пользователь идёт спать"""
     await callback.answer()
     
-    current_time = datetime.now().strftime("%H:%M")
+    user = await get_user(callback.from_user.id)
+    tz_offset = user.get('timezone_offset', 3) if user else 3
+    now = datetime.utcnow() + timedelta(hours=tz_offset)
+    current_time = now.strftime("%H:%M")
+    
+    # БАГФИКС: Debounce
+    today = date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT actual_bedtime FROM circadian_log WHERE telegram_id = ? AND date = ? AND actual_bedtime IS NOT NULL",
+            (callback.from_user.id, today)
+        )
+        already_logged = await cursor.fetchone()
+    
+    if already_logged:
+        await callback.message.answer("😴 Уже записано! Спокойной ночи 💤")
+        return
+    
+    # БАГФИКС: Если утро — спросить реальное время
+    if 6 <= now.hour < 18:
+        await callback.message.answer(
+            "🕐 Вижу, ты заполняешь ретроспективно.\n"
+            "Во сколько ты легла вчера?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="21:00", callback_data="retro_bed_21:00"),
+                    InlineKeyboardButton(text="22:00", callback_data="retro_bed_22:00"),
+                    InlineKeyboardButton(text="23:00", callback_data="retro_bed_23:00"),
+                ],
+                [
+                    InlineKeyboardButton(text="00:00", callback_data="retro_bed_00:00"),
+                    InlineKeyboardButton(text="01:00", callback_data="retro_bed_01:00"),
+                    InlineKeyboardButton(text="02:00", callback_data="retro_bed_02:00"),
+                ],
+            ])
+        )
+        return
     
     await log_circadian_day(
         telegram_id=callback.from_user.id,
@@ -40677,10 +40974,66 @@ async def handle_bedtime_sleep(callback: CallbackQuery):
     
     await callback.message.answer(
         f"😴 Спокойной ночи!\n\n"
-        f"🕐 Записала: вы ложитесь в {current_time}\n\n"
-        f"Глимфатическая система запускается...\n"
+        f"🕐 Записала: ложишься в {current_time}\n\n"
         f"До утра! 💤"
     )
+
+
+@router.callback_query(F.data.startswith("retro_bed_"))
+async def handle_retro_bedtime(callback: CallbackQuery):
+    """Ретроспективная запись времени засыпания (утром)"""
+    await callback.answer()
+    
+    bedtime = callback.data.replace("retro_bed_", "")  # "22:00"
+    
+    # Debounce
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT actual_bedtime FROM circadian_log WHERE telegram_id = ? AND date = ? AND actual_bedtime IS NOT NULL",
+            (callback.from_user.id, yesterday)
+        )
+        already = await cursor.fetchone()
+    
+    if already:
+        await callback.message.edit_text(f"✅ Уже записано: ложилась в {already[0]}")
+        return
+    
+    await log_circadian_day(
+        telegram_id=callback.from_user.id,
+        actual_bedtime=bedtime,
+        actual_waketime=""
+    )
+    
+    # Проверяем: был ли вечерний чекин вчера
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM daily_checkins WHERE telegram_id = ? AND date = ? AND checkin_type = 'evening'",
+            (callback.from_user.id, yesterday)
+        )
+        evening_done = await cursor.fetchone()
+    
+    if not evening_done:
+        # Вечерний не заполнен — предлагаем быстрый чекин за вчера
+        await callback.message.edit_text(
+            f"✅ Записала: легла в {bedtime}\n\n"
+            f"Заполним вечерний чекин за вчера?\n"
+            f"_(5 вопросов, ~1 минута)_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Заполню за вчера", callback_data="quick_yesterday_checkin")],
+                [InlineKeyboardButton(text="⏭ Пропустить → утренний", callback_data="morning_checkin")],
+            ])
+        )
+    else:
+        # Вечерний был — сразу к утреннему
+        await callback.message.edit_text(
+            f"✅ Записала: легла в {bedtime}\n\n"
+            f"Теперь утренний чекин? 🌅",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="▶️ Утренний чек-ин", callback_data="morning_checkin")],
+            ])
+        )
 
 
 @router.callback_query(F.data == "bedtime_snooze")
@@ -42952,15 +43305,15 @@ async def _get_last_test_time(telegram_id: int):
 # ═══════════════════════════════════════════════════════════════
 
 async def send_hrv_deferred_reminders():
-    """Напоминание в 13:00: если утром нажала «📸 Измерю, внесу позже»"""
-    now = datetime.now()
+    """Напоминание в 13:00: если утром нажала «📸 Измерю, внесу позже» (per-user TZ)"""
+    now_utc = datetime.utcnow()
     today = date.today().isoformat()
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("""
-                SELECT telegram_id, name, target_waketime, target_bedtime
+                SELECT telegram_id, name, timezone_offset, target_waketime, target_bedtime
                 FROM users
                 WHERE hrv_deferred_today = 1
                 AND reminders_enabled = 1
@@ -42971,8 +43324,14 @@ async def send_hrv_deferred_reminders():
             try:
                 tid = user["telegram_id"]
                 name = user["name"] or "друг"
+                offset = user["timezone_offset"] or 3
+                user_now = now_utc + timedelta(hours=offset)
                 
-                if is_quiet_hours(now, dict(user)):
+                # БАГФИКС TIMEZONE: 13:00 по локальному времени
+                if user_now.hour != 13 or user_now.minute != 0:
+                    continue
+                
+                if is_quiet_hours(user_now, dict(user)):
                     continue
                 
                 # Проверяем: может уже внесла через меню HRV?
@@ -43018,20 +43377,15 @@ async def reset_daily_flags():
 
 
 async def send_soft_start_tasks():
-    """Проверяет и отправляет задания мягкого старта (вызывается scheduler'ом)"""
+    """Проверяет и отправляет задания мягкого старта (per-user TZ)"""
     from datetime import datetime, timedelta
     
-    now = datetime.now()
-    
-    # Проверяем только в 10:00 по времени пользователя
-    # (упрощённо — проверяем для Europe/Riga)
-    if now.hour != 10 or now.minute != 0:
-        return
+    now_utc = datetime.utcnow()
     
     async with aiosqlite.connect(DB_PATH) as db:
         # Находим пользователей на программе мягкого старта
         async with db.execute("""
-            SELECT telegram_id, soft_start_day, soft_start_started_at
+            SELECT telegram_id, soft_start_day, soft_start_started_at, timezone_offset
             FROM users
             WHERE soft_start_day > 0 
             AND soft_start_day < 8
@@ -43039,8 +43393,16 @@ async def send_soft_start_tasks():
         """) as cursor:
             users = await cursor.fetchall()
     
-    for telegram_id, current_day, started_at in users:
+    for telegram_id, current_day, started_at, tz_offset in users:
         try:
+            offset = tz_offset or 3
+            user_now = now_utc + timedelta(hours=offset)
+            
+            # БАГФИКС TIMEZONE: проверяем 10:00 по локальному времени
+            if user_now.hour != 10 or user_now.minute != 0:
+                continue
+            
+            now = user_now  # for days_passed calc
             start_date = datetime.fromisoformat(started_at)
             days_passed = (now - start_date).days
             
@@ -43125,31 +43487,32 @@ async def send_soft_start_tasks():
 
 
 async def send_soft_start_checks():
-    """Проверяет выполнение заданий мягкого старта (через 3 дня после отправки)"""
+    """Проверяет выполнение заданий мягкого старта (per-user TZ, 18:00)"""
     from datetime import datetime, timedelta
     
-    now = datetime.now()
-    
-    # Проверяем только в 18:00 (вечером удобнее отвечать)
-    if now.hour != 18 or now.minute != 0:
-        return
+    now_utc = datetime.utcnow()
+    three_days_ago = (now_utc - timedelta(days=3)).isoformat()
     
     async with aiosqlite.connect(DB_PATH) as db:
-        # Находим задания, отправленные 3+ дня назад, но без проверки
-        three_days_ago = (now - timedelta(days=3)).isoformat()
-        
         async with db.execute("""
-            SELECT telegram_id, task_number, task_id, sent_at
-            FROM onboarding_tasks
-            WHERE sent_at < ?
-            AND asked_at IS NULL
-            AND status = 'pending'
+            SELECT t.telegram_id, t.task_number, t.task_id, t.sent_at, u.timezone_offset
+            FROM onboarding_tasks t
+            JOIN users u ON t.telegram_id = u.telegram_id
+            WHERE t.sent_at < ?
+            AND t.asked_at IS NULL
+            AND t.status = 'pending'
         """, (three_days_ago,)) as cursor:
             tasks_to_check = await cursor.fetchall()
     
-    for telegram_id, task_number, task_id, sent_at in tasks_to_check:
+    for telegram_id, task_number, task_id, sent_at, tz_offset in tasks_to_check:
         try:
-            # Получаем вопрос для этого задания
+            offset = tz_offset or 3
+            user_now = now_utc + timedelta(hours=offset)
+            
+            # БАГФИКС TIMEZONE: 18:00 по локальному времени
+            if user_now.hour != 18 or user_now.minute != 0:
+                continue
+            
             check = SOFT_START_CHECK_QUESTIONS.get(task_number)
             if not check:
                 continue
@@ -43175,7 +43538,7 @@ async def send_soft_start_checks():
                     UPDATE onboarding_tasks 
                     SET asked_at = ?
                     WHERE telegram_id = ? AND task_number = ?
-                """, (now.isoformat(), telegram_id, task_number))
+                """, (user_now.isoformat(), telegram_id, task_number))
                 await db.commit()
                 
         except Exception as e:
@@ -43262,7 +43625,8 @@ async def main():
     dp.include_router(router)
     
     # Запуск планировщика
-    scheduler = AsyncIOScheduler(timezone="Europe/Riga")
+    # БАГФИКС TIMEZONE: UTC вместо Europe/Riga — каждая функция сама вычисляет локальное время пользователя
+    scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(send_morning_reminders, "cron", minute="*")
     scheduler.add_job(send_evening_reminders, "cron", minute="*")
     scheduler.add_job(send_bedtime_reminders, "cron", minute="*")
@@ -43272,28 +43636,28 @@ async def main():
     scheduler.add_job(send_supplement_reminders, "cron", minute="*")
     # ПОПРАВКА #126: Чекины и напоминания Авроры
     scheduler.add_job(send_aurora_checkins, "cron", minute="*")
-    scheduler.add_job(send_day_checkins, "cron", minute="*")  # ОЧЕРЕДЬ 2: Дневной чек-ин в 13:00
+    scheduler.add_job(send_day_checkins, "cron", minute="*")
     scheduler.add_job(send_blue_filter_reminder, "cron", minute="*")
     scheduler.add_job(send_bath_reminder, "cron", minute="*")
     scheduler.add_job(send_plan_bedtime_reminder, "cron", minute="*")
     # ПОПРАВКА #123: Недельные отчёты и напоминания о тестах
-    scheduler.add_job(send_weekly_reports, "cron", minute="*")  # Проверяет воскресенье 20:00
-    scheduler.add_job(send_test_reminders, "cron", minute="*")  # Проверяет 10:00
-    scheduler.add_job(send_vitamin_analysis_reminders, "cron", hour=10, minute=0)  # Напоминание о пересдаче анализов
+    scheduler.add_job(send_weekly_reports, "cron", minute="*")
+    scheduler.add_job(send_test_reminders, "cron", minute="*")
+    scheduler.add_job(send_vitamin_analysis_reminders, "cron", minute="*")  # Было hour=10 — теперь per-user TZ
     # ПОПРАВКА #138: Напоминание о дыхании 4-7-8 перед сном
     scheduler.add_job(send_breathing_478_reminders, "cron", minute="*")
     # ПОПРАВКА: Мягкий старт — первые задания
     scheduler.add_job(send_soft_start_tasks, "cron", minute="*")
-    scheduler.add_job(send_soft_start_checks, "cron", minute="*")  # Проверка выполнения
+    scheduler.add_job(send_soft_start_checks, "cron", minute="*")
     # ОНБОРДИНГ 2.0: Напоминание через 2 часа после "Пройду позже"
     scheduler.add_job(send_tests_postponed_reminders, "cron", minute="*/10")
-    # ОЧЕРЕДЬ 3: Проверка неактивных пользователей (1 раз в день в 12:00)
-    scheduler.add_job(check_inactive_users, "cron", hour=12, minute=0)
+    # ОЧЕРЕДЬ 3: Проверка неактивных пользователей (каждый час — внутри фильтрует по TZ)
+    scheduler.add_job(check_inactive_users, "cron", minute=0)
     # ПОПРАВКА: Напоминания о незавершённых тестах (каждые 30 мин)
     scheduler.add_job(check_incomplete_tests, "interval", minutes=30)
-    # ПОПРАВКА: HRV deferred reminder — в 13:00
-    scheduler.add_job(send_hrv_deferred_reminders, "cron", hour=13, minute=0)
-    # ПОПРАВКА: Сброс ежедневных флагов — в 00:05
+    # ПОПРАВКА: HRV deferred reminder — per-user TZ
+    scheduler.add_job(send_hrv_deferred_reminders, "cron", minute="*")
+    # ПОПРАВКА: Сброс ежедневных флагов — в 00:05 UTC
     scheduler.add_job(reset_daily_flags, "cron", hour=0, minute=5)
     scheduler.start()
     
@@ -46219,7 +46583,7 @@ async def vo2max_confirm_ocr(callback: CallbackQuery, state: FSMContext):
     sex = user.get("sex", "male") if user else "male"
     
     age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
-    chrono_age = age_map.get(age_group, 35)
+    chrono_age = user.get("exact_age") or age_map.get(age_group, 35)
     
     # ПОПРАВКА #132: Маппинг detected_source → device key
     device_key = "other"
@@ -46351,7 +46715,7 @@ async def vo2max_got_source(callback: CallbackQuery, state: FSMContext):
     sex = user.get("sex", "male") if user else "male"
     
     age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
-    chrono_age = age_map.get(age_group, 35)
+    chrono_age = user.get("exact_age") or age_map.get(age_group, 35)
     
     # ПОПРАВКА #132: Невалидированные устройства — сохраняем, но без биовозраста
     if source in ("samsung", "coros"):
@@ -46716,7 +47080,7 @@ async def bio_age_menu(callback: CallbackQuery):
     
     # Получаем паспортный возраст
     age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
-    chrono_age = age_map.get(age_group, 35)
+    chrono_age = user.get("exact_age") or age_map.get(age_group, 35)
     
     # Получаем последние данные HRV
     hrv_bio_age = None
@@ -46818,7 +47182,7 @@ async def bio_age_history(callback: CallbackQuery):
     user = await get_user(callback.from_user.id)
     age_group = user.get("age_group", "30-39") if user else "30-39"
     age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
-    chrono_age = age_map.get(age_group, 35)
+    chrono_age = user.get("exact_age") or age_map.get(age_group, 35)
     
     text = "📈 ИСТОРИЯ БИОВОЗРАСТА\n\n"
     
@@ -48003,26 +48367,44 @@ async def onb_cog_intro(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     
     await callback.message.edit_text(
-        "🧠 Последний! Когнитивный трекер.\n\n"
-        "Зафиксируем: ясность мышления, память,\n"
-        "концентрацию, туман в голове.\n"
-        "Через месяц сравним.",
+        "🧠 Последний шаг!\n\n"
+        "Фиксируем как работает голова сейчас:\n"
+        "ясность, память, концентрация, скорость мышления.\n\n"
+        "Через месяц сравним — и увидим,\n"
+        "что реально меняется.\n\n"
+        "11 вопросов, \\~3 минуты.",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🧠 Пройти когнитивный трекер", callback_data="onb_cog_start")]
+            [InlineKeyboardButton(text="🚀 Начать", callback_data="onb_cog_start")]
         ])
     )
 
 
 @router.callback_query(F.data == "onb_cog_start")
 async def onb_cog_start(callback: CallbackQuery, state: FSMContext):
-    """ОНБОРДИНГ 2.0: Начало когнитивного трекера"""
+    """ОНБОРДИНГ 2.0: Запускаем стандартный когнитивный baseline"""
     await callback.answer()
-    await state.update_data(onb_cog_answers={}, onb_cog_idx=0)
-    await show_onb_cog_question(callback, state)
+    
+    # Помечаем что это из онбординга
+    await state.update_data(
+        assessment_type="full",
+        is_baseline=True,
+        from_onboarding=True,
+        questions=COGNITIVE_QUESTIONS_ORDER["full"].copy(),
+        current_question_index=0,
+        answers={}
+    )
+    
+    # Показываем первый вопрос стандартного теста
+    await show_cognitive_question(callback, state)
 
+
+# DEPRECATED: Старый онбординговый когнитивный тест (6 вопросов, 1-5)
+# Заменён единым тестом через cognitive_start_baseline (11 вопросов, 0-10)
+# Оставлено для обратной совместимости — если кто-то в процессе прохождения
 
 async def show_onb_cog_question(callback: CallbackQuery, state: FSMContext):
-    """Показать следующий вопрос когнитивного трекера"""
+    """DEPRECATED: Показать следующий вопрос когнитивного трекера"""
     data = await state.get_data()
     idx = data.get("onb_cog_idx", 0)
     
@@ -52092,13 +52474,15 @@ async def integrated_assessment_handler(callback: CallbackQuery):
 
 def generate_visual_signs(dermographism: str, hpa_stage: int, pss_score: int,
                           sqs_score: int, circ_score: int, chronotype: str,
-                          night_wakeups: str, user: dict) -> dict:
+                          night_wakeups: str, user: dict, ahs_data: dict = None) -> dict:
     """
     БЛОК 6: Генерирует визуальные признаки на основе результатов тестов.
     Возвращает dict с signs (list) и needs (list).
     """
     signs = []
     needs_set = set()
+    if ahs_data is None:
+        ahs_data = {}
     
     # --- Белый дермографизм → спазм капилляров ---
     if dermographism == "white":
@@ -52133,13 +52517,10 @@ def generate_visual_signs(dermographism: str, hpa_stage: int, pss_score: int,
         })
         needs_set.add("🛁 Капилляротерапия")
     
-    # --- Отёки (проверяем из rejuvenation tracker или syndrome data) ---
-    initial_edema = user.get("initial_fog", 0)  # fallback
-    # Пробуем из rejuvenation tracker
+    # --- Отёки ---
+    initial_edema = user.get("initial_fog", 0)
     rejuv_edema = user.get("edema_score", 0)
     has_edema = rejuv_edema and rejuv_edema <= 2
-    
-    # Проверяем syndrome results
     syndrome_edema = user.get("syndrome_edema", 0) or user.get("water_retention", 0)
     if syndrome_edema or has_edema:
         signs.append({
@@ -52159,10 +52540,50 @@ def generate_visual_signs(dermographism: str, hpa_stage: int, pss_score: int,
         })
         needs_set.add("🧘 Работа со стрессом")
     
-    # --- Фрагментированный сон → уставшее лицо ---
+    # --- Кофеиновая зависимость: ahs5 >= 3 ---
+    ahs5 = ahs_data.get("ahs5", 0) or 0
+    if ahs5 >= 3:
+        signs.append({
+            "emoji": "☕", "title": "Зависимость от кофе",
+            "cause": "Надпочечники истощены, тело держится на кофеине",
+            "fix": "Уйдёт: восстановление БГС + мягкие замены",
+        })
+        needs_set.add("🧘 Работа со стрессом")
+    
+    # --- Тяга к сладкому: ahs6 >= 3 ---
+    ahs6 = ahs_data.get("ahs6", 0) or 0
+    if ahs6 >= 3:
+        signs.append({
+            "emoji": "🍫", "title": "Тяга к сладкому",
+            "cause": "Кортизольные качели, тело ищет быстрое топливо",
+            "fix": "Уйдёт: стабилизация стресса + работа с метаболизмом",
+        })
+        needs_set.add("🧘 Работа со стрессом")
+    
+    # --- Раздражительность: PSS > 20 И SQS < 20 ---
+    if pss_score > 20 and sqs_score > 0 and sqs_score < 20:
+        signs.append({
+            "emoji": "😤", "title": "Раздражительность, 'короткий фитиль'",
+            "cause": "Сон фрагментирован + надпочечники истощены",
+            "fix": "Уйдёт: качество сна + работа со стрессом",
+        })
+        needs_set.add("😴 Улучшение качества сна")
+        needs_set.add("🧘 Работа со стрессом")
+    
+    # --- Ночные пробуждения ---
     wakeup_bad = night_wakeups in ("three_plus", "on_demand")
+    if wakeup_bad or (sqs_score > 0 and sqs_score < 15):
+        signs.append({
+            "emoji": "🌙", "title": "Просыпаешься среди ночи",
+            "cause": "Кортизол скачет в неправильное время, глимфатика не успевает",
+            "fix": "Уйдёт: восстановление циркадного ритма + капилляротерапия",
+        })
+        needs_set.add("🌙 Упорядочение циркадного ритма")
+        needs_set.add("🛁 Капилляротерапия")
+    
+    # --- Фрагментированный сон → уставшее лицо ---
     sqs_bad = sqs_score > 0 and sqs_score < 20
-    if wakeup_bad or sqs_bad:
+    if (wakeup_bad or sqs_bad) and not any(s["emoji"] == "🌙" for s in signs):
         signs.append({
             "emoji": "😫", "title": "Лицо уставшее даже после сна",
             "cause": "Сон фрагментированный, глимфатика не работает",
@@ -52170,7 +52591,7 @@ def generate_visual_signs(dermographism: str, hpa_stage: int, pss_score: int,
         })
         needs_set.add("😴 Улучшение качества сна")
     
-    # --- Тёмные круги: хронотип поздний И циркадка < 25 И SQS < 20 ---
+    # --- Тёмные круги: поздний хронотип + плохая циркадка + плохой сон ---
     late_chrono = chronotype in ("owl",)
     if late_chrono and circ_score > 0 and circ_score < 25 and sqs_score > 0 and sqs_score < 20:
         signs.append({
@@ -52377,7 +52798,17 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
     
     heredity_text = ""
     if heredity_items:
-        heredity_text = f"\n🧬 Наследственность: {', '.join(heredity_items)}"
+        heredity_text = (
+            "\n━━━━━━━━━━━━━━━━━━━━━\n"
+            "🧬 *ТВОЯ НАСЛЕДСТВЕННОСТЬ:*\n\n"
+            + "\n".join(f"├─ {item}" for item in heredity_items)
+            + "\n\n⚠️ _Это не приговор — но сигнал поберечь себя,_\n"
+            "_чтобы не повторить семейный сценарий._\n\n"
+            "*💡 Генетический тест поможет персонализировать\n"
+            "рекомендации под твою наследственность.\n"
+            "Эпигенетика позволяет «выключать» нежелательные гены\n"
+            "через образ жизни.*"
+        )
     
     # === ПРОФИЛЬ (давление, дермографизм) ===
     blood_pressure = user.get('blood_pressure', '')
@@ -52417,12 +52848,13 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
         chronotype=user.get("chronotype", ""),
         night_wakeups=user.get("night_wakeups", ""),
         user=user,
+        ahs_data=ahs,
     )
     
     visual_block = ""
     if visual_signs["signs"]:
         visual_block = "\n━━━━━━━━━━━━━━━━━━━━━\n"
-        visual_block += "👁 *ТЫ МОЖЕШЬ ЗАМЕЧАТЬ:*\n"
+        visual_block += "👁 *О ЧЁМ ГОВОРИТ ТЕБЕ ТВОЁ ТЕЛО?*\n"
         for sign in visual_signs["signs"]:
             visual_block += f"\n{sign['emoji']} {sign['title']}\n    → {sign['cause']}\n    ✅ {sign['fix']}\n"
         
@@ -52471,19 +52903,19 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
     text = f"""📋 *СВОДНЫЙ ОТЧЁТ*
 {partial_banner}
 ━━━━━━━━━━━━━━━━━━━━━
-📊 *ОБЩАЯ КАРТИНА:*
+📊 *Твои результаты тестов:*
 
 🌅 Циркадка: {circ_score}/60 {circ_emoji} {circ_level}
 😴 Сон (SQS): {sqs_score}/40 {sqs_emoji} {sqs_level}
 🔥 Стресс (PSS): {pss_score}/40 {pss_emoji} {pss_level}
 😰 Тревожность (GAD): {gad_score}/21 {gad_emoji}
-⚡ БГС: {ahs_score}/48 {ahs_emoji} Стадия {hpa_stage}: {hpa_name}{chrono_text}{heredity_text}{bp_text}{dermo_text}{modifiers_text}
+⚡ БГС: {ahs_score}/48 {ahs_emoji} Стадия {hpa_stage}: {hpa_name}{chrono_text}{bp_text}{dermo_text}{modifiers_text}
 
 🟢 норма  🟡 внимание  🟠 риск  🔴 критично"""
 
-    # Визуальные признаки и когнитивный блок — только если все тесты пройдены
+    # Визуальные признаки, наследственность и когнитивный блок — только если все тесты пройдены
     if all_tests_done:
-        text += f"{visual_block}{cognitive_block}"
+        text += f"{visual_block}{heredity_text}{cognitive_block}"
     
     text += """
 
@@ -52491,7 +52923,7 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
 
 """
     if all_tests_done:
-        text += "Теперь вы видите свою точку А.\nЭто не приговор — это карта.\nИ мы пойдём по ней вместе. 💚"
+        text += "Теперь ты видишь свою точку А.\n*Биовозраст можно снизить.*\n*Работая над этими показателями.*\n\n*Это — в подробном отчёте.* 💚"
     else:
         text += f"Пройдите оставшиеся тесты ({tests_remaining}),\nчтобы увидеть полную картину. 💚"
 
@@ -52729,6 +53161,12 @@ async def show_detailed_report(callback: CallbackQuery):
     transition_text = generate_transition_to_action_block(data)
     if transition_text:
         await callback.message.answer(transition_text, parse_mode="Markdown")
+        await asyncio.sleep(0.3)
+    
+    # Расшифровки визуальных признаков
+    body_signals_blocks = generate_body_signals_explanations(data)
+    for block in body_signals_blocks:
+        await callback.message.answer(block, parse_mode="Markdown")
         await asyncio.sleep(0.3)
     
     # Кнопки
@@ -53453,40 +53891,64 @@ async def show_tariffs_handler(callback: CallbackQuery):
     
     text = """💎 *ТАРИФЫ*
 
+🌱 *Как устроена программа*
+
+Это не курс на 3 месяца.
+Это начало нового образа жизни с сопровождением.
+
+*Этап 1 → Фундамент.*
+Сон, ритм, капилляры, нервная система.
+Тело выходит из режима выживания.
+
+*Этап 2 → Точная настройка.*
+Питание, добавки, практики
+под твою биологию и генетику.
+
+*Этап 3 → Трансформация.*
+Глубокие практики, которые меняют качество жизни.
+
 Ты прошла диагностику — это бесплатно.
-Теперь выбери как работать дальше:
+Чтобы работать дальше — выбери свой уровень:
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 💚 *БАЗОВЫЙ* — 3000₽ / 3 месяца
 
-├─ 📋 Все отчёты (сводный + подробный)
-├─ 🎯 Цели и план восстановления
-├─ 💊 Витамины по протоколу БГС
-├─ 🛁 Капилляротерапия (ванны Залманова)
+Твой личный навигатор здоровья.
+Каждый день бот отслеживает состояние,
+находит закономерности и ведёт к целям.
+
+├─ 📋 Расшифровка диагностики
+├─ 🎯 Персональный маршрут
 ├─ ✅ Ежедневные чекины
-└─ 📊 Еженедельные отчёты прогресса
+├─ 💓 HRV-мониторинг
+├─ 💊 Витамины по протоколу БГС
+├─ 🛁 Капилляротерапия
+└─ 📊 Еженедельные отчёты
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 💎 *ПЕРСОНАЛЬНЫЙ* — 7000₽ / 3 месяца
 
-├─ ✅ Всё из базового
-├─ 💓 HRV-мониторинг
+Всё из базового + глубокая персонализация.
+
+├─ 🕵️ Пищевой детектив (пульс-тест)
+├─ 🔬 Мониторинг анализов
 ├─ 💊 Витамины по твоим анализам
-├─ 🍽 Персональное питание
+├─ 🥗 Персональное питание
 └─ 🛒 Список покупок на неделю
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 🧬 *ГЕНЕТИЧЕСКИЙ* — 15000₽ / 3 месяца
 
-├─ ✅ Всё из персонального
+Всё из персонального + генетический коуч.
+
 ├─ 🧬 Генетический профиль (13 генов)
-├─ 💊 Витамины под твою генетику
-├─ 🍽 Питание под генетику
-├─ 🛁 Ванны под COMT
-└─ 💓 HRV под генетику
+├─ 🎯 Темп, поддержка, интенсивность под генотип
+├─ 💊 Витамины под генетику
+├─ 🥗 Питание под генотип
+└─ 🛡️ Управление наследственностью
 
 ━━━━━━━━━━━━━━━━━━━━━
 """
@@ -53539,29 +54001,39 @@ async def pay_basic_handler(callback: CallbackQuery):
     """ПОПРАВКА #132: Оплата базового тарифа"""
     await callback.answer()
     
-    text = """💚 *БАЗОВЫЙ ТАРИФ*
+    text = """💚 *БАЗОВЫЙ — 3000₽ / 3 месяца*
 
-💰 Стоимость: *3000₽* за 3 месяца
+Это не набор тестов.
+Это *твой личный навигатор здоровья* на 3 месяца.
 
-Что получишь:
-├─ 📋 Подробный отчёт с объяснениями
-├─ 🎯 Персональные цели и план
-├─ 💊 Протокол витаминов по БГС
-├─ 🛁 Капилляротерапия (ванны)
-├─ ✅ Ежедневные чекины
-└─ 📊 Еженедельные отчёты
+Каждый день бот отслеживает твоё состояние,
+находит закономерности, которые ты сама не видишь,
+и ведёт тебя к конкретным целям —
+без таблеток, без догадок.
+
+*Что внутри:*
+
+📋 Полная расшифровка диагностики
+🎯 Цели и персональный маршрут
+✅ Ежедневные чекины — сон, стресс, энергия, давление
+💓 HRV-мониторинг — объективная картина восстановления
+🔍 Выявление паттернов — что вызывает срывы сна, упадок сил
+⚡ Быстрая корректировка — бот реагирует сразу
+💊 Витамины по протоколу БГС
+🛁 Капилляротерапия — перезагрузка мозга и тела
+📊 Еженедельные отчёты
+
+_Программа немедикаментозная.
+Восстанавливаем фундамент — сон, ритм,
+капилляры, нервную систему._
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 💳 *Способы оплаты:*
-
 1️⃣ *Карта:* переводом на карту
 2️⃣ *СБП:* по номеру телефона
 
-После оплаты отправь чек/скриншот сюда — 
-я активирую тариф в течение часа!
-
-💬 Или напиши @aurora_support"""
+После оплаты отправь чек/скриншот сюда!"""
     
     buttons = [
         [InlineKeyboardButton(text="💳 Реквизиты для оплаты", callback_data="payment_details_basic")],
@@ -53581,31 +54053,38 @@ async def pay_personal_handler(callback: CallbackQuery):
     """ПОПРАВКА #132: Оплата персонального тарифа"""
     await callback.answer()
     
-    text = """💎 *ПЕРСОНАЛЬНЫЙ ТАРИФ*
+    text = """💎 *ПЕРСОНАЛЬНЫЙ — 7000₽ / 3 месяца*
 
-💰 Стоимость: *7000₽* за 3 месяца
+Всё из базового +
+*глубокая персонализация под твой организм.*
 
-Что получишь:
-├─ ✅ Всё из базового тарифа
-├─ 💓 HRV-мониторинг (видеть эффект!)
-├─ 💊 Витамины по твоим анализам
-├─ 🍽 Персональное питание
-├─ 🧬 Учёт наследственности
-└─ 🛒 Список покупок на неделю
+У каждого тела свои триггеры,
+свои дефициты, свои реакции на еду.
+Персональный уровень находит именно твои —
+и ускоряет результат.
 
-━━━━━━━━━━━━━━━━━━━━━
+*Что добавляется:*
 
-💓 *Про HRV:*
-Ванны → парасимпатика → HRV растёт
+🕵️ *Пищевой детектив (пульс-тест)* —
+бот ведёт по протоколу тестирования продуктов.
+Точность сопоставима с анализами за 15-50 тыс₽.
 
-⚠️ Эффект виден с 5-й ванны!
-Без HRV: «не знаю, работает ли» → бросаешь
-С HRV: «после 5-й HRV пошёл вверх!» → мотивация
+🔬 *Мониторинг анализов* —
+загружаешь в бот, он отслеживает динамику
+и корректирует рекомендации.
+
+💊 *Витамины по твоим анализам* —
+точечная коррекция твоих дефицитов.
+
+🥗 *Персональное питание* —
+на основе анализов и наследственности.
+
+🛒 *Список покупок на неделю* —
+готовый список, меньше решений.
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 💳 *Способы оплаты:*
-
 1️⃣ *Карта:* переводом на карту
 2️⃣ *СБП:* по номеру телефона
 
@@ -53629,29 +54108,38 @@ async def pay_genetic_handler(callback: CallbackQuery):
     """ПОПРАВКА #136: Оплата генетического тарифа"""
     await callback.answer()
     
-    text = """🧬 *ГЕНЕТИЧЕСКИЙ ТАРИФ*
+    text = """🧬 *ГЕНЕТИЧЕСКИЙ — 15000₽ / 3 месяца*
 
-💰 Стоимость: *15000₽* за 3 месяца
+Всё из персонального +
+*твой личный генетический коуч.*
 
-Что получишь:
-├─ ✅ Всё из персонального тарифа
-├─ 🧬 Генетический профиль (13 генов)
-│    _(COMT, MTHFR, BDNF, APOE, VDR и др.)_
-├─ 📊 Отчёт с рекомендациями по генам
-├─ 💊 Витамины под твою генетику
-├─ 🍽 Питание под генетику
-├─ 🛁 Ванны адаптированы под COMT
-└─ 💓 HRV интерпретация с учётом генов
+Гены определяют, почему одни и те же практики
+одному помогают, а другому нет.
 
-━━━━━━━━━━━━━━━━━━━━━
+*Что добавляется:*
 
-🧬 *Про генетику:*
-Гены определяют как ты усваиваешь 
-витамины, переносишь стресс, реагируешь 
-на кофеин, детоксицируешь токсины.
+🧬 *Генетический профиль (13 генов)* —
+COMT, BDNF, MTHFR, APOE, SOD2 и другие.
+Бот узнаёт, как твой мозг обрабатывает стресс
+и какие риски заложены от природы.
 
-Зная свои гены — получаешь точную 
-стратегию, а не «среднюю по больнице».
+🎯 *Три оси персонализации:*
+• Темп — как быстро наращивать нагрузку
+• Поддержка — сколько нужно напоминаний
+• Интенсивность — какой уровень практик готово принять тело
+
+🥗 *Питание под генотип* —
+как организм усваивает жиры, кофеин, фолаты.
+
+💊 *Витамины под генетику* —
+MTHFR мутация? Активная форма фолата.
+SOD2? Антиоксидантная поддержка.
+
+🛡️ *Управление наследственностью* —
+эпигенетика позволяет держать нежелательные гены
+«выключенными» через образ жизни.
+
+_Это высший уровень персонализации._
 
 ━━━━━━━━━━━━━━━━━━━━━
 
@@ -56601,6 +57089,90 @@ def generate_dementia_warning(data: dict) -> str:
     return text
 
 
+def generate_body_signals_explanations(data: dict) -> list:
+    """
+    Генерирует расшифровки визуальных признаков для подробного отчёта.
+    Каждый блок — отдельное сообщение.
+    """
+    blocks = []
+    user = data.get("user") or {}
+    ahs = data.get("ahs") or {}
+    stress = data.get("stress") or {}
+    sqs = data.get("sqs") or {}
+    
+    hpa_stage = ahs.get("hpa_stage", 0)
+    pss_score = stress.get("pss_total", 0)
+    sqs_score = sqs.get("sqs_total", 0)
+    ahs5 = ahs.get("ahs5", 0) or 0
+    ahs6 = ahs.get("ahs6", 0) or 0
+    night_wakeups = user.get("night_wakeups", "")
+    
+    # Кофе
+    if ahs5 >= 3:
+        blocks.append(
+            f"☕ *КОФЕИНОВАЯ ЗАВИСИМОСТЬ*\n\n"
+            f"Ты пьёшь много кофе — и это не случайность.\n"
+            f"Твои надпочечники истощены (стадия {hpa_stage}),\n"
+            f"и кофеин — единственное, что поддерживает энергию.\n\n"
+            f"Но кофеин маскирует усталость, не убирает её.\n"
+            f"А после 14:00 он разрушает архитектуру сна.\n\n"
+            f"*Что будем делать:*\n"
+            f"├── Постепенное снижение (не резко!)\n"
+            f"├── Замена на мягкие энергетики (свет + холод + дыхание)\n"
+            f"└── Восстановление надпочечников → кофе станет не нужен"
+        )
+    
+    # Сладкое
+    if ahs6 >= 3:
+        blocks.append(
+            "🍫 *ТЯГА К СЛАДКОМУ*\n\n"
+            "Тело просит сладкое не потому что ты «слабовольная».\n"
+            "Хронический стресс → кортизол скачет → сахар нестабилен\n"
+            "→ мозг требует быстрое топливо.\n\n"
+            "Это замкнутый круг:\n"
+            "стресс → сладкое → инсулин → ещё больше стресса.\n\n"
+            "*Что будем делать:*\n"
+            "├── Стабилизация кортизола (дыхание + ритм + ванны)\n"
+            "├── Питание, выравнивающее сахар в крови\n"
+            "└── Круг разорвётся сам, когда стресс снизится"
+        )
+    
+    # Раздражительность
+    if pss_score > 20 and sqs_score > 0 and sqs_score < 20:
+        blocks.append(
+            "😤 *РАЗДРАЖИТЕЛЬНОСТЬ*\n\n"
+            "«Короткий фитиль» — это не характер.\n"
+            "Это результат: плохой сон + высокий кортизол =\n"
+            "нервная система на пределе.\n\n"
+            "Парасимпатика (система торможения) не включается.\n"
+            "Ты буквально не можешь затормозить реакцию.\n\n"
+            "*Что будем делать:*\n"
+            "├── Восстановить качество сна (глимфатика + циркадка)\n"
+            "├── Снизить кортизол (дыхание 4-7-8 + капилляротерапия)\n"
+            "└── Парасимпатика начнёт работать → реакции станут мягче"
+        )
+    
+    # Ночные пробуждения
+    wakeup_bad = night_wakeups in ("three_plus", "on_demand")
+    if wakeup_bad or (sqs_score > 0 and sqs_score < 15):
+        blocks.append(
+            "🌙 *ПРОБУЖДЕНИЯ СРЕДИ НОЧИ*\n\n"
+            "Ты просыпаешься, потому что кортизол выбрасывается\n"
+            "в неправильное время. В норме он растёт к утру,\n"
+            "а у тебя скачет ночью.\n\n"
+            "Это значит:\n"
+            "├── Глимфатика не успевает очистить мозг\n"
+            "├── Фазы глубокого сна укорачиваются\n"
+            "└── Утром ощущение «не выспалась» даже после 8 часов\n\n"
+            "*Что будем делать:*\n"
+            "├── Восстановить циркадный ритм (свет утром, темнота вечером)\n"
+            "├── Дыхание 4-7-8 перед сном (кортизол ↓)\n"
+            "└── Капилляротерапия (нервная система в баланс)"
+        )
+    
+    return blocks
+
+
 def generate_transition_to_action_block(data: dict) -> str:
     """
     Переходный блок: от анализа к действию.
@@ -58164,7 +58736,7 @@ async def collect_summary_data(telegram_id: int) -> dict:
         # Возраст из группы
         age_group = user.get("age_group", "30-39")
         age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
-        data["passport_age"] = age_map.get(age_group, 35)
+        data["passport_age"] = user.get("exact_age") or age_map.get(age_group, 35)
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -66318,7 +66890,7 @@ async def save_bio_age_snapshot(telegram_id: int, source: str = "manual"):
         
         age_group = user.get("age_group", "30-39")
         age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
-        passport_age = age_map.get(age_group, 40)
+        passport_age = user.get("exact_age") or age_map.get(age_group, 40)
         
         # 1. Расчётный биовозраст (L1)
         bio_age_calc = await calculate_monthly_bio_age(telegram_id, "current")
@@ -66422,7 +66994,7 @@ async def get_bio_age_from_all_sources(telegram_id: int) -> dict:
     
     age_group = user.get("age_group", "30-39")
     age_map = {"18-29": 25, "30-39": 35, "40-49": 45, "50-59": 55, "60-69": 65, "70+": 75}
-    passport_age = age_map.get(age_group, 40)
+    passport_age = user.get("exact_age") or age_map.get(age_group, 40)
     
     result = {
         'passport_age': passport_age,
@@ -70937,19 +71509,31 @@ async def cognitive_menu_handler(callback: CallbackQuery, state: FSMContext):
     has_baseline = baseline is not None
     baths_done = hydro_profile.get("total_sessions", 0) if hydro_profile else 0
     
+    # Fallback: если нет baseline, но есть данные в cognitive_tracker
+    if not has_baseline:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT id FROM cognitive_tracker WHERE telegram_id = ? LIMIT 1",
+                    (callback.from_user.id,)
+                )
+                has_tracker = await cursor.fetchone()
+                if has_tracker:
+                    has_baseline = True
+        except:
+            pass
+    
     # Для новых пользователей — простой текст
     if not has_baseline:
-        text = f"""🧠 *КОГНИТИВНЫЙ ТРЕКЕР*
+        text = f"""🧠 *Когнитивный трекер*
 
-{name}, зафиксируем работу мозга сейчас.
+{name}, фиксируем как работает голова сейчас:
+ясность, память, концентрация, скорость мышления.
 
-После 15-20 ванн + улучшения сна 
-вы почувствуете разницу:
-• Голова яснее
-• Легче концентрироваться
-• Память лучше
+Через месяц сравним — и увидим,
+что реально меняется от сна, практик и привычек.
 
-📸 *Оценим текущее состояние?*"""
+9 вопросов, \\~3 минуты."""
         
         buttons = [
             [InlineKeyboardButton(text="✅ Оценить", callback_data="cognitive_start_baseline")],
@@ -70957,36 +71541,15 @@ async def cognitive_menu_handler(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
         ]
     else:
-        # Показываем прогресс с привязкой к ваннам
         index = baseline.get("cognitive_index", 0)
         baseline_date = baseline.get("baseline_date", "")
         interp = get_cognitive_interpretation(index)
         
-        # Прогресс по ваннам
-        target_baths = 20
-        progress_percent = min(100, int((baths_done / target_baths) * 100))
-        baths_remaining = max(0, 15 - baths_done)
-        
-        # Прогресс-бар
-        filled = int(progress_percent / 5)
-        progress_bar = "â–ˆ" * filled + "â–'" * (20 - filled)
-        
-        text = f"""🧠 *КОГНИТИВНЫЙ ТРЕКЕР*
+        text = f"""🧠 *Когнитивный трекер*
 
-📸 *Базовая линия:* {baseline_date}
-📊 *Стартовый индекс:* {index:.1f}/100
-{interp['emoji']} {interp['text']}
-
-🛁 *ВАШ ПРОГРЕСС:*
-
-Ванн сделано: {baths_done} из 15-20
-{progress_bar} {progress_percent}%
-"""
-        
-        if baths_done < 15:
-            text += f"\nДо первой проверки: ~{baths_remaining} ванн"
-        else:
-            text += "\n🎉 *Пора проверить когнитивные изменения!*"
+📸 Базовая линия: {baseline_date}
+📊 Стартовый индекс: {index:.1f}/100
+{interp['emoji']} {interp['text']}"""
         
         # Последняя оценка
         latest = await get_latest_cognitive_assessment(callback.from_user.id)
@@ -70996,8 +71559,10 @@ async def cognitive_menu_handler(callback: CallbackQuery, state: FSMContext):
             change_emoji = "📈" if change > 0 else "📉" if change < 0 else "➡️"
             text += f"""
 
-📈 *Текущий индекс:* {current_index:.1f}/100
-{change_emoji} *Изменение:* {change:+.1f}"""
+📈 Текущий индекс: {current_index:.1f}/100
+{change_emoji} Изменение: {change:+.1f}"""
+        
+        text += "\n\n_Следующая оценка — через месяц после предыдущей_"
         
         buttons = [
             [InlineKeyboardButton(text="📝 Оценить сейчас", callback_data="cognitive_weekly")],
@@ -71019,37 +71584,25 @@ async def cognitive_about_handler(callback: CallbackQuery):
     """О когнитивном трекере"""
     await callback.answer()
     
-    text = """📚 **О КОГНИТИВНОМ ТРЕКЕРЕ**
+    text = """🧠 *О когнитивном трекере*
 
-🎯 **Что это:**
-Система мониторинга когнитивных функций — 
-памяти, внимания, скорости мышления.
+*Что отслеживаем:*
+Ясность мышления, концентрация, память,
+скорость обработки, поиск слов, принятие решений.
 
-🧠 **Зачем:**
-Проект задумывался как «Мозг из Будущего» — 
-но вырос в комплексную систему здоровья.
-Мозг по-прежнему в центре, 
-а вокруг него — сон, стресс, капилляры, 
-лимфатика, гормоны и привычки.
+*Зачем:*
+Субъективные ощущения обманчивы.
+Трекер фиксирует цифры — и через месяц
+ты видишь реальную динамику, а не «кажется лучше».
 
-📊 **Что отслеживаем:**
-• Ясность мышления (туман в голове)
-• Концентрация и внимание
-• Краткосрочная память
-• Скорость обработки информации
-• Поиск слов (tip-of-the-tongue)
-• Принятие решений
+*Как это связано с остальным:*
+Сон, стресс, движение, питание —
+всё влияет на работу мозга.
+Трекер показывает, что именно помогает тебе.
 
-🔬 **Научное обоснование:**
-• Сон + глимфатика → очистка мозга
-• Стресс ↓ → гиппокамп защищён
-• Ванны Залманова → капилляры мозга ↑
-• HRV ↑ → префронтальная кора ↑
-
-⏱️ **Когда ждать улучшений:**
-• Первые изменения: 2-3 недели
-• Заметный прогресс: 4-6 недель
-• Выраженный эффект: 8+ недель"""
+*Как часто проходить:*
+Базовая линия → через 1 месяц → далее раз в месяц.
+Чаще нет смысла — изменения накапливаются постепенно."""
     
     keyboard = [[InlineKeyboardButton(text="🔙 Назад", callback_data="cognitive_menu")]]
     
@@ -71065,14 +71618,12 @@ async def cognitive_start_baseline(callback: CallbackQuery, state: FSMContext):
     """Начало фиксации когнитивной базовой линии"""
     await callback.answer()
     
-    text = """📸 **ФИКСАЦИЯ КОГНИТИВНОЙ БАЗОВОЙ ЛИНИИ**
+    text = """🧠 *Когнитивная базовая линия*
 
-Ответьте на 9 вопросов о работе вашего мозга
-за последнюю неделю.
+Оцени работу мозга за последнюю неделю.
+Это твоя точка А — потом сравним.
 
-⏱️ Займёт ~3 минуты.
-
-Готовы начать?"""
+9 вопросов, \\~3 минуты."""
     
     await state.update_data(
         assessment_type="full", 
@@ -71084,7 +71635,6 @@ async def cognitive_start_baseline(callback: CallbackQuery, state: FSMContext):
     
     keyboard = [
         [InlineKeyboardButton(text="🚀 Начать", callback_data="cognitive_next_question")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cognitive_menu")]
     ]
     
     await callback.message.edit_text(
@@ -71225,74 +71775,145 @@ async def cognitive_answer_handler(callback: CallbackQuery, state: FSMContext):
         await show_cognitive_question(callback, state)
 
 
+async def _save_to_cognitive_tracker(telegram_id: int, answers: dict):
+    """
+    Сохранить результат когнитивного теста (0-10) в cognitive_tracker.
+    Конвертирует 0-10 → 1-5 для совместимости с биовозрастом.
+    """
+    today = date.today().isoformat()
+    
+    mental_clarity = answers.get("mental_clarity", 5)
+    memory = answers.get("short_term_memory", 5)
+    concentration = answers.get("concentration", 5)
+    brain_fog = answers.get("brain_fog_days", 0)
+    decision_making = answers.get("decision_making", 5)
+    word_finding = answers.get("word_finding", 5)
+    
+    def to_5(val_10):
+        """0-10 → 1-5"""
+        return max(1, min(5, round(val_10 / 2)))
+    
+    # brain_fog_days (0-7) → brain_fog (1-5, где 5 = нет тумана)
+    fog_converted = max(1, min(5, 5 - brain_fog))
+    
+    mc5 = to_5(mental_clarity)
+    mem5 = to_5(memory)
+    con5 = to_5(concentration)
+    dm5 = to_5(decision_making)
+    wf5 = to_5(word_finding)
+    total = mc5 + mem5 + con5 + fog_converted + dm5 + wf5
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM cognitive_tracker WHERE telegram_id = ?",
+            (telegram_id,)
+        )
+        count = (await cursor.fetchone())[0]
+        week_number = count
+        
+        await db.execute("""
+            INSERT INTO cognitive_tracker (
+                telegram_id, check_date, week_number,
+                mental_clarity, memory, concentration,
+                brain_fog, decision_making, word_finding,
+                total_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            telegram_id, today, week_number,
+            mc5, mem5, con5, fog_converted, dm5, wf5, total
+        ))
+        await db.commit()
+
+
 async def save_cognitive_result(callback: CallbackQuery, state: FSMContext):
-    """Сохранить результат когнитивной оценки"""
+    """Сохранить результат когнитивной оценки — в обе таблицы"""
     data = await state.get_data()
     answers = data.get("answers", {})
     is_baseline = data.get("is_baseline", False)
+    from_onboarding = data.get("from_onboarding", False)
     
     telegram_id = callback.from_user.id
     
     if is_baseline:
-        # Сохраняем как baseline
-        await save_cognitive_baseline(telegram_id, answers)
+        # 1. Сохраняем в cognitive_baseline
+        try:
+            await save_cognitive_baseline(telegram_id, answers)
+        except Exception as e:
+            print(f"❌ cognitive baseline save error: {e}")
         
-        # Также сохраняем как первую оценку
-        answers["week_number"] = 0
-        await save_cognitive_assessment(telegram_id, answers)
+        # 2. Сохраняем в cognitive_assessments (для истории)
+        try:
+            answers_copy = answers.copy()
+            answers_copy["week_number"] = 0
+            await save_cognitive_assessment(telegram_id, answers_copy)
+        except Exception as e:
+            print(f"❌ cognitive assessment save error: {e}")
+        
+        # 3. Сохраняем в cognitive_tracker (совместимость с биовозрастом)
+        try:
+            await _save_to_cognitive_tracker(telegram_id, answers)
+        except Exception as e:
+            print(f"❌ cognitive tracker save error: {e}")
         
         baseline = await get_cognitive_baseline(telegram_id)
-        index = baseline.get("cognitive_index", 0)
+        index = baseline.get("cognitive_index", 0) if baseline else 0
         interp = get_cognitive_interpretation(index)
         
-        text = f"""📸 **КОГНИТИВНАЯ БАЗОВАЯ ЛИНИЯ ЗАФИКСИРОВАНА!**
-
-═══════════════════════════════════════
-
-🧠 **Ваш стартовый индекс:** {index:.1f}/100
-
-{interp['emoji']} {interp['text']}
-
-═══════════════════════════════════════
-
-💡 _Сохранили вашу стартовую точку!_
-_Еженедельно отслеживайте изменения._
-
-📅 Следующая оценка: через 1 месяц"""
+        text = (
+            f"📸 *Когнитивная базовая линия зафиксирована!*\n\n"
+            f"🧠 Стартовый индекс: *{index:.1f}/100*\n"
+            f"{interp['emoji']} {interp['text']}\n\n"
+            f"_Сохранили твою точку А._\n"
+            f"_Следующая оценка — через 1 месяц._"
+        )
         
     else:
-        # Сохраняем как обычную оценку
-        await save_cognitive_assessment(telegram_id, answers)
+        # Обычная оценка
+        try:
+            await save_cognitive_assessment(telegram_id, answers)
+        except Exception as e:
+            print(f"❌ cognitive assessment save error: {e}")
+        
+        try:
+            await _save_to_cognitive_tracker(telegram_id, answers)
+        except Exception as e:
+            print(f"❌ cognitive tracker save error: {e}")
         
         assessment = await get_latest_cognitive_assessment(telegram_id)
-        index = assessment.get("cognitive_index", 0)
-        change = assessment.get("index_change_from_baseline", 0) or 0
+        index = assessment.get("cognitive_index", 0) if assessment else 0
+        change = assessment.get("index_change_from_baseline", 0) or 0 if assessment else 0
         interp = get_cognitive_interpretation(index)
         
-        text = f"""✅ **КОГНИТИВНАЯ ОЦЕНКА СОХРАНЕНА!**
-
-═══════════════════════════════════════
-
-🧠 **Когнитивный индекс:** {index:.1f}/100
-📈 **Изменение от старта:** {change:+.1f}
-
-{interp['emoji']} {interp['text']}
-
-"""
+        text = (
+            f"✅ *Когнитивная оценка сохранена!*\n\n"
+            f"🧠 Когнитивный индекс: *{index:.1f}/100*\n"
+            f"📈 Изменение от старта: *{change:+.1f}*\n\n"
+            f"{interp['emoji']} {interp['text']}"
+        )
         
-        # Показываем сравнение если есть изменение
         if abs(change) >= 5:
             if change > 0:
-                text += "🎉 **Мозг работает лучше!**"
+                text += "\n\n🎉 *Мозг работает лучше!*"
             else:
-                text += "⚠️ **Проверьте сон, стресс и питание.**"
+                text += "\n\n💡 Проверь сон, стресс и питание."
     
     await state.clear()
     
-    keyboard = [
-        [InlineKeyboardButton(text="📊 Мой прогресс", callback_data="cognitive_progress")],
-        [InlineKeyboardButton(text="🔙 В меню трекера", callback_data="cognitive_menu")]
-    ]
+    # Если из онбординга — завершаем онбординг
+    if from_onboarding:
+        await save_user(telegram_id, {
+            "onboarding_completed": 1,
+            "onboarding_phase": 4,
+        })
+        
+        keyboard = [
+            [InlineKeyboardButton(text="📋 Сводный отчёт", callback_data="integrated_assessment")]
+        ]
+    else:
+        keyboard = [
+            [InlineKeyboardButton(text="📊 Мой прогресс", callback_data="cognitive_progress")],
+            [InlineKeyboardButton(text="🔙 В меню трекера", callback_data="cognitive_menu")]
+        ]
     
     await callback.message.edit_text(
         text,

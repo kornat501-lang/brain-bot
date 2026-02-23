@@ -25171,29 +25171,58 @@ def get_menu_keyboard(onboarding_phase: int = 0, current_mode: str = "home"):
     ПОПРАВКА #113: Иерархическое меню
     ПОПРАВКА #120: Добавлен сводный отчёт
     ОЧЕРЕДЬ 2: Добавлена кнопка режима
+    ПОПРАВКА: Меню по фазам онбординга — не показываем лишнее
     """
     mode_label = MODE_LABELS.get(current_mode, "🏠 Дома")
     
     buttons = []
     
-    # Кнопка "Продолжить диагностику" если тесты отложены (phase 2 или 3)
-    if onboarding_phase in (2, 3):
-        buttons.append([InlineKeyboardButton(text="📋 Продолжить диагностику", callback_data="onb_start_tests")])
+    # ════════════════════════════════════════
+    # ФАЗА 0-2: Онбординг не завершён
+    # ════════════════════════════════════════
+    if onboarding_phase <= 2:
+        buttons = [
+            [InlineKeyboardButton(text="📋 Продолжить диагностику", callback_data="onb_start_tests")],
+            [
+                InlineKeyboardButton(text="🆘 SOS", callback_data="sos_menu"),
+                InlineKeyboardButton(text=f"Режим: {mode_label}", callback_data="mode_switch_menu"),
+            ],
+            [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+        ]
     
-    buttons.extend([
-        [
-            InlineKeyboardButton(text="🆘 SOS", callback_data="sos_menu"),
-            InlineKeyboardButton(text=f"Режим: {mode_label}", callback_data="mode_switch_menu"),
-        ],
-        [InlineKeyboardButton(text="📋 Сводный отчёт", callback_data="summary_report")],
-        [InlineKeyboardButton(text="📊 Мой день", callback_data="menu_day")],
-        [InlineKeyboardButton(text="📦 Копилочка советов", callback_data="tip_bank_menu")],
-        [InlineKeyboardButton(text="🧪 Диагностика", callback_data="menu_diagnosis")],
-        [InlineKeyboardButton(text="🛁 Мои практики", callback_data="menu_practices")],
-        [InlineKeyboardButton(text="📈 Мой прогресс", callback_data="menu_progress")],
-        [InlineKeyboardButton(text="🔬 Продвинутое", callback_data="menu_advanced")],
-        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")]
-    ])
+    # ════════════════════════════════════════
+    # ФАЗА 3: Тесты в процессе
+    # ════════════════════════════════════════
+    elif onboarding_phase == 3:
+        buttons = [
+            [InlineKeyboardButton(text="📋 Продолжить диагностику", callback_data="onb_start_tests")],
+            [
+                InlineKeyboardButton(text="🆘 SOS", callback_data="sos_menu"),
+                InlineKeyboardButton(text=f"Режим: {mode_label}", callback_data="mode_switch_menu"),
+            ],
+            [InlineKeyboardButton(text="🧪 Диагностика", callback_data="menu_diagnosis")],
+            [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+        ]
+    
+    # ════════════════════════════════════════
+    # ФАЗА 4+: Тесты пройдены — полное меню
+    # ════════════════════════════════════════
+    else:
+        buttons = [
+            [
+                InlineKeyboardButton(text="🆘 SOS", callback_data="sos_menu"),
+                InlineKeyboardButton(text=f"Режим: {mode_label}", callback_data="mode_switch_menu"),
+            ],
+            [InlineKeyboardButton(text="📋 Сводный отчёт", callback_data="summary_report")],
+            [InlineKeyboardButton(text="📊 Мой день", callback_data="menu_day")],
+            [InlineKeyboardButton(text="📦 Копилочка советов", callback_data="tip_bank_menu")],
+            [InlineKeyboardButton(text="🧪 Диагностика", callback_data="menu_diagnosis")],
+            [InlineKeyboardButton(text="🛁 Мои практики", callback_data="menu_practices")],
+            [InlineKeyboardButton(text="📈 Мой прогресс", callback_data="menu_progress")],
+            [InlineKeyboardButton(text="🔬 Продвинутое", callback_data="menu_advanced")],
+            [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+        ]
+    
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -27444,6 +27473,7 @@ async def onb_legal_accept(callback: CallbackQuery, state: FSMContext):
         "_(Введите имя в поле сообщения)_",
         parse_mode="Markdown"
     )
+    await state.update_data(last_bot_msg_id=callback.message.message_id)
     await state.set_state(OnboardingStates.waiting_name)
 
 
@@ -27452,7 +27482,8 @@ async def cmd_menu(message: Message):
     """Команда /menu"""
     user = await get_user(message.from_user.id)
     mode = user.get("current_mode", "home") if user else "home"
-    await message.answer("📋 Главное меню:", reply_markup=get_menu_keyboard(current_mode=mode))
+    phase = user.get("onboarding_phase", 0) if user else 0
+    await message.answer("📋 Главное меню:", reply_markup=get_menu_keyboard(onboarding_phase=phase or 0, current_mode=mode))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -31466,8 +31497,20 @@ async def process_name(message: Message, state: FSMContext):
     
     await state.update_data(name=name)
     
+    # Очистка ленты: удаляем ответ пользователя и предыдущий вопрос бота
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    data = await state.get_data()
+    if data.get("last_bot_msg_id"):
+        try:
+            await bot.delete_message(message.chat.id, data["last_bot_msg_id"])
+        except Exception:
+            pass
+    
     # → Экран ПОЛ (1/10)
-    await message.answer(
+    msg = await message.answer(
         f"Приятно познакомиться, {name}! 😊\n\n"
         "Несколько вопросов, чтобы настроить\n"
         "программу под вас. Займёт 5 минут.\n\n"
@@ -31478,6 +31521,7 @@ async def process_name(message: Message, state: FSMContext):
             [InlineKeyboardButton(text="👨 Мужской", callback_data="onb_gender_male")]
         ])
     )
+    await state.update_data(last_bot_msg_id=msg.message_id)
 
 
 @router.callback_query(OnboardingStates.waiting_timezone, F.data.startswith("tz_"))
@@ -33973,6 +34017,19 @@ async def onb_process_exact_age(message: Message, state: FSMContext):
     age_group = get_age_group(age)
     
     await state.update_data(exact_age=age, age_group=age_group)
+    
+    # Очистка ленты
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    data = await state.get_data()
+    if data.get("last_bot_msg_id"):
+        try:
+            await bot.delete_message(message.chat.id, data["last_bot_msg_id"])
+        except Exception:
+            pass
+    
     await show_height_weight_screen(message, state, edit=False)
 
 
@@ -34003,7 +34060,8 @@ async def show_height_weight_screen(message, state: FSMContext, edit=False):
     if edit:
         await message.edit_text(text)
     else:
-        await message.answer(text)
+        msg = await message.answer(text)
+        await state.update_data(last_bot_msg_id=msg.message_id)
     await state.set_state(OnboardingStates.waiting_height_weight)
 
 
@@ -34049,12 +34107,25 @@ async def onb_process_height_weight(message: Message, state: FSMContext):
     
     await state.update_data(height_cm=height, weight_kg=weight)
     
+    # Очистка ленты
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    data = await state.get_data()
+    if data.get("last_bot_msg_id"):
+        try:
+            await bot.delete_message(message.chat.id, data["last_bot_msg_id"])
+        except Exception:
+            pass
+    
     # → Экран ГОРОД (4/10)
-    await message.answer(
+    msg = await message.answer(
         "[●●●●○○○○○○] 4/10\n\n"
         "В каком городе живёте?\n"
         "(Для учёта светового дня и климата)"
     )
+    await state.update_data(last_bot_msg_id=msg.message_id)
     await state.set_state(OnboardingStates.waiting_city_onb)
 
 
@@ -34071,6 +34142,18 @@ async def onb_process_city(message: Message, state: FSMContext):
     
     await state.update_data(city=city)
     
+    # Очистка ленты
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    data = await state.get_data()
+    if data.get("last_bot_msg_id"):
+        try:
+            await bot.delete_message(message.chat.id, data["last_bot_msg_id"])
+        except Exception:
+            pass
+    
     # Автоопределение часового пояса
     city_lower = city.lower().strip()
     tz_offset = CITY_TO_TIMEZONE.get(city_lower)
@@ -34086,13 +34169,14 @@ async def onb_process_city(message: Message, state: FSMContext):
             tz_label = f"МСК{msk_diff}"
         
         await state.update_data(timezone_offset=tz_offset)
-        await message.answer(
+        msg = await message.answer(
             f"✅ {city}, часовой пояс {tz_label} (UTC+{tz_offset})"
         )
+        await state.update_data(last_bot_msg_id=msg.message_id)
         await show_work_screen(message, state)  # ПОПРАВКА #137: цели убраны из онбординга
     else:
         # Город не найден — спрашиваем часовой пояс вручную
-        await message.answer(
+        msg = await message.answer(
             f"Не нашла «{city}» в базе.\n"
             "Укажите часовой пояс:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -34113,6 +34197,7 @@ async def onb_process_city(message: Message, state: FSMContext):
                 ],
             ])
         )
+        await state.update_data(last_bot_msg_id=msg.message_id)
         await state.set_state(OnboardingStates.waiting_city_tz_fallback)
 
 

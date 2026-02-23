@@ -2279,6 +2279,12 @@ async def init_db():
             ('morning_reminder_msg_id', 'INTEGER'),
             ('evening_reminder_msg_id', 'INTEGER'),
             ('bedtime_reminder_msg_id', 'INTEGER'),
+            # Менструальный цикл
+            ('tracking_cycle', 'INTEGER DEFAULT 0'),
+            ('cycle_status', 'TEXT'),
+            ('cycle_day', 'INTEGER'),
+            ('cycle_length', 'INTEGER DEFAULT 28'),
+            ('cycle_start_date', 'TEXT'),
         ]
         for col_name, col_type in onboarding_new_fields:
             try:

@@ -34829,7 +34829,7 @@ async def complete_onboarding_heredity(callback: CallbackQuery, state: FSMContex
 # ОНБОРДИНГ 2.0 — ЦИКЛ (после наследственности, для женщин 18-55)
 # ═══════════════════════════════════════════════════════════════
 
-@router.callback_query(OnboardingStates.waiting_cycle, F.data.startswith("onb_cycle_"))
+@router.callback_query(F.data.startswith("onb_cycle_"))
 async def onb_process_cycle(callback: CallbackQuery, state: FSMContext):
     """ОНБОРДИНГ 2.0: Менструальный цикл"""
     await callback.answer()
@@ -43623,7 +43623,12 @@ async def task_check_failed(callback: CallbackQuery):
 async def main():
     await init_db()
     await migrate_queue3_fields()  # ОЧЕРЕДЬ 3: новые поля в users
-    dp.include_router(router)
+    
+    # БАГФИКС: include_router только один раз (при retry router уже привязан)
+    try:
+        dp.include_router(router)
+    except RuntimeError:
+        pass  # Router already attached — OK при перезапуске
     
     # Запуск планировщика
     # БАГФИКС TIMEZONE: UTC вместо Europe/Riga — каждая функция сама вычисляет локальное время пользователя

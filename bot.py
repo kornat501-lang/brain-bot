@@ -27,6 +27,7 @@ import base64
 import httpx  # ПОПРАВКА #126: Для Claude Vision API
 import os
 import re
+import statistics
 from io import BytesIO  # ПОПРАВКА #139: Для графиков
 
 # ПОПРАВКА #139: Matplotlib для графиков анализов
@@ -347,6 +348,17 @@ async def init_db():
                 sqs_mini_score INTEGER,
                 ahs_mini_score INTEGER,
                 circ_mini_score INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # ПОПРАВКА: Кэш индивидуальных ответов для наследования между тестами
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS test_answers_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER,
+                test_type TEXT,
+                answers_json TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -1523,6 +1535,29 @@ async def init_db():
             except:
                 pass
         
+        # PRO-апселл: флаги предложенных полных тестов
+        pro_suggest_columns = [
+            ("ahs_full_suggested", "INTEGER DEFAULT 0"),
+            ("sqs_full_suggested", "INTEGER DEFAULT 0"),
+            ("pss10_suggested", "INTEGER DEFAULT 0"),
+        ]
+        for col_name, col_type in pro_suggest_columns:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+        
+        # Детекция сдвига режима
+        drift_columns = [
+            ("drift_last_asked", "TEXT"),
+            ("drift_observe_until", "TEXT"),
+        ]
+        for col_name, col_type in drift_columns:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+        
         # ПОПРАВКА #123: Таблица ежедневных чекинов
         await db.execute("""
             CREATE TABLE IF NOT EXISTS checkins (
@@ -2285,6 +2320,18 @@ async def init_db():
             ('cycle_day', 'INTEGER'),
             ('cycle_length', 'INTEGER DEFAULT 28'),
             ('cycle_start_date', 'TEXT'),
+            # Двухступенчатый онбординг
+            ('onboarding_step2_pending', 'INTEGER DEFAULT 0'),
+            ('onboarding_step2_remind_date', 'TEXT'),
+            ('step2_remind_count', 'INTEGER DEFAULT 0'),
+            # Наследственность — Неделя 2
+            ('heredity_completed', 'INTEGER DEFAULT 0'),
+            ('heredity_remind_date', 'TEXT'),
+            ('heredity_remind_count', 'INTEGER DEFAULT 0'),
+            # Фаза 4: План отката биовозраста
+            ('rollback_plan_active', 'INTEGER DEFAULT 0'),
+            ('rollback_plan_date', 'TEXT'),
+            ('rollback_check_date', 'TEXT'),
         ]
         for col_name, col_type in onboarding_new_fields:
             try:
@@ -2676,8 +2723,234 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_tip_bank_user ON tip_bank(telegram_id, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_tip_bank_type ON tip_bank(telegram_id, tip_type)")
 
+        # ════════════════════════════════════════════════════════
+        # ФАЗА 3: HRV SMART DIAGNOSTICS — БД
+        # ════════════════════════════════════════════════════════
+
+        # Устройства пользователя для HRV
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS hrv_devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER,
+                device_type TEXT,
+                device_model TEXT,
+                accuracy_tier TEXT,
+                available_metrics TEXT,
+                is_primary INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Алерты HRV
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS hrv_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER,
+                alert_type TEXT,
+                alert_data TEXT,
+                triggered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                acknowledged INTEGER DEFAULT 0,
+                action_taken TEXT
+            )
+        """)
+
+        # Расширение hrv_baseline
+        for col_name, col_type in [
+            ('baseline_ready', 'INTEGER DEFAULT 0'),
+            ('baseline_started_at', 'TEXT'),
+            ('baseline_days', 'INTEGER DEFAULT 0'),
+            ('device_type', 'TEXT'),
+            ('rmssd_std', 'REAL'),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE hrv_baseline ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+
+        # Расширение hrv_records
+        for col_name, col_type in [
+            ('vs_baseline_pct', 'REAL'),
+            ('interpretation', 'TEXT'),
+            ('context_json', 'TEXT'),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE hrv_records ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+
+        # Поля в users для HRV Smart
+        for col_name, col_type in [
+            ('hrv_device_type', 'TEXT'),
+            ('hrv_accuracy_tier', 'TEXT'),
+            ('hrv_available_metrics', 'TEXT'),
+            ('hrv_baseline_ready', 'INTEGER DEFAULT 0'),
+            ('hrv_evening_enabled', 'INTEGER DEFAULT 0'),
+            ('bgs_stage', 'INTEGER DEFAULT 0'),
+            ('bgs_last_assessed', 'TEXT'),
+            ('bgs_assessment_source', 'TEXT'),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+
+        # ═══════════════════════════════════════════════════════════════
+        # ФАЗА 3 ЧАТ 2: HRV Patterns + BGS Assessments
+        # ═══════════════════════════════════════════════════════════════
+
+        # Таблица обнаруженных паттернов HRV
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS hrv_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER,
+                pattern_type TEXT,
+                description TEXT,
+                strength REAL,
+                confidence TEXT,
+                data_points INTEGER,
+                emoji TEXT,
+                actionable INTEGER DEFAULT 0,
+                action_text TEXT,
+                discovered_at TEXT,
+                last_confirmed TEXT,
+                shown_to_user INTEGER DEFAULT 0,
+                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+            )
+        """)
+
+        # Таблица оценок стадии БГС (история пересмотров)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bgs_assessments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER,
+                date TEXT,
+                source TEXT,
+                old_stage INTEGER,
+                new_stage INTEGER,
+                ahs_score INTEGER,
+                cortisol_morning REAL,
+                cortisol_evening REAL,
+                dhea_s REAL,
+                raw_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+            )
+        """)
+
+        # Доп. поля в users для Чат 2
+        for col_name, col_type in [
+            ('hrv_patterns_unlocked', 'INTEGER DEFAULT 0'),
+            ('hrv_patterns_last_shown', 'TEXT'),
+            ('bgs_remind_later_date', 'TEXT'),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+
+        # ═══════════════════════════════════════════════════════════════
+        # МАРШРУТНАЯ КАРТА ОМОЛОЖЕНИЯ — ТАБЛИЦЫ (Чат 42)
+        # ═══════════════════════════════════════════════════════════════
+
+        # Состояние маршрута пользователя
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS roadmap_state (
+                telegram_id INTEGER PRIMARY KEY,
+                
+                -- Маршрут
+                roadmap_json TEXT,
+                roadmap_generated_at TEXT,
+                
+                -- Текущий статус
+                status TEXT DEFAULT 'not_started',
+                current_quarter INTEGER DEFAULT 1,
+                current_block TEXT,
+                current_intensity TEXT,
+                block_started_at TEXT,
+                block_week INTEGER DEFAULT 1,
+                
+                -- GAP снимок
+                last_gaps_json TEXT,
+                gaps_updated_at TEXT,
+                
+                -- Начальные значения
+                start_bio_age REAL,
+                start_gaps_json TEXT,
+                bgs_at_start INTEGER,
+                
+                -- Детокс
+                detox_status TEXT DEFAULT 'not_started',
+                detox_started_at TEXT,
+                detox_week INTEGER DEFAULT 0,
+                detox_genetics_applied INTEGER DEFAULT 0,
+                
+                -- Контрольные точки
+                last_checkpoint_at TEXT,
+                next_checkpoint_at TEXT,
+                month_number INTEGER DEFAULT 0,
+                
+                -- Метаданные
+                genetics_integrated INTEGER DEFAULT 0,
+                total_protocols_completed INTEGER DEFAULT 0,
+                skipped_protocols TEXT DEFAULT '[]',
+                last_interaction_at TEXT,
+                parallel_block TEXT,
+                cycle_number INTEGER DEFAULT 1,
+                
+                -- Пауза
+                paused_at TEXT,
+                pause_reason TEXT,
+                resumed_at TEXT,
+                
+                -- Лекарства (блокер 3)
+                last_roadmap_checkin TEXT,
+                
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+        ''')
+
+        # История пересмотров маршрута
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS roadmap_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER,
+                review_date TEXT DEFAULT (datetime('now')),
+                month_number INTEGER,
+                
+                -- GAP на момент пересмотра
+                gaps_json TEXT,
+                changes_json TEXT,
+                
+                -- Решение
+                action TEXT,
+                old_block TEXT,
+                new_block TEXT,
+                
+                -- Биовозраст
+                bio_age_at_review REAL,
+                bio_age_delta_from_start REAL,
+                
+                -- Сообщение
+                message_sent TEXT,
+                
+                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+            )
+        ''')
+
+        # Доп. поля в users для маршрута (лекарства — блокер 3)
+        for col_name, col_type in [
+            ('medications', "TEXT DEFAULT ''"),
+            ('chronic_conditions', "TEXT DEFAULT ''"),
+            ('medications_asked', "TEXT DEFAULT ''"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+
         await db.commit()
-        print("✅ База данных готова (включая Очередь 3: SOS, цикл, мотивация, детектив)!")
+        print("✅ База данных готова (включая Маршрутную карту омоложения — Чат 42)!")
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -6006,6 +6279,16 @@ def should_skip_for_mode(user: dict) -> bool:
 
 async def send_practice(bot_instance, telegram_id: int, block_key: str, mode: str, trigger: str):
     """Предложить практику пользователю. ПОПРАВКА #141: профиль-aware."""
+    
+    # ═══ МАРШРУТ: подставляем block_key из маршрута ═══
+    try:
+        roadmap_override = await resolve_practice_conflict(telegram_id)
+        if roadmap_override:
+            block_key = roadmap_override
+    except Exception:
+        pass
+    # ═══ END МАРШРУТ ═══
+    
     block = PRACTICE_BLOCKS.get(block_key)
     if not block:
         return
@@ -8810,6 +9093,11 @@ async def show_monthly_report(callback: CallbackQuery):
     """Показать ежемесячный отчёт."""
     await callback.answer()
     
+    # ═══ PRO-ГЕЙТ: Месячный отчёт ═══
+    if not await require_pro(callback, "monthly_reports"):
+        return
+    # ═══ END PRO-ГЕЙТ ═══
+    
     report = await generate_monthly_report(callback.from_user.id)
     
     await callback.message.edit_text(
@@ -8915,6 +9203,8 @@ class OnboardingStates(StatesGroup):
     waiting_payment_proof = State()
     # ПОПРАВКА #134: Промокод
     waiting_promo_code = State()
+    # Редактирование имени из настроек
+    waiting_name_edit = State()
     # ПОПРАВКА #135: Админ-активация
     waiting_admin_activate = State()
     # ОНБОРДИНГ 2.0: Новые состояния
@@ -9025,6 +9315,8 @@ class EveningStates(StatesGroup):
     waiting_coffee_amount = State()   # Количество кофе
     waiting_falling_asleep = State()
     # БАГФИКС: Давление после ванны
+    # ФАЗА 3: Вечерний HRV замер
+    waiting_evening_hrv_rmssd = State()
     waiting_bp_after_bath_systolic = State()
     waiting_bp_after_bath_diastolic = State()
     waiting_bp_after_bath_pulse = State()
@@ -9117,12 +9409,13 @@ class SyndromeStates(StatesGroup):
 
 class CircadianTestStates(StatesGroup):
     """Состояния теста циркадных ритмов (12 вопросов)"""
+    in_test = State()      # НОВОЕ: Универсальное состояние для наследования
     waiting_c1 = State()   # Утренний свет
     waiting_c2 = State()   # Завтрак
     waiting_c3 = State()   # Стабильность пробуждения
     waiting_c4 = State()   # Синий свет вечером
     waiting_c5 = State()   # Время засыпания
-    waiting_c6 = State()   # Пик продуктивности
+    waiting_c6 = State()   # Утренняя инерция
     waiting_c7 = State()   # Кофеин
     waiting_c8 = State()   # Усталость утром
     waiting_c9 = State()   # "Второе дыхание"
@@ -9132,12 +9425,11 @@ class CircadianTestStates(StatesGroup):
 
 
 class ChronotypeStates(StatesGroup):
-    """ПОПРАВКА #73: Тест хронотипа (5 вопросов)"""
+    """ПОПРАВКА #73: Тест хронотипа (4 вопроса)"""
     waiting_q1 = State()  # Время естественного пробуждения
     waiting_q2 = State()  # Время естественного засыпания
     waiting_q3 = State()  # Пик энергии
-    waiting_q4 = State()  # Лучшее время для важных дел
-    waiting_q5 = State()  # Выходные без будильника
+    waiting_q4 = State()  # Выходные без будильника
     waiting_choice = State()  # Выбор пользователя (остаться/сдвигаться)
 
 
@@ -9991,15 +10283,15 @@ COGNITIVE_QUESTIONS_ORDER = {
     "full": [
         "mental_clarity", "concentration", "short_term_memory",
         "processing_speed", "word_finding", "multitasking",
-        "decision_making", "brain_fog_days", "overall_cognitive",
+        "decision_making", "overall_cognitive",
         "dreams_recall", "creativity"
     ],
     "standard": [
         "mental_clarity", "concentration", "short_term_memory",
-        "processing_speed", "brain_fog_days", "overall_cognitive"
+        "processing_speed", "overall_cognitive"
     ],
     "simplified": [
-        "mental_clarity", "brain_fog_days", "overall_cognitive"
+        "mental_clarity", "overall_cognitive"
     ]
 }
 
@@ -12532,6 +12824,42 @@ async def send_morning_reminders():
                 else:
                     continue
             
+            # ═══ МАРШРУТ: Понедельный план ═══
+            if date.today().weekday() == 0:  # Понедельник
+                try:
+                    roadmap_ctx = await get_active_roadmap_context(tid)
+                    if roadmap_ctx and roadmap_ctx.get('block'):
+                        name_rm = user.get("name", "друг")
+                        block = roadmap_ctx['block']
+                        week = roadmap_ctx['week']
+                        block_name = _get_protocol_name(block)
+                        block_emoji = _get_protocol_emoji(block)
+                        
+                        # Получаем текст недели
+                        texts = ALL_PROTOCOL_TEXTS.get(block, {})
+                        intensity = roadmap_ctx.get('intensity', '')
+                        week_key = f"{intensity}_week_{week}" if intensity else f"week_{week}"
+                        week_text = texts.get(week_key) or texts.get(f"week_{week}", "")
+                        
+                        plan_msg = (
+                            f"📅 *{name_rm}, план на неделю:*\n\n"
+                            f"{block_emoji} *{block_name}* — неделя {week}\n\n"
+                            f"{week_text}\n\n"
+                            f"Хорошей недели! 💚"
+                        )
+                        await bot.send_message(
+                            chat_id=tid, text=plan_msg, parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
+                                [InlineKeyboardButton(text="▶️ Утренний чек-ин", callback_data="morning_checkin")],
+                            ])
+                        )
+                        print(f"✅ Понедельный план маршрута: {tid}")
+                        continue  # Вместо стандартного утреннего
+                except Exception as e:
+                    print(f"⚠️ Ошибка понедельного плана {tid}: {e}")
+            # ═══ END МАРШРУТ ═══
+            
             # Проверяем, был ли уже утренний чек-ин сегодня
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
@@ -13174,6 +13502,16 @@ async def send_supplement_reminders():
 
 {supp_list}"""
                 
+                # ═══ МАРШРУТ: добавляем контекст ═══
+                try:
+                    roadmap_ctx = await get_active_roadmap_context(telegram_id)
+                    if roadmap_ctx and roadmap_ctx.get('block'):
+                        block_name = _get_protocol_name(roadmap_ctx['block'])
+                        text += f"\n\n🗺️ _{block_name} — неделя {roadmap_ctx.get('week', '?')}_"
+                except Exception:
+                    pass
+                # ═══ END МАРШРУТ ═══
+                
                 # Формируем данные для кнопок
                 supp_ids = ",".join([s['supplement_id'] for s in supps_now])
                 
@@ -13369,6 +13707,18 @@ async def send_bath_reminder():
                 telegram_id = user['telegram_id']
                 name = user['name'] or "друг"
                 
+                # ═══ МАРШРУТ: контекст ванн ═══
+                bath_extra = ""
+                try:
+                    roadmap_ctx = await get_active_roadmap_context(telegram_id)
+                    if roadmap_ctx and roadmap_ctx.get('block'):
+                        block_emoji = _get_protocol_emoji(roadmap_ctx['block'])
+                        block_name = _get_protocol_name(roadmap_ctx['block'])
+                        bath_extra = f"\n🗺️ Маршрут: {block_emoji} {block_name} — неделя {roadmap_ctx.get('week', '?')}"
+                except Exception:
+                    pass
+                # ═══ END МАРШРУТ ═══
+                
                 await bot.send_message(
                     chat_id=telegram_id,
                     text=f"""🛁 *{name}, сегодня день ванны!*
@@ -13378,7 +13728,7 @@ async def send_bath_reminder():
 ├── Эмульсию Залманова
 ├── Полотенце
 
-Идеальное время: за 2-3 часа до сна.
+Идеальное время: за 2-3 часа до сна.{bath_extra}
 
 💚 Аврора""",
                     parse_mode="Markdown",
@@ -13699,6 +14049,22 @@ async def generate_weekly_report_v2(telegram_id: int, name: str, gender: str) ->
 {jetlag['message']}"""
     except Exception:
         pass
+    
+    # ═══ МАРШРУТ: строка статуса ═══
+    try:
+        roadmap_ctx = await get_active_roadmap_context(telegram_id)
+        if roadmap_ctx and roadmap_ctx.get('block'):
+            block_emoji = _get_protocol_emoji(roadmap_ctx['block'])
+            block_name = _get_protocol_name(roadmap_ctx['block'])
+            week = roadmap_ctx.get('week', '?')
+            proto = ROADMAP_PROTOCOLS.get(roadmap_ctx['block'], {})
+            total_w = proto.get("duration_weeks", {}).get(roadmap_ctx.get('intensity', ''), '?')
+            if isinstance(total_w, dict):
+                total_w = list(total_w.values())[0] if total_w else '?'
+            text += f"\n\n🗺️ *Маршрут:* {block_emoji} {block_name} — неделя {week}/{total_w}"
+    except Exception:
+        pass
+    # ═══ END МАРШРУТ ═══
     
     text += f"""
 
@@ -18918,14 +19284,6 @@ CHRONOTYPE_QUESTIONS = {
         ]
     },
     4: {
-        "text": "Если нужно сделать важное дело — когда лучше?",
-        "options": [
-            ("🐤 Рано утром", "lark"),
-            ("🕊️ В середине дня", "pigeon"),
-            ("🦉 Вечером", "owl"),
-        ]
-    },
-    5: {
         "text": "Выходные без будильника — во сколько встаёте?",
         "options": [
             ("🐤 Как обычно, рано", "lark"),
@@ -18937,7 +19295,7 @@ CHRONOTYPE_QUESTIONS = {
 
 
 def determine_chronotype(answers: dict) -> str:
-    """Определить хронотип по ответам"""
+    """Определить хронотип по ответам (4 вопроса)"""
     scores = {
         'lark': 0,
         'pigeon': 0,
@@ -18952,17 +19310,21 @@ def determine_chronotype(answers: dict) -> str:
     # Объединяем owl и night_owl для определения
     owl_total = scores['owl'] + scores['night_owl']
     
-    if scores['lark'] >= 3:
+    # Пороги скорректированы под 4 вопроса
+    if scores['lark'] >= 3:             # 75% — уверенный жаворонок
         return 'lark'
-    elif scores['night_owl'] >= 2:
+    elif scores['night_owl'] >= 2:      # 50% — выраженная ночная сова
         return 'night_owl'
-    elif owl_total >= 3:
+    elif owl_total >= 3:                # 75% — уверенная сова
         return 'owl'
-    elif scores['pigeon'] >= 2:
+    elif scores['lark'] >= 2 and scores['pigeon'] <= 1:  # 50% + не голубь
+        return 'lark'
+    elif owl_total >= 2 and scores['pigeon'] <= 1:        # 50% + не голубь
+        return 'owl'
+    elif scores['pigeon'] >= 2:         # 50% — голубь
         return 'pigeon'
     else:
-        # По умолчанию - голубь
-        return 'pigeon'
+        return 'pigeon'  # по умолчанию
 
 
 def get_chronotype_info(chronotype: str) -> dict:
@@ -18981,8 +19343,8 @@ def get_chronotype_info(chronotype: str) -> dict:
         'pigeon': {
             'emoji': '🕊️',
             'name': 'Голубь',
-            'target_bed': '23:00',
-            'target_wake': '07:00',
+            'target_bed': '22:15',
+            'target_wake': '06:15',
             'glymphatic': 'оптимально',
             'glymphatic_pct': '🟢',
             'light': 'Естественный утренний свет',
@@ -18991,9 +19353,9 @@ def get_chronotype_info(chronotype: str) -> dict:
         'owl': {
             'emoji': '🦉',
             'name': 'Сова',
-            'target_bed': '23:45',
-            'target_wake': '07:45',
-            'glymphatic': 'средний риск',
+            'target_bed': '22:45',
+            'target_wake': '06:45',
+            'glymphatic': 'лёгкий сдвиг',
             'glymphatic_pct': '🟡',
             'light': '10000 люкс утром 30 мин',
             'show_choice': True
@@ -19001,10 +19363,10 @@ def get_chronotype_info(chronotype: str) -> dict:
         'night_owl': {
             'emoji': '🦇',
             'name': 'Выраженная сова',
-            'target_bed': '00:30',
-            'target_wake': '08:30',
-            'glymphatic': 'высокий риск',
-            'glymphatic_pct': '🔴',
+            'target_bed': '23:30',
+            'target_wake': '07:30',
+            'glymphatic': 'сдвиг пика',
+            'glymphatic_pct': '🟠',
             'light': '10000+ люкс утром 45 мин',
             'show_choice': True
         }
@@ -19218,9 +19580,9 @@ async def get_personalized_bedtime(telegram_id: int) -> dict:
     chronotype = user.get("chronotype", "pigeon") if user else "pigeon"
     target_times = {
         "lark": {"bed": "22:00", "wake": "06:00"},
-        "pigeon": {"bed": "23:00", "wake": "07:00"},
-        "owl": {"bed": "00:00", "wake": "08:00"},
-        "night_owl": {"bed": "00:30", "wake": "08:30"},
+        "pigeon": {"bed": "22:15", "wake": "06:15"},
+        "owl": {"bed": "22:45", "wake": "06:45"},
+        "night_owl": {"bed": "23:30", "wake": "07:30"},
     }
     times = target_times.get(chronotype, target_times["pigeon"])
     
@@ -19293,21 +19655,21 @@ GLYMPHATIC_RISK = {
     },
     "neutral": {
         "risk": "low",
-        "note": "Оптимальное покрытие окна глимфатики при 23:00-07:00",
-        "compensation": "Не нужна — стандартный режим идеален",
+        "note": "Хорошее покрытие пика глимфатики при отбое 22:15",
+        "compensation": "Минимальная — стандартный режим",
         "mg_dose": 200,
         "light": "Естественный утренний свет",
     },
     "owl": {
         "risk": "medium",
-        "note": "N3 смещён на 1-2ч → меньше overlap с окном глимфатики",
-        "compensation": "Сон 7.5+ ч, утренний свет 10000 люкс 30 мин, магний 400 мг",
+        "note": "N3 начинается ~23:30 — теряется 30 мин пика глимфатики",
+        "compensation": "Сон 8+ ч, утренний свет 10000 люкс 30 мин, магний 400 мг",
         "mg_dose": 400,
-        "light": "Утром: 10000 люкс 30 мин (сдвигает фазу)",
+        "light": "Утром: 10000 люкс 30 мин (сдвигает фазу раньше)",
     },
     "extreme_owl": {
         "risk": "high",
-        "note": "N3 смещён значительно → глимфатика недокомпенсирована",
+        "note": "N3 начинается ~00:15 — теряется 1+ час пика глимфатики",
         "compensation": "Сон 8+ ч, утренний свет 10000+ люкс 45 мин, магний 400 мг + B6",
         "mg_dose": 400,
         "light": "Утром: 10000+ люкс 45 мин (обязательно!)",
@@ -20144,11 +20506,22 @@ _Работая над этими показателями._"""
 
 {chr(10).join(heredity_list)}{genetics_hint}"""
     else:
-        msg6 = """━━━━━━━━━━━━━━━━━━━━━
+        # Наследственность не заполнена — показываем заглушку
+        heredity_stub = "⏳ Впереди по плану (6 вопросов, 1 минута)"
+        try:
+            created = user.get("created_at")
+            if created:
+                days_in = (date.today() - datetime.fromisoformat(str(created).replace("Z", "+00:00")).date()).days
+                if days_in >= 7:
+                    heredity_stub = "❗ Не заполнена — семейные риски не учтены"
+        except:
+            pass
+        
+        msg6 = f"""━━━━━━━━━━━━━━━━━━━━━
 
 🧬 *НАСЛЕДСТВЕННОСТЬ:*
 
-└─ Не указана"""
+└─ {heredity_stub}"""
     
     messages.append(msg6)
     
@@ -20191,18 +20564,24 @@ TARIFF_INFO = {
         'price': 0,
         'duration_days': 0,
         'features': [
-            '📋 Сводный отчёт (диагностика)',
-            '📊 Тесты (циркадка, сон, стресс, БГС)',
+            '📊 Экспресс-диагностика (5 направлений)',
+            '📋 Сводный отчёт с картиной здоровья',
             '🧬 Расчёт биологического возраста',
+            '🧠 Когнитивный трекер (baseline + ежемесячно)',
+            '🪞 Трекер видимых изменений',
+            '🌅 Базовые рекомендации (3 действия на направление)',
+            '📝 Повторный мини-тест (динамика)',
         ],
         'locked': [
-            '📋 Подробный отчёт',
-            '🎯 Цели и план',
-            '💊 Персональные витамины',
+            '🔥 Полные тесты (стресс, сон, БГС, тревожность)',
+            '💊 Персональные витамины и добавки',
+            '📋 Подробный отчёт с протоколами',
+            '🎯 Персональный маршрут восстановления',
+            '✅ Ежедневные чекины с Авророй',
+            '📊 Еженедельные отчёты прогресса',
             '🛁 Капилляротерапия',
             '💓 HRV-мониторинг',
             '🍽 Персональное питание',
-            '🧬 Генетический анализ',
         ]
     },
     'basic': {
@@ -20210,19 +20589,20 @@ TARIFF_INFO = {
         'price': 3000,
         'duration_days': 90,
         'features': [
-            '📋 Все отчёты (сводный + подробный)',
-            '🎯 Цели и план восстановления',
-            '💊 Общие витамины по протоколу',
-            '🛁 Капилляротерапия (ванны Залманова)',
-            '✅ Ежедневные чекины',
+            '📋 Подробный отчёт с протоколами',
+            '🔥 Полные тесты (стресс PSS-10, сон SQS, БГС, GAD-7)',
+            '🎯 Персональный маршрут восстановления',
+            '✅ Ежедневные чекины с Авророй',
             '📊 Еженедельные отчёты прогресса',
-            '💬 Поддержка Авроры',
-            '🔄 Пересчёт биовозраста через 3 мес',
+            '🛁 Капилляротерапия (ванны Залманова)',
+            '💊 Витамины по протоколу (общий)',
+            '💓 HRV-мониторинг',
+            '🔄 Пересчёт биовозраста через 3 месяца',
         ],
         'locked': [
-            '💓 HRV-мониторинг',
-            '💊 Витамины по анализам',
+            '💊 Витамины по твоим анализам',
             '🍽 Персональное питание',
+            '🕵️ Пищевой детектив',
             '🧬 Генетический анализ',
         ]
     },
@@ -20232,18 +20612,16 @@ TARIFF_INFO = {
         'duration_days': 90,
         'features': [
             '✅ Всё из базового тарифа',
-            '💓 HRV-мониторинг (Apple Watch, Garmin, Polar)',
-            '💊 Витамины по твоим анализам',
+            '💊 Витамины по твоим анализам крови',
             '🍽 Персональное питание',
-            '🧬 Учёт наследственности в питании',
+            '🕵️ Пищевой детектив (пульс-тест)',
             '🛒 Список покупок на неделю',
             '📈 Расширенная аналитика',
         ],
         'locked': [
             '🧬 Генетический профиль (13 генов)',
             '💊 Витамины под генетику',
-            '🍽 Питание под генетику',
-            '🛁 Ванны под COMT',
+            '🍽 Питание под генотип',
         ]
     },
     'genetic': {
@@ -20253,12 +20631,10 @@ TARIFF_INFO = {
         'features': [
             '✅ Всё из персонального тарифа',
             '🧬 Генетический профиль (13 генов)',
-            '📝 Ввод/загрузка генотипов',
-            '📊 Отчёт с рекомендациями по генам',
-            '💊 Витамины под твою генетику',
-            '🍽 Питание под генетику',
-            '🛁 Ванны под COMT (адаптация протокола)',
-            '💓 HRV интерпретация под генетику',
+            '💊 Витамины под генетику',
+            '🍽 Питание под генотип',
+            '🛁 Ванны под COMT',
+            '🛡️ Управление наследственными рисками',
         ],
         'locked': []
     }
@@ -20270,6 +20646,232 @@ TARIFF_UPGRADE_PRICES = {
     'basic_to_genetic': 12000,     # Базовый → Генетический
     'personal_to_genetic': 8000,   # Персональный → Генетический
 }
+
+
+# ═══════════════════════════════════════════════════════════════
+# PRO-КОНТЕНТ: ПОЛНЫЕ ТЕСТЫ — ДОСТУП ПО ТАРИФУ
+# ═══════════════════════════════════════════════════════════════
+
+PRO_TESTS = {
+    "stress_test_start": {
+        "name": "Полный тест стресса PSS-10 + GAD-7",
+        "benefit": "Покажет точную динамику и какие аспекты стресса доминируют",
+        "emoji": "🔥",
+    },
+    "sleep_test_start": {
+        "name": "Полный тест сна SQS",
+        "benefit": "Проверит апноэ, условия спальни и подберёт протокол сна",
+        "emoji": "😴",
+    },
+    "ahs_test_start": {
+        "name": "Полный тест БГС",
+        "benefit": "Определит стадию истощения → подберу витамины и добавки",
+        "emoji": "⚡",
+    },
+}
+
+
+async def check_pro_test_access(telegram_id: int, test_callback: str) -> dict:
+    """
+    Проверяет доступ к полному тесту.
+    Returns: {'allowed': bool, ...}
+    """
+    if test_callback not in PRO_TESTS:
+        return {'allowed': True}
+    
+    tariff = await get_user_tariff(telegram_id)
+    
+    # Платный тариф — всё доступно
+    if tariff.get('type') in ('basic', 'personal', 'genetic'):
+        return {'allowed': True}
+    
+    # FREE — заблокировано
+    user = await get_user(telegram_id)
+    test_info = PRO_TESTS[test_callback]
+    name = user.get('name', 'друг') if user else 'друг'
+    
+    upsell_text = (
+        f"{test_info['emoji']} *{test_info['name']}*\n\n"
+        f"{name}, этот тест доступен в PRO.\n\n"
+        f"💡 *Что он даст:*\n"
+        f"{test_info['benefit']}\n\n"
+        f"Мини-тест уже показал проблему — "
+        f"полный тест покажет *что именно делать*."
+    )
+    
+    return {
+        'allowed': False,
+        'test_name': test_info['name'],
+        'upsell_text': upsell_text,
+    }
+
+
+async def show_test_locked(callback, access: dict):
+    """Показывает экран заблокированного теста с апселлом"""
+    await callback.message.edit_text(
+        access['upsell_text'],
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💚 Узнать про PRO", callback_data="show_tariffs")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_diagnosis")]
+        ])
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# FREE-РЕКОМЕНДАЦИИ: "ЧТО делать" без деталей PRO
+# ═══════════════════════════════════════════════════════════════
+
+FREE_RECOMMENDATIONS = {
+    "adrenal_fatigue": {
+        "direction": "Восстановление баланса гормонов стресса",
+        "free_actions": [
+            "Дыхание 4-7-8 перед сном",
+            "Прогулка 20 минут утром (солнечный свет)",
+            "Ложиться до 23:00",
+        ],
+        "pro_teaser": "В PRO: точная стадия + протокол витаминов + контроль динамики",
+    },
+    "poor_sleep": {
+        "direction": "Улучшение архитектуры сна",
+        "free_actions": [
+            "Убрать экраны за 2 часа до сна",
+            "Проветрить спальню (18-20°C)",
+            "Стабильное время подъёма",
+        ],
+        "pro_teaser": "В PRO: проверка апноэ + магний + мелатонин + полный протокол",
+    },
+    "high_stress": {
+        "direction": "Разгрузка системы стресс-ответа",
+        "free_actions": [
+            "Техника дыхания 4-7-8",
+            "5 минут тишины утром",
+            "Прогулка без телефона",
+        ],
+        "pro_teaser": "В PRO: нутрицевтики для нервной системы + персональная программа",
+    },
+    "circadian_disruption": {
+        "direction": "Синхронизация внутренних часов",
+        "free_actions": [
+            "Яркий свет в первые 30 минут утра",
+            "Тёплый свет после 20:00",
+            "Стабильный режим ± 30 минут",
+        ],
+        "pro_teaser": "В PRO: точное время мелатонина + световой протокол + питание по часам",
+    },
+    "cognitive_decline": {
+        "direction": "Поддержка когнитивных функций",
+        "free_actions": [
+            "Сон 7-8 часов (глимфатика!)",
+            "Прогулка 30 минут (нейротрофины)",
+            "Убрать сахар и быстрые углеводы",
+        ],
+        "pro_teaser": "В PRO: ноотропы + персональный когнитивный план",
+    },
+}
+
+
+async def check_pro_test_suggestion(telegram_id: int, user: dict) -> dict | None:
+    """Проверяет, пора ли предложить полный тест (для PRO-апселла в чекине)"""
+    tariff = await get_user_tariff(telegram_id)
+    
+    # Только для FREE пользователей
+    if tariff.get('type') != 'free':
+        return None
+    
+    name = user.get('name', 'друг')
+    created = user.get('created_at', '')
+    days = 0
+    if created:
+        try:
+            from datetime import datetime
+            created_dt = datetime.fromisoformat(created.replace('Z', '+00:00')) if 'T' in created else datetime.strptime(created, '%Y-%m-%d')
+            days = (datetime.now() - created_dt.replace(tzinfo=None)).days
+        except:
+            pass
+    
+    # AHS — через 7 дней, если мини показал проблему
+    if days >= 7 and not user.get('ahs_full_suggested'):
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT ahs_mini_score FROM mini_test_results WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (telegram_id,)
+                )
+                row = await cursor.fetchone()
+                if row and row['ahs_mini_score'] >= 8:
+                    await save_user(telegram_id, {'ahs_full_suggested': 1})
+                    return {
+                        'text': (
+                            f"💚 {name}, мини-тест показал утомление надпочечников.\n\n"
+                            "Тебе *важно поработать над восстановлением "
+                            "баланса гормонов стресса*.\n\n"
+                            "Базовые вещи (дыхание, сон, прогулки) уже помогают. "
+                            "Но для *точного протокола восстановления* "
+                            "мне нужно определить стадию.\n\n"
+                            "Полный тест + персональный план — в PRO 💊"
+                        ),
+                        'button_text': "💚 Узнать про PRO",
+                        'button_callback': "show_tariffs",
+                    }
+        except:
+            pass
+    
+    # SQS — через 7 дней
+    if days >= 7 and not user.get('sqs_full_suggested'):
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT sqs_mini_score FROM mini_test_results WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (telegram_id,)
+                )
+                row = await cursor.fetchone()
+                if row and row['sqs_mini_score'] <= 10:
+                    await save_user(telegram_id, {'sqs_full_suggested': 1})
+                    return {
+                        'text': (
+                            f"💚 {name}, мини-тест показал что "
+                            "*нужно поработать над архитектурой сна*.\n\n"
+                            "Базовые привычки ты уже знаешь. "
+                            "Полный тест проверит апноэ, условия спальни "
+                            "и подберёт *точный протокол* улучшения сна.\n\n"
+                            "Доступен в PRO 😴"
+                        ),
+                        'button_text': "😴 Узнать про PRO",
+                        'button_callback': "show_tariffs",
+                    }
+        except:
+            pass
+    
+    # PSS-10 — через 14 дней
+    if days >= 14 and not user.get('pss10_suggested'):
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT pss4_score FROM mini_test_results WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (telegram_id,)
+                )
+                row = await cursor.fetchone()
+                if row and row['pss4_score'] >= 8:
+                    await save_user(telegram_id, {'pss10_suggested': 1})
+                    return {
+                        'text': (
+                            f"💚 {name}, ты уже 2 недели со мной!\n\n"
+                            "Система стресс-ответа у тебя перегружена. "
+                            "Базовые практики помогают, но для *точной "
+                            "корректировки программы* нужна детальная картина.\n\n"
+                            "Полный тест стресса + персональный план — в PRO 🔥"
+                        ),
+                        'button_text': "🔥 Узнать про PRO",
+                        'button_callback': "show_tariffs",
+                    }
+        except:
+            pass
+    
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -20503,6 +21105,138 @@ def can_access_feature(tariff_type: str, feature: str) -> bool:
         return feature in basic_features
     else:
         return False  # Бесплатный — только диагностика
+
+
+# ═══════════════════════════════════════════════════════════════
+# УНИВЕРСАЛЬНЫЙ PRO-ГЕЙТ
+# ═══════════════════════════════════════════════════════════════
+
+PRO_TEASERS = {
+    "vitamins_basic": (
+        "💊 *Базовые добавки (для всех):*\n\n"
+        "├─ Витамин D3 — 2000-4000 IU\n"
+        "├─ Омега-3 (EPA+DHA) — 1000mg\n"
+        "└─ Магний глицинат — 400mg\n\n"
+        "Это основа. Работает у 90% людей.\n\n"
+        "🔒 *В PRO:*\n"
+        "Персональный протокол по стадии БГС,\n"
+        "нутрицевтики под стресс/сон/когнитивку,\n"
+        "точные дозировки \\+ ссылки на покупку."
+    ),
+    
+    "capillary_therapy": (
+        "🛁 *Капилляротерапия (ванны Залманова)*\n\n"
+        "Метод восстановления микроциркуляции.\n"
+        "Улучшает кровоснабжение мозга и органов.\n\n"
+        "🆓 *Что можно попробовать:*\n"
+        "Тёплая ванна 36-37°C, 15 минут перед сном.\n"
+        "Уже улучшит засыпание и расслабление.\n\n"
+        "🔒 *В PRO:*\n"
+        "Полная схема (белая/жёлтая/смешанная),\n"
+        "персонализация под давление и дермографизм,\n"
+        "трекер ванн \\+ адаптация по циклу."
+    ),
+    
+    "weekly_reports": (
+        "📊 *Еженедельный отчёт прогресса*\n\n"
+        "Каждую неделю Аврора анализирует:\n"
+        "├─ Динамику стресса, сна, энергии\n"
+        "├─ Что сработало, а что нет\n"
+        "└─ Корректировки на следующую неделю\n\n"
+        "Доступен в PRO 💚\n\n"
+        "💡 Базовый тариф — 3000₽ / 3 мес (\\~33₽/день)"
+    ),
+    
+    "monthly_reports": (
+        "📈 *Ежемесячный отчёт*\n\n"
+        "Глубокий анализ за месяц:\n"
+        "├─ Тренды всех показателей\n"
+        "├─ Пересчёт биовозраста\n"
+        "├─ Сравнение «ДО и ПОСЛЕ»\n"
+        "└─ Новые цели и протоколы\n\n"
+        "Доступен в PRO 💚"
+    ),
+    
+    "detailed_report": (
+        "📋 *Подробный отчёт*\n\n"
+        "Объясняет ПОЧЕМУ и ЧТО ДЕЛАТЬ:\n"
+        "├─ Взаимосвязи между системами\n"
+        "├─ Конкретные протоколы\n"
+        "├─ Персональный маршрут\n"
+        "└─ Приоритеты восстановления\n\n"
+        "Сводный отчёт показал ГДЕ проблема.\n"
+        "Подробный покажет КАК решить.\n\n"
+        "Доступен в PRO 💚"
+    ),
+    
+    "hrv_analysis": (
+        "💓 *HRV-анализ*\n\n"
+        "Добавлять данные HRV можно бесплатно ✅\n\n"
+        "🔒 *Что добавляет PRO:*\n"
+        "├─ Умная диагностика падений\n"
+        "├─ Связь HRV с режимом и стрессом\n"
+        "├─ Персональные рекомендации\n"
+        "└─ Биовозраст по HRV"
+    ),
+    
+    "checkins_expired": (
+        "☀️ *Ежедневные чекины с Авророй*\n\n"
+        "За пробные дни ты почувствовала, как работает:\n"
+        "├─ Аврора видит твой режим\n"
+        "├─ Замечает тренды\n"
+        "└─ Даёт конкретные советы на день\n\n"
+        "В PRO — Аврора ведёт каждый день:\n"
+        "утро \\+ вечер \\+ адаптивные рекомендации.\n\n"
+        "💚 Базовый тариф — 3000₽ / 3 мес (\\~33₽/день)"
+    ),
+}
+
+
+async def require_pro(callback: CallbackQuery, feature: str, 
+                      custom_teaser: str = None) -> bool:
+    """
+    Универсальная проверка PRO-доступа.
+    Returns True если доступ есть.
+    Returns False и показывает мягкий paywall если нет.
+    """
+    tariff = await get_user_tariff(callback.from_user.id)
+    
+    if can_access_feature(tariff['type'], feature):
+        return True
+    
+    # Нет доступа — мягкий paywall
+    teaser = custom_teaser or PRO_TEASERS.get(feature, "")
+    
+    if not teaser:
+        user = await get_user(callback.from_user.id)
+        name = user.get("name", "друг")
+        teaser = (
+            f"💚 {name}, эта функция доступна в PRO.\n\n"
+            "Аврора сможет вести тебя каждый день,\n"
+            "отслеживать прогресс и давать точные рекомендации."
+        )
+    
+    try:
+        await callback.message.edit_text(
+            teaser,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Узнать про тарифы", callback_data="show_tariffs")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
+            ])
+        )
+    except Exception:
+        await callback.message.answer(
+            teaser,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Узнать про тарифы", callback_data="show_tariffs")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
+            ])
+        )
+    
+    await callback.answer()
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -21134,7 +21868,7 @@ async def collect_cri_data(telegram_id: int) -> dict:
         'caregiver_status': user.get('caregiver_status', ''),
     }
     
-    # PSS (стресс)
+    # PSS (стресс) — приоритет: PSS-10, фолбэк на PSS-4 (мини-тест)
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -21143,11 +21877,20 @@ async def collect_cri_data(telegram_id: int) -> dict:
                 (telegram_id,)
             )
             row = await cursor.fetchone()
-            data['pss_score'] = row['pss_total'] if row else 20
+            if row:
+                data['pss_score'] = row['pss_total']
+            else:
+                # Фолбэк: PSS-4 из мини-теста → масштабируем в PSS-10 (0-16 → 0-40)
+                cursor2 = await db.execute(
+                    "SELECT pss4_score FROM mini_test_results WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (telegram_id,)
+                )
+                row2 = await cursor2.fetchone()
+                data['pss_score'] = round(row2['pss4_score'] * 2.5) if row2 else 20
     except:
         data['pss_score'] = 20
     
-    # GAD (тревога)
+    # GAD (тревога) — приоритет: GAD-7, фолбэк на GAD-2 (мини-тест)
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -21156,7 +21899,16 @@ async def collect_cri_data(telegram_id: int) -> dict:
                 (telegram_id,)
             )
             row = await cursor.fetchone()
-            data['gad2_score'] = row['gad_total'] if row else 3
+            if row:
+                data['gad2_score'] = row['gad_total']
+            else:
+                # Фолбэк: GAD-2 из мини-теста → масштабируем в GAD-7 (0-6 → 0-21)
+                cursor2 = await db.execute(
+                    "SELECT gad2_score FROM mini_test_results WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (telegram_id,)
+                )
+                row2 = await cursor2.fetchone()
+                data['gad2_score'] = round(row2['gad2_score'] * 3.5) if row2 else 3
     except:
         data['gad2_score'] = 3
     
@@ -22367,11 +23119,11 @@ async def save_chronotype(telegram_id: int, chronotype: str, choice: str = None)
     # Маппинг хронотип → целевое время
     CHRONO_BEDTIMES = {
         "lark": "22:00",
-        "pigeon": "23:00",
-        "owl": "23:45",
-        "night_owl": "00:30",
+        "pigeon": "22:15",
+        "owl": "22:45",
+        "night_owl": "23:30",
     }
-    target_bed = CHRONO_BEDTIMES.get(chronotype, "23:00")
+    target_bed = CHRONO_BEDTIMES.get(chronotype, "22:15")
     
     async with aiosqlite.connect(DB_PATH) as db:
         if choice:
@@ -22881,10 +23633,9 @@ def detect_apathy_syndrome(user_data: dict) -> dict:
 def detect_cognitive_syndrome(user_data: dict) -> dict:
     """Определяет синдром "Когнитивный спад" """
     
-    fog_score = user_data.get('brain_fog_level') or user_data.get('fog_score', 0)
-    # brain_fog_level (1-10) — приоритет, fog_score (1-5) — legacy
-    if fog_score <= 5 and fog_score > 0:
-        fog_score = fog_score * 2  # конвертация 1-5 → 2-10
+    # Используем хелпер с приоритетом когнитивного трекера
+    fog_score = _get_brain_fog_from_data(user_data)
+    # fog_score уже в шкале 1-10
     
     sleep_score = user_data.get('sleep_score', 30)
     age_group = user_data.get('age_group', '30-39')
@@ -23657,6 +24408,36 @@ def get_syndrome_question_keyboard(question_key: str):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def _get_brain_fog_from_data(user_data: dict) -> int:
+    """Туман: когнитивный трекер → Тест Состояний → онбординг fog_score"""
+    # mental_clarity: 0(туман)→10(ясно) → инвертируем в 1-10 где 10=туман
+    mc = user_data.get('cognitive_mental_clarity')
+    if mc is not None:
+        return max(1, 11 - mc)
+    if user_data.get('brain_fog_level'):
+        return user_data['brain_fog_level']
+    fog = user_data.get('fog_score')
+    if fog:
+        return {1: 10, 2: 8, 3: 5, 4: 3, 5: 1}.get(fog, 5)
+    return 5
+
+
+def _get_forgetfulness_from_data(user_data: dict) -> int:
+    """Память: когнитивный трекер → Тест Состояний"""
+    stm = user_data.get('cognitive_short_term_memory')
+    if stm is not None:
+        return max(1, 11 - stm)
+    return user_data.get('forgetfulness_level', 5)
+
+
+def _get_concentration_from_data(user_data: dict) -> int:
+    """Концентрация: когнитивный трекер → Тест Состояний"""
+    conc = user_data.get('cognitive_concentration')
+    if conc is not None:
+        return max(1, 11 - conc)
+    return user_data.get('concentration_level', 5)
+
+
 def get_syndrome_inputs_from_data(user_data: dict) -> dict:
     """Собираем все данные для определения синдромов с нормализацией."""
     
@@ -23688,9 +24469,10 @@ def get_syndrome_inputs_from_data(user_data: dict) -> dict:
         'circadian_problems': circadian_problems,
         'energy_deficit': energy_deficit,
         'apathy': user_data.get('apathy_level', 5),
-        'brain_fog': user_data.get('brain_fog_level', 5),
-        'forgetfulness': user_data.get('forgetfulness_level', 5),
-        'concentration': user_data.get('concentration_level', 5),  # ПОПРАВКА #127
+        # Когнитивные показатели: приоритет когнитивного трекера → фолбэк на Тест Состояний
+        'brain_fog': _get_brain_fog_from_data(user_data),
+        'forgetfulness': _get_forgetfulness_from_data(user_data),
+        'concentration': _get_concentration_from_data(user_data),
         'pain': user_data.get('pain_level', 5),
         'skin_problems': user_data.get('skin_problems_level', 5),
         'family_dementia': user_data.get('h1_dementia') == 'yes'
@@ -23764,17 +24546,17 @@ def calculate_snd_index(user_data: dict) -> dict:
     
     Формула: (Т_norm + З_norm + К_norm + Ц_norm + С_norm) / 5 × 100
     """
-    # Туман в голове (1-10, где 10 = постоянно)
-    brain_fog = user_data.get('brain_fog_level', 5)
+    # Туман в голове (1-10, где 10 = постоянно) — приоритет когнитивного трекера
+    brain_fog = _get_brain_fog_from_data(user_data)
     # Инвертируем: 1 (нет тумана) → 1.0, 10 (постоянно) → 0.2
     t_norm = max(0.2, 1.0 - (brain_fog - 1) * 0.09)
     
     # Забывчивость (1-10, где 10 = постоянно)
-    forgetfulness = user_data.get('forgetfulness_level', 5)
+    forgetfulness = _get_forgetfulness_from_data(user_data)
     z_norm = max(0.2, 1.0 - (forgetfulness - 1) * 0.09)
     
     # Концентрация (1-10, где 10 = не могу сосредоточиться)
-    concentration = user_data.get('concentration_level', 5)
+    concentration = _get_concentration_from_data(user_data)
     k_norm = max(0.2, 1.0 - (concentration - 1) * 0.09)
     
     # Циркадка (score/60)
@@ -25214,6 +25996,7 @@ def get_menu_keyboard(onboarding_phase: int = 0, current_mode: str = "home"):
                 InlineKeyboardButton(text=f"Режим: {mode_label}", callback_data="mode_switch_menu"),
             ],
             [InlineKeyboardButton(text="📋 Сводный отчёт", callback_data="summary_report")],
+            [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
             [InlineKeyboardButton(text="📊 Мой день", callback_data="menu_day")],
             [InlineKeyboardButton(text="📦 Копилочка советов", callback_data="tip_bank_menu")],
             [InlineKeyboardButton(text="🧪 Диагностика", callback_data="menu_diagnosis")],
@@ -25230,12 +26013,20 @@ def get_menu_keyboard(onboarding_phase: int = 0, current_mode: str = "home"):
 # ПОПРАВКА #113: ПОДМЕНЮ ИЕРАРХИЧЕСКОГО МЕНЮ
 # ═══════════════════════════════════════════════════════════════
 
-def get_day_menu_keyboard():
+def get_day_menu_keyboard(checkin_trial_active: bool = True):
     """ПОПРАВКА #135: Подменю 'Мой день' — ежедневные действия"""
+    
+    morning_text = "🌅 Утренний чек-ин"
+    evening_text = "🌙 Вечерний чек-ин"
+    
+    if not checkin_trial_active:
+        morning_text = "🔒 Утренний чек-ин"
+        evening_text = "🔒 Вечерний чек-ин"
+    
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌅 Утренний чек-ин", callback_data="morning_checkin")],
+        [InlineKeyboardButton(text=morning_text, callback_data="morning_checkin")],
         [InlineKeyboardButton(text="☀️ Дневной чек-ин", callback_data="day_checkin")],
-        [InlineKeyboardButton(text="🌙 Вечерний чек-ин", callback_data="evening_checkin")],
+        [InlineKeyboardButton(text=evening_text, callback_data="evening_checkin")],
         [InlineKeyboardButton(text="📋 Мои задания", callback_data="my_tasks")],
         [
             InlineKeyboardButton(text="🌴 Выходной", callback_data="holiday_button"),
@@ -25245,46 +26036,84 @@ def get_day_menu_keyboard():
     ])
 
 
-def get_diagnosis_menu_keyboard():
-    """ПОПРАВКА #135: Подменю 'Диагностика' — все тесты и замеры"""
-    return InlineKeyboardMarkup(inline_keyboard=[
+async def get_diagnosis_menu_keyboard(telegram_id: int = None):
+    """ПОПРАВКА #135: Подменю 'Диагностика' — замки для FREE"""
+    is_pro = False
+    if telegram_id:
+        tariff = await get_user_tariff(telegram_id)
+        is_pro = tariff.get('type') in ('basic', 'personal', 'genetic')
+    
+    buttons = [
         [InlineKeyboardButton(text="📝 Мини-тест (5 мин)", callback_data="mini_test_start")],
         [InlineKeyboardButton(text="🧪 Месячные тесты", callback_data="monthly_tests_menu")],
         [InlineKeyboardButton(text="🕐 Тест хронотипа", callback_data="chronotype_test_menu")],
         [InlineKeyboardButton(text="🎯 Тест Состояний", callback_data="syndrome_questions_start")],
+    ]
+    
+    if is_pro:
+        buttons.extend([
+            [InlineKeyboardButton(text="🔥 Полный тест стресса PSS-10", callback_data="stress_test_start")],
+            [InlineKeyboardButton(text="😴 Полный тест сна SQS", callback_data="sleep_test_start")],
+            [InlineKeyboardButton(text="⚡ Полный тест БГС", callback_data="ahs_test_start")],
+        ])
+    else:
+        buttons.extend([
+            [InlineKeyboardButton(text="🔒 Полный стресс PSS-10", callback_data="stress_test_start")],
+            [InlineKeyboardButton(text="🔒 Полный сон SQS", callback_data="sleep_test_start")],
+            [InlineKeyboardButton(text="🔒 Полный БГС", callback_data="ahs_test_start")],
+        ])
+    
+    buttons.extend([
         [InlineKeyboardButton(text="❤️ HRV (вариабельность)", callback_data="hrv_menu")],
         [InlineKeyboardButton(text="🏃 VO2max", callback_data="vo2max_menu")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_menu")]
     ])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def get_practices_menu_keyboard():
+def get_practices_menu_keyboard(tariff_type: str = "free"):
     """Подменю 'Мои практики' — ванны, дыхание, добавки, питание + ПОПРАВКА #141"""
-    return InlineKeyboardMarkup(inline_keyboard=[
+    lock = "🔒 " if tariff_type == "free" else ""
+    
+    buttons = [
         [InlineKeyboardButton(text="📅 Мой план на день", callback_data="daily_plan_menu")],
-        [InlineKeyboardButton(text="🧬 Мой генетический профиль", callback_data="genetic_profile_card")],
-        [InlineKeyboardButton(text="🎵 Гид по частотам", callback_data="frequency_guide")],
-        [InlineKeyboardButton(text="🩸 Капиллярная терапия (ванны)", callback_data="capillary_menu")],
         [InlineKeyboardButton(text="🌬 Дыхательные практики", callback_data="breathing_menu")],
-        [InlineKeyboardButton(text="💊 Мои добавки", callback_data="supplements_menu")],
-        [InlineKeyboardButton(text="🍽 Персональное питание", callback_data="personal_nutrition")],
         [InlineKeyboardButton(text="🌅 Циркадный трекинг", callback_data="circadian_menu")],
-        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_menu")]
+        [InlineKeyboardButton(text=f"{lock}🩸 Капиллярная терапия", callback_data="capillary_menu")],
+        [InlineKeyboardButton(text=f"{lock}💊 Мои добавки", callback_data="supplements_menu")],
+        [InlineKeyboardButton(text=f"{lock}🍽 Персональное питание", callback_data="personal_nutrition")],
+    ]
+    
+    if tariff_type == "genetic":
+        buttons.append([InlineKeyboardButton(text="🧬 Мой генетический профиль", callback_data="genetic_profile_card")])
+    elif tariff_type != "free":
+        buttons.append([InlineKeyboardButton(text="🔒 Генетический профиль", callback_data="genetic_profile_card")])
+    else:
+        buttons.append([InlineKeyboardButton(text="🔒 Генетический профиль", callback_data="genetic_profile_card")])
+    
+    buttons.extend([
+        [InlineKeyboardButton(text="🎵 Гид по частотам", callback_data="frequency_guide")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_menu")],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def get_progress_menu_keyboard():
+def get_progress_menu_keyboard(tariff_type: str = "free"):
     """ПОПРАВКА #135: Подменю 'Мой прогресс' — отчёты, трекеры, достижения"""
+    lock = "🔒 " if tariff_type == "free" else ""
+    
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Сводный отчёт", callback_data="summary_report")],
-        [InlineKeyboardButton(text="📊 Недельный отчёт", callback_data="weekly_report")],
-        [InlineKeyboardButton(text="📈 Ежемесячный отчёт", callback_data="monthly_report")],
+        [InlineKeyboardButton(text="🗺️ Маршрут омоложения", callback_data="roadmap_menu")],
+        [InlineKeyboardButton(text=f"{lock}📊 Недельный отчёт", callback_data="weekly_report")],
+        [InlineKeyboardButton(text=f"{lock}📈 Ежемесячный отчёт", callback_data="monthly_report")],
         [InlineKeyboardButton(text="🧬 Биовозраст", callback_data="bio_age_menu")],
         [InlineKeyboardButton(text="🪞 Трекер изменений", callback_data="rejuvenation_menu")],
         [InlineKeyboardButton(text="🧠 Когнитивный трекер", callback_data="cognitive_menu")],
         [InlineKeyboardButton(text="📸 Фото прогресса", callback_data="progress_photos_menu")],
         [InlineKeyboardButton(text="🏆 Достижения", callback_data="milestones_menu")],
-        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_menu")]
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_menu")],
     ])
 
 
@@ -25770,9 +26599,9 @@ def get_cognitive_menu_keyboard(has_baseline: bool = False):
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def get_cognitive_scale_keyboard(param_name: str):
+def get_cognitive_scale_keyboard(param_name: str, hide_cancel: bool = False):
     """Клавиатура шкалы 0-10 для когнитивного трекера"""
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [
             InlineKeyboardButton(text="0", callback_data=f"cog_{param_name}_0"),
             InlineKeyboardButton(text="1", callback_data=f"cog_{param_name}_1"),
@@ -25792,13 +26621,18 @@ def get_cognitive_scale_keyboard(param_name: str):
             InlineKeyboardButton(text="9", callback_data=f"cog_{param_name}_9"),
             InlineKeyboardButton(text="10", callback_data=f"cog_{param_name}_10"),
         ],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cognitive_menu")]
-    ])
+    ]
+    
+    # Не показываем "Отмена" во время онбординга
+    if not hide_cancel:
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cognitive_menu")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def get_brain_fog_days_keyboard():
+def get_brain_fog_days_keyboard(hide_cancel: bool = False):
     """Клавиатура для дней с туманом (0-7)"""
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [
             InlineKeyboardButton(text="0 ✨", callback_data="cog_brain_fog_days_0"),
             InlineKeyboardButton(text="1", callback_data="cog_brain_fog_days_1"),
@@ -25811,19 +26645,29 @@ def get_brain_fog_days_keyboard():
             InlineKeyboardButton(text="6", callback_data="cog_brain_fog_days_6"),
             InlineKeyboardButton(text="7 😔", callback_data="cog_brain_fog_days_7"),
         ],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cognitive_menu")]
-    ])
+    ]
+    
+    # Не показываем "Отмена" во время онбординга
+    if not hide_cancel:
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cognitive_menu")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def get_dreams_recall_keyboard():
+def get_dreams_recall_keyboard(hide_cancel: bool = False):
     """Клавиатура для вспоминания снов"""
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="💤 Не помню снов (0)", callback_data="cog_dreams_recall_0")],
         [InlineKeyboardButton(text="😴 Редко вспоминаю (1)", callback_data="cog_dreams_recall_1")],
         [InlineKeyboardButton(text="💭 Да, смутно помню (2)", callback_data="cog_dreams_recall_2")],
         [InlineKeyboardButton(text="🌟 Да, яркие, запоминающиеся (3)", callback_data="cog_dreams_recall_3")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cognitive_menu")]
-    ])
+    ]
+    
+    # Не показываем "Отмена" во время онбординга
+    if not hide_cancel:
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cognitive_menu")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_cognitive_type_keyboard():
@@ -26103,15 +26947,27 @@ def get_scenario_keyboard():
     ])
 
 
-def get_settings_keyboard():
-    """ПОПРАВКА #135: Клавиатура настроек — конфигурация бота"""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💚 О программе", callback_data="about_program")],
-        [InlineKeyboardButton(text="🩸 Женский цикл", callback_data="cycle_settings")],
-        [InlineKeyboardButton(text="🔔 Вкл/Выкл напоминания", callback_data="toggle_reminders")],
-        [InlineKeyboardButton(text="📊 Научные данные", callback_data="toggle_research_consent")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
-    ])
+def get_settings_keyboard(user: dict = None):
+    """Обновлённая клавиатура настроек"""
+    buttons = [
+        [InlineKeyboardButton(text="🌙 Цель сна (время отбоя)", callback_data="set_sleep_goal")],
+        [InlineKeyboardButton(text="🔔 Напоминания", callback_data="toggle_reminders")],
+        [InlineKeyboardButton(text="👤 Мои данные", callback_data="edit_profile")],
+        [InlineKeyboardButton(text="💎 Мой тариф", callback_data="show_tariffs")],
+    ]
+    
+    # Женский цикл — только для женщин
+    if user:
+        gender = user.get("gender")
+        tracking_cycle = user.get("tracking_cycle")
+        if gender == "female" or tracking_cycle:
+            buttons.insert(2, [InlineKeyboardButton(
+                text="🩸 Женский цикл", callback_data="cycle_settings"
+            )])
+    
+    buttons.append([InlineKeyboardButton(text="💊 Лекарства", callback_data="medications_input")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def get_time_keyboard(prefix: str):
@@ -29208,10 +30064,14 @@ async def show_day_menu(callback: CallbackQuery):
         f"Выбери действие:"
     )
 
+    tariff = await get_user_tariff(callback.from_user.id)
+    checkin_day = user.get("checkin_day", 1) or 1 if user else 1
+    trial_active = tariff['type'] != 'free' or checkin_day <= 3
+    
     await callback.message.edit_text(
         text,
         parse_mode="Markdown",
-        reply_markup=get_day_menu_keyboard()
+        reply_markup=get_day_menu_keyboard(checkin_trial_active=trial_active)
     )
 
 
@@ -29238,7 +30098,7 @@ async def show_diagnosis_menu(callback: CallbackQuery):
     await callback.message.edit_text(
         text,
         parse_mode="Markdown",
-        reply_markup=get_diagnosis_menu_keyboard()
+        reply_markup=await get_diagnosis_menu_keyboard(callback.from_user.id)
     )
 
 
@@ -29626,8 +30486,8 @@ async def start_circadian_test_direct(callback: CallbackQuery, state: FSMContext
 Этот тест оценит синхронизацию 
 твоих биологических ритмов.
 
-📋 *10 вопросов*
-⏱ *3-5 минут*
+📋 *7-12 вопросов* _(часть ответов возьму из предыдущих тестов)_
+⏱ *2-4 минуты*
 
 ━━━━━━━━━━━━━━━━━━━━━"""
     
@@ -29682,33 +30542,38 @@ async def start_stress_test_direct(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "recalc_bio_age")
 async def recalc_bio_age_handler(callback: CallbackQuery):
-    """ПОПРАВКА #122: Пересчёт биовозраста после всех тестов"""
-    await callback.answer("Пересчитываю биовозраст...")
+    """Пересчёт биовозраста + мотивационное сообщение"""
+    await callback.answer("Пересчитываю...")
+    telegram_id = callback.from_user.id
     
-    # Отмечаем что тесты пройдены
-    await mark_test_passed(callback.from_user.id, 'all')
-    
-    # Перенаправляем на биовозраст
-    callback.data = "bio_age_menu"
-    # Показываем сообщение с результатом
     await callback.message.edit_text(
-        "🎂 *Пересчитываю биовозраст...*\n\nПодождите...",
+        "🎂 *Пересчитываю биовозраст...*",
         parse_mode="Markdown"
     )
     
-    # Здесь должен быть вызов функции пересчёта биовозраста
-    # Пока просто редиректим на меню биовозраста
-    await asyncio.sleep(1)
+    # Отмечаем что тесты пройдены
+    try:
+        await mark_test_passed(telegram_id, 'all')
+    except Exception:
+        pass
     
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    await callback.message.edit_text(
-        "✅ *Биовозраст пересчитан!*\n\nПерехожу к результатам...",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Смотреть результат", callback_data="bio_age_menu")],
-            [InlineKeyboardButton(text="📈 Ежемесячный отчёт", callback_data="monthly_report")]
-        ])
-    )
+    await save_bio_age_snapshot(telegram_id, source="monthly_test")
+    trend = await check_bio_age_trend(telegram_id)
+    
+    if trend:
+        await callback.message.edit_text(
+            trend["text"], parse_mode="Markdown",
+            reply_markup=trend["reply_markup"]
+        )
+    else:
+        await callback.message.edit_text(
+            "✅ *Биовозраст пересчитан!*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📊 Результат", callback_data="bio_age_dynamics")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")]
+            ])
+        )
 
 
 @router.callback_query(F.data == "menu_practices")
@@ -29733,10 +30598,12 @@ async def show_practices_menu(callback: CallbackQuery):
 
 ━━━━━━━━━━━━━━━━━━━━━"""
 
+    tariff = await get_user_tariff(callback.from_user.id)
+    
     await callback.message.edit_text(
         text,
         parse_mode="Markdown",
-        reply_markup=get_practices_menu_keyboard()
+        reply_markup=get_practices_menu_keyboard(tariff['type'])
     )
 
 
@@ -30012,10 +30879,12 @@ async def show_progress_menu(callback: CallbackQuery):
 
 ━━━━━━━━━━━━━━━━━━━━━"""
 
+    tariff = await get_user_tariff(callback.from_user.id)
+    
     await callback.message.edit_text(
         text,
         parse_mode="Markdown",
-        reply_markup=get_progress_menu_keyboard()
+        reply_markup=get_progress_menu_keyboard(tariff['type'])
     )
 
 
@@ -30759,13 +31628,11 @@ async def send_breathing_478_reminders():
             evening_time = user["evening_time"]
             
             if target_bedtime:
-                # Есть target_bedtime — используем его
                 try:
                     bed_hour, bed_min = map(int, target_bedtime.split(":"))
                 except:
                     bed_hour, bed_min = 23, 0
             elif evening_time:
-                # Нет target_bedtime — берём evening_time + 1.5 часа
                 try:
                     ev_hour, ev_min = map(int, evening_time.split(":"))
                     bed_hour = ev_hour + 1
@@ -30778,7 +31645,6 @@ async def send_breathing_478_reminders():
                 except:
                     bed_hour, bed_min = 23, 0
             else:
-                # Fallback — 23:00
                 bed_hour, bed_min = 23, 0
             
             # Напоминание за 45 минут до сна
@@ -30794,11 +31660,36 @@ async def send_breathing_478_reminders():
             if user_now.hour == reminder_hour and user_now.minute == 0:
                 # Проверяем: делал ли сегодня
                 if not await has_done_breathing_today(telegram_id):
+                    
+                    # ═══ МАРШРУТ: подставляем тип дыхания ═══
+                    breathing_text = "дыхание 4-7-8"
+                    breathing_detail = "Вдох 4с → задержка 7с → выдох 8с"
+                    try:
+                        roadmap_ctx = await get_active_roadmap_context(telegram_id)
+                        if roadmap_ctx and roadmap_ctx.get('breathing'):
+                            br_key = roadmap_ctx['breathing']
+                            if br_key == 'coherent_breathing':
+                                breathing_text = "когерентное дыхание"
+                                breathing_detail = "Вдох 5с → выдох 5с (5.5/мин)"
+                            elif br_key == 'resonant_breathing':
+                                breathing_text = "резонансное дыхание"
+                                breathing_detail = "Вдох 5с → выдох 5с с вниманием на сердце"
+                            elif br_key == 'box_breathing':
+                                breathing_text = "квадратное дыхание"
+                                breathing_detail = "Вдох 4с → пауза 4с → выдох 4с → пауза 4с"
+                            elif br_key == 'alternate_nostril':
+                                breathing_text = "попеременное дыхание"
+                                breathing_detail = "Правая ноздря → левая ноздря, чередуя"
+                    except Exception:
+                        pass
+                    # ═══ END МАРШРУТ ═══
+                    
                     await bot.send_message(
                         chat_id=telegram_id,
                         text=f"🌙 Через 45 минут — время сна.\n\n"
-                             f"Не забудь про дыхание 4-7-8 перед сном!\n"
-                             f"Это займёт всего 3 минуты.",
+                             f"Не забудь про {breathing_text} перед сном!\n"
+                             f"{breathing_detail}\n"
+                             f"Это займёт всего 3-5 минут.",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                             [InlineKeyboardButton(text="🧘 Сделаю сейчас", callback_data="br_start_478")],
                             [InlineKeyboardButton(text="😴 Уже ложусь", callback_data="br_skip_tonight")]
@@ -30813,6 +31704,73 @@ async def br_skip_tonight(callback: CallbackQuery):
     """Пропуск дыхания сегодня."""
     await callback.answer("Спокойной ночи! 🌙")
     await callback.message.edit_reply_markup(reply_markup=None)
+
+
+# ═══════════════════════════════════════════════════════════════
+# МАРШРУТ: send_roadmap_checkin — чек-ин каждые 3 дня
+# ═══════════════════════════════════════════════════════════════
+
+async def send_roadmap_checkin():
+    """
+    Новый scheduler job: каждые 3 дня — короткий вопрос по текущему блоку маршрута.
+    Запускается каждую минуту, проверяет per-user TZ (отправляет в 12:00 local).
+    """
+    now_utc = datetime.utcnow()
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT rs.telegram_id, rs.current_block, rs.last_roadmap_checkin,
+                       rs.status, rs.block_week,
+                       u.name, u.timezone_offset
+                FROM roadmap_state rs
+                JOIN users u ON rs.telegram_id = u.telegram_id
+                WHERE rs.status = 'active'
+                AND u.reminders_enabled = 1
+            """)
+            users = await cursor.fetchall()
+
+        for user in users:
+            try:
+                tid = user['telegram_id']
+                offset = user['timezone_offset'] or 3
+                user_now = now_utc + timedelta(hours=offset)
+
+                # Отправляем в 12:00 local
+                if user_now.hour != 12 or user_now.minute != 0:
+                    continue
+
+                # Проверяем: прошло ли 3 дня с последнего чек-ина
+                last_checkin = user['last_roadmap_checkin']
+                if last_checkin:
+                    try:
+                        last_dt = datetime.fromisoformat(str(last_checkin).replace("Z", "+00:00").replace("+00:00", ""))
+                        days_since = (datetime.now() - last_dt).days
+                        if days_since < 3:
+                            continue
+                    except Exception:
+                        pass
+
+                block = user['current_block'] or 'sleep'
+                name = user['name'] or 'друг'
+                question = ROADMAP_CHECKIN_QUESTIONS.get(block, "Как продвигается?")
+
+                await bot.send_message(
+                    chat_id=tid,
+                    text=f"📋 *{name}*, {question}",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="👍 Хорошо", callback_data="rm_checkin_good")],
+                        [InlineKeyboardButton(text="😐 Так себе", callback_data="rm_checkin_ok")],
+                        [InlineKeyboardButton(text="😩 Трудно", callback_data="rm_checkin_hard")],
+                    ])
+                )
+                print(f"✅ Roadmap checkin: {tid}")
+            except Exception as e:
+                print(f"❌ Roadmap checkin error {user.get('telegram_id')}: {e}")
+    except Exception as e:
+        print(f"❌ send_roadmap_checkin global error: {e}")
 
 
 # ── Хэндлер sos_overwhelmed (был без обработчика) ──
@@ -31386,6 +32344,13 @@ async def finish_mini_test(callback: CallbackQuery, state: FSMContext, answers: 
             """, (telegram_id, pss4_score, gad2_score, sqs_mini_score, 
                   ahs_mini_score, circ_mini_score))
             await db.commit()
+            
+            # Сохраняем индивидуальные ответы для наследования
+            await db.execute("""
+                INSERT INTO test_answers_cache (telegram_id, test_type, answers_json, created_at)
+                VALUES (?, 'composite', ?, datetime('now'))
+            """, (telegram_id, json.dumps(answers)))
+            await db.commit()
     except Exception as e:
         print(f"Ошибка сохранения мини-теста: {e}")
     
@@ -31470,7 +32435,40 @@ async def finish_mini_test(callback: CallbackQuery, state: FSMContext, answers: 
 📅 Следующий мини-тест: через 2 недели
 💚 Вы на правильном пути!"""
 
+    # Проверяем флаг онбординга ПЕРЕД очисткой state
+    data_before_clear = await state.get_data()
+    is_onboarding = data_before_clear.get("is_onboarding", False)
+    
     await state.clear()
+    
+    if is_onboarding:
+        # Онбординг: после мини-теста → Циркадный тест
+        gad_warning = ""
+        if gad2_score >= 3:
+            gad_warning = "\n\n⚠️ _Вижу повышенную тревожность. Позже предложу расширенный тест._"
+        
+        onb_text = f"""📊 *{name}, РЕЗУЛЬТАТЫ*
+
+━━━━━━━━━━━━━━━━━━━━━
+
+😰 *Стресс:* {pss4_score}/16 — {get_pss4_level(pss4_score)}
+😟 *Тревога:* {gad2_score}/6 — {get_gad2_level(gad2_score)}
+😴 *Сон:* {sqs_mini_score}/18 — {get_sqs_level(sqs_mini_score)}
+⚡ *Надпочечники:* {ahs_mini_score}/16 — {get_ahs_level(ahs_mini_score)}
+🌙 *Циркадка:* {circ_mini_score}/12 — {get_circ_level(circ_mini_score)}
+
+━━━━━━━━━━━━━━━━━━━━━
+
+✅ Записала! Продолжим диагностику.{gad_warning}"""
+
+        await callback.message.edit_text(
+            onb_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➡️ Следующий тест: Циркадка", callback_data="circadian_test_menu")]
+            ])
+        )
+        return
     
     await callback.message.edit_text(
         text,
@@ -34530,7 +35528,7 @@ async def onb_process_time(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("onb_living_"))
 async def onb_process_living(callback: CallbackQuery, state: FSMContext):
-    """ОНБОРДИНГ 2.0: Жильё → Наследственность (следующий блок)"""
+    """ОНБОРДИНГ 2.0: Жильё → Цикл/Обстоятельства (наследственность перенесена в Неделю 2)"""
     await callback.answer()
     
     living_map = {
@@ -34543,16 +35541,28 @@ async def onb_process_living(callback: CallbackQuery, state: FSMContext):
     # Сохраняем в БД
     await save_user(callback.from_user.id, {"living_situation": living_situation})
     
-    # TODO: Здесь будет переход к Наследственности (следующее задание)
-    # Пока переходим к старому флоу — энергия/сон/стресс/туман
-    await callback.message.edit_text(
-        "✅ Записала!\n\n"
-        "Теперь несколько вопросов о здоровье семьи\n"
-        "и вашем текущем состоянии.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➡️ Продолжить", callback_data="onb_heredity_start")]
-        ])
-    )
+    # Наследственность перенесена в Неделю 2 → идём к циклу/обстоятельствам
+    user = await get_user(callback.from_user.id)
+    gender = user.get("gender", "female") if user else "female"
+    age_group = user.get("age_group", "30-39") if user else "30-39"
+    
+    if gender == "female" and age_group not in ("60-69", "70+"):
+        await state.set_state(OnboardingStates.waiting_cycle)
+        await callback.message.edit_text(
+            "✅ Записала!\n\n"
+            "Хотите учитывать менструальный цикл?\n\n"
+            "(HRV, энергия и настроение меняются\n"
+            "в течение цикла — я буду это учитывать)",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Да, хочу", callback_data="onb_cycle_yes")],
+                [InlineKeyboardButton(text="❌ Нет, не нужно", callback_data="onb_cycle_no")],
+                [InlineKeyboardButton(text="🔄 У меня перименопауза", callback_data="onb_cycle_peri")],
+                [InlineKeyboardButton(text="⏸ Менопауза / нет цикла", callback_data="onb_cycle_meno")],
+            ])
+        )
+    else:
+        # Мужчины и женщины 56+ → Жизненные обстоятельства
+        await show_life_events_screen(callback, state)
 
 
 # LEGACY: Старый обработчик графика работы (для тех, кто застрял в старом стейте)
@@ -34637,30 +35647,31 @@ async def process_sleep(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(OnboardingStates.waiting_stress, F.data.startswith("stress_"))
 async def process_stress(callback: CallbackQuery, state: FSMContext):
-    """Обработка стресса → вопрос про туман"""
+    """Обработка стресса → переход к наследственности (туман спросит когнитивный трекер)"""
     await callback.answer()
     stress = int(callback.data.replace("stress_", ""))
     await state.update_data(stress_score=stress)
     
+    # Сразу к наследственности — туман покрывается когнитивным трекером позже
     await callback.message.edit_text(
-        "🌫 *ТУМАН В ГОЛОВЕ*\n\n"
-        "Как часто вы испытываете «туман в голове»\n"
-        "(сложно сосредоточиться, мысли «плывут»)?",
+        "🧬 Теперь несколько вопросов о здоровье вашей семьи.\n\n"
+        "Это поможет понять ваши индивидуальные риски\n"
+        "и персонализировать программу.\n\n"
+        "⚠️ *Важно:* Наследственность — это НЕ приговор!\n"
+        "Современная наука показывает, что образ жизни\n"
+        "может «выключать» плохие гены и «включать» хорошие.\n\n"
+        "Отвечайте честно — это только для вас.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="1️⃣ Почти постоянно", callback_data="fog_1")],
-            [InlineKeyboardButton(text="2️⃣ Часто (4-5 дней в неделю)", callback_data="fog_2")],
-            [InlineKeyboardButton(text="3️⃣ Иногда (2-3 дня в неделю)", callback_data="fog_3")],
-            [InlineKeyboardButton(text="4️⃣ Редко", callback_data="fog_4")],
-            [InlineKeyboardButton(text="5️⃣ Почти никогда", callback_data="fog_5")]
+            [InlineKeyboardButton(text="▶️ Продолжить", callback_data="start_heredity")]
         ])
     )
-    await state.set_state(OnboardingStates.waiting_fog)
+    await state.set_state(OnboardingStates.waiting_heredity_intro)
 
 
 @router.callback_query(OnboardingStates.waiting_fog, F.data.startswith("fog_"))
 async def process_fog(callback: CallbackQuery, state: FSMContext):
-    """Обработка тумана → переход к наследственности"""
+    """Legacy: Обработка тумана (для пользователей застрявших на этом шаге)"""
     await callback.answer()
     fog = int(callback.data.replace("fog_", ""))
     await state.update_data(fog_score=fog)
@@ -34690,17 +35701,40 @@ async def process_fog(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "onb_heredity_start")
 async def onb_heredity_start(callback: CallbackQuery, state: FSMContext):
-    """ОНБОРДИНГ 2.0: Переход к наследственности (8/10)"""
+    """Наследственность: из Недели 2 (standalone) или legacy онбординг"""
     await callback.answer()
     
+    # Определяем: это standalone (Неделя 2) или legacy онбординг?
+    user = await get_user(callback.from_user.id)
+    onboarding_done = user.get("onboarding_completed", 0) if user else 0
+    
+    if onboarding_done:
+        # Standalone — из напоминания Недели 2 или из отчёта
+        source = "standalone"
+        intro_text = (
+            "🧬 *Семейная история*\n\n"
+            "6 вопросов о здоровье родственников.\n"
+            "Это поможет учесть наследственные риски\n"
+            "и точнее подобрать протоколы."
+        )
+    else:
+        # Legacy — старый онбординг (для тех, кто застрял)
+        source = "onboarding"
+        intro_text = (
+            "[●●●●●●●●○○] 8/10\n\n"
+            "Несколько вопросов о семейной истории.\n"
+            "Это важно — помогает оценить риски\n"
+            "и настроить профилактику.\n\n"
+            "Были ли у ваших родителей,\n"
+            "бабушек, дедушек:\n\n"
+            "(Отвечайте на каждый вопрос)"
+        )
+    
+    await state.update_data(heredity_source=source)
+    
     await callback.message.edit_text(
-        "[●●●●●●●●○○] 8/10\n\n"
-        "Несколько вопросов о семейной истории.\n"
-        "Это важно — помогает оценить риски\n"
-        "и настроить профилактику.\n\n"
-        "Были ли у ваших родителей,\n"
-        "бабушек, дедушек:\n\n"
-        "(Отвечайте на каждый вопрос)",
+        intro_text,
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➡️ Начать", callback_data="start_heredity")]
         ])
@@ -34846,7 +35880,7 @@ async def process_h5(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(OnboardingStates.waiting_h6, F.data.startswith("h6_"))
 async def process_h6(callback: CallbackQuery, state: FSMContext):
-    """H6: Онкология → Цикл (женщины 18-55) или → Обстоятельства (мужчины)"""
+    """H6: Онкология → Завершение наследственности"""
     await callback.answer()
     h6 = callback.data.replace("h6_", "")
     await state.update_data(h6_cancer=h6)
@@ -34856,7 +35890,7 @@ async def process_h6(callback: CallbackQuery, state: FSMContext):
     risk_data = calculate_family_risk_v2(data)
     await state.update_data(family_risk_score=risk_data.get("total_score", 0))
     
-    # Сохраняем наследственность в БД сразу
+    # Сохраняем наследственность в БД
     await save_user(callback.from_user.id, {
         "h1_dementia": data.get("h1_dementia"),
         "h2_cvd": data.get("h2_cvd"),
@@ -34864,31 +35898,77 @@ async def process_h6(callback: CallbackQuery, state: FSMContext):
         "h4_mental": data.get("h4_mental"),
         "h5_longevity": data.get("h5_longevity"),
         "h6_cancer": h6,
+        "heredity_completed": 1,
+        "heredity_remind_count": 0,
+        "onboarding_step2_pending": 0,
     })
     await save_family_risk(callback.from_user.id, risk_data)
     
-    # Определяем пол и возраст
-    user = await get_user(callback.from_user.id)
-    gender = user.get("gender", "female") if user else data.get("gender", "female")
-    age_group = user.get("age_group", "30-39") if user else data.get("age_group", "30-39")
+    # Определяем: standalone (Неделя 2) или legacy онбординг?
+    source = data.get("heredity_source", "standalone")
     
-    # Женщины 18-55 → Цикл
-    if gender == "female" and age_group not in ("60-69", "70+"):
-        await state.set_state(OnboardingStates.waiting_cycle)
-        await callback.message.edit_text(
-            "Хотите учитывать менструальный цикл?\n\n"
-            "(HRV, энергия и настроение меняются\n"
-            "в течение цикла — я буду это учитывать)",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Да, хочу", callback_data="onb_cycle_yes")],
-                [InlineKeyboardButton(text="❌ Нет, не нужно", callback_data="onb_cycle_no")],
-                [InlineKeyboardButton(text="🔄 У меня перименопауза", callback_data="onb_cycle_peri")],
-                [InlineKeyboardButton(text="⏸ Менопауза / нет цикла", callback_data="onb_cycle_meno")],
-            ])
-        )
+    if source == "onboarding":
+        # Legacy путь — переход к циклу/обстоятельствам
+        user = await get_user(callback.from_user.id)
+        gender = user.get("gender", "female") if user else data.get("gender", "female")
+        age_group = user.get("age_group", "30-39") if user else data.get("age_group", "30-39")
+        
+        if gender == "female" and age_group not in ("60-69", "70+"):
+            await state.set_state(OnboardingStates.waiting_cycle)
+            await callback.message.edit_text(
+                "Хотите учитывать менструальный цикл?\n\n"
+                "(HRV, энергия и настроение меняются\n"
+                "в течение цикла — я буду это учитывать)",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Да, хочу", callback_data="onb_cycle_yes")],
+                    [InlineKeyboardButton(text="❌ Нет, не нужно", callback_data="onb_cycle_no")],
+                    [InlineKeyboardButton(text="🔄 У меня перименопауза", callback_data="onb_cycle_peri")],
+                    [InlineKeyboardButton(text="⏸ Менопауза / нет цикла", callback_data="onb_cycle_meno")],
+                ])
+            )
+        else:
+            await show_life_events_screen(callback, state)
     else:
-        # Мужчины и женщины 56+ → Жизненные обстоятельства
-        await show_life_events_screen(callback, state)
+        # Standalone путь (Неделя 2) — пересчёт + уведомление
+        user = await get_user(callback.from_user.id)
+        name = user.get("name", "друг") if user else "друг"
+        
+        result = await recalculate_vitamins_with_heredity(callback.from_user.id)
+        changes = result.get("changes", [])
+        
+        if changes:
+            changes_text = ""
+            for ch in changes:
+                changes_text += f"\n\n{ch['risk']}:\n  + {ch['added']}"
+            
+            await callback.message.edit_text(
+                f"✅ *{name}, наследственность учтена!*\n\n"
+                f"Найдены семейные риски → скорректировала план:"
+                f"{changes_text}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "📋 Отчёт и витамины обновлены.\n"
+                "Посмотри изменения 👇",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💊 Обновлённые витамины", callback_data="supplements_menu")],
+                    [InlineKeyboardButton(text="📋 Полный отчёт", callback_data="summary_report")],
+                    [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")],
+                ])
+            )
+        else:
+            await callback.message.edit_text(
+                f"✅ *{name}, наследственность учтена!*\n\n"
+                "Хорошие новости — критичных семейных\n"
+                "рисков не обнаружено 🎉\n\n"
+                "Витаминный план без изменений.\n"
+                "Данные добавлены в отчёт.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📋 Отчёт", callback_data="summary_report")],
+                    [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")],
+                ])
+            )
+        await state.clear()
 
 
 async def complete_onboarding_heredity(callback: CallbackQuery, state: FSMContext, data: dict, risk_data: dict):
@@ -34914,6 +35994,133 @@ async def complete_onboarding_heredity(callback: CallbackQuery, state: FSMContex
                 [InlineKeyboardButton(text="🔬 Пройти диагностику", callback_data="finish_onboarding")]
             ]))
     await state.clear()
+
+
+# ═══════════════════════════════════════════════════════════════
+# НАСЛЕДСТВЕННОСТЬ — НЕДЕЛЯ 2 (standalone напоминание + пересчёт)
+# ═══════════════════════════════════════════════════════════════
+
+async def recalculate_vitamins_with_heredity(telegram_id: int) -> dict:
+    """
+    Пересчёт витаминного плана после заполнения наследственности.
+    Возвращает dict с изменениями для показа пользователю.
+    """
+    user = await get_user(telegram_id)
+    if not user:
+        return {"changes": [], "new_mods": []}
+    
+    new_mods = []
+    if user.get('h2_cvd') and user.get('h2_cvd') not in ('no', 'unknown'):
+        new_mods.append('heredity_cvd')
+    if user.get('h3_diabetes') and user.get('h3_diabetes') not in ('no', 'dont_know'):
+        new_mods.append('heredity_diabetes')
+    if user.get('h6_cancer') and user.get('h6_cancer') not in ('no', 'unknown'):
+        new_mods.append('heredity_cancer')
+    if user.get('h4_mental') and user.get('h4_mental') not in ('no', 'unknown'):
+        new_mods.append('heredity_mental')
+    if user.get('h1_dementia') and user.get('h1_dementia') not in ('no', 'unknown'):
+        new_mods.append('heredity_dementia')
+    
+    # Обновляем vitamin_plans если есть
+    if new_mods:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE vitamin_plans SET heredity_modifiers = ? WHERE telegram_id = ?",
+                    (json.dumps(new_mods), telegram_id)
+                )
+                await db.commit()
+        except Exception as e:
+            print(f"⚠️ recalculate_vitamins_with_heredity: {e}")
+    
+    mod_descriptions = {
+        'heredity_cvd': {'risk': '❤️ Сердце и сосуды', 'added': 'Omega-3 (2-3г), Магний (800мг), Витамин E (300мг)'},
+        'heredity_diabetes': {'risk': '🩸 Диабет', 'added': 'B12 (1500мкг), Магний (1000мг)'},
+        'heredity_cancer': {'risk': '🎗 Онкология', 'added': 'Витамин D (5000 МЕ), NAC (1000мг), Витамин C (2000мг)'},
+        'heredity_mental': {'risk': '🧠 Психика', 'added': 'Omega-3 (2-3г), B12 (1500мкг), Магний (900мг), Витамин D (4000 МЕ)'},
+        'heredity_dementia': {'risk': '🧠 Деменция', 'added': 'Omega-3 (2-3г), B12 (1500мкг), NAC (800мг), Витамин E (300мг)'},
+    }
+    
+    changes = [mod_descriptions[m] for m in new_mods if m in mod_descriptions]
+    return {"new_mods": new_mods, "changes": changes}
+
+
+async def check_heredity_reminder(telegram_id: int) -> dict | None:
+    """Проверяет, нужно ли напомнить о наследственности (Неделя 2)"""
+    user = await get_user(telegram_id)
+    if not user:
+        return None
+    
+    # Уже заполнена
+    if user.get("heredity_completed") or user.get("h1_dementia"):
+        return None
+    
+    # Макс 2 напоминания
+    remind_count = user.get("heredity_remind_count", 0) or 0
+    if remind_count >= 2:
+        return None
+    
+    # Прошло ли 7 дней с регистрации?
+    created = user.get("created_at")
+    if not created:
+        return None
+    try:
+        days_in = (date.today() - datetime.fromisoformat(str(created).replace("Z", "+00:00")).date()).days
+        if days_in < 7:
+            return None
+    except Exception:
+        return None
+    
+    # Не рано ли для повторного?
+    remind_date = user.get("heredity_remind_date")
+    if remind_date:
+        try:
+            if remind_date > date.today().isoformat():
+                return None
+        except:
+            pass
+    
+    name = user.get("name", "друг")
+    
+    if remind_count == 0:
+        text = (
+            f"🧬 {name}, пришло время следующего шага!\n\n"
+            "Теперь, когда базовая картина есть —\n"
+            "добавим наследственность.\n\n"
+            "Это поможет учесть семейные риски\n"
+            "и точнее подобрать протоколы.\n\n"
+            "6 вопросов, 1 минута."
+        )
+    else:
+        text = (
+            f"🧬 {name}, напоминаю — 6 вопросов о семье.\n\n"
+            "Без этого не могу учесть наследственные риски\n"
+            "в твоих витаминах и рекомендациях.\n\n"
+            "1 минута — и картина полная."
+        )
+    
+    await save_user(telegram_id, {
+        "heredity_remind_count": remind_count + 1,
+        "heredity_remind_date": (date.today() + timedelta(days=3)).isoformat(),
+    })
+    
+    return {
+        "text": text,
+        "reply_markup": InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Пройти (1 мин)", callback_data="onb_heredity_start")],
+            [InlineKeyboardButton(text="⏰ Позже", callback_data="heredity_dismiss")],
+        ]),
+    }
+
+
+@router.callback_query(F.data == "heredity_dismiss")
+async def heredity_dismiss(callback: CallbackQuery):
+    """Отклонить напоминание о наследственности"""
+    await callback.answer("Напомню позже 💚")
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -35726,6 +36933,23 @@ async def start_morning_checkin(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     
+    # ═══ PRO-ГЕЙТ: Чекины — 3 дня trial ═══
+    tariff = await get_user_tariff(callback.from_user.id)
+    if tariff['type'] == 'free':
+        checkin_day = user.get("checkin_day", 1) or 1
+        if checkin_day > 3:
+            await callback.message.answer(
+                PRO_TEASERS["checkins_expired"],
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💎 Перейти на PRO", callback_data="show_tariffs")],
+                    [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")],
+                ])
+            )
+            await callback.answer()
+            return
+    # ═══ END PRO-ГЕЙТ ═══
+    
     # ПОПРАВКА #139: Удаляем напоминание из ленты
     try:
         await callback.message.delete()
@@ -36500,41 +37724,102 @@ async def morning_hrv_manual(callback: CallbackQuery, state: FSMContext):
     """Ввести RMSSD вручную из утреннего чекина"""
     await callback.answer()
     await save_user(callback.from_user.id, {"has_hrv_device": 1})
-    
-    await callback.message.edit_text(
+
+    # ФАЗА 3: Проверяем, есть ли устройство в hrv_devices
+    user = await get_user(callback.from_user.id)
+    device_type = user.get('hrv_device_type') if user else None
+
+    if not device_type:
+        # Онбординг устройства — спрашиваем один раз
+        await callback.message.edit_text(
+            "📊 *Какое устройство ты используешь для HRV?*\n\n"
+            "Это нужно один раз — бот адаптирует ввод под твоё устройство.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💓 Polar H10 / нагрудный", callback_data="hrv_dev_polar_h10")],
+                [InlineKeyboardButton(text="⌚ Garmin (часы)", callback_data="hrv_dev_garmin_watch")],
+                [InlineKeyboardButton(text="⌚ Apple Watch", callback_data="hrv_dev_apple_watch")],
+                [InlineKeyboardButton(text="⌚ Samsung Watch", callback_data="hrv_dev_samsung_watch")],
+                [InlineKeyboardButton(text="💍 Oura Ring", callback_data="hrv_dev_oura_ring")],
+                [InlineKeyboardButton(text="💪 WHOOP", callback_data="hrv_dev_whoop")],
+                [InlineKeyboardButton(text="📱 Камера / приложение", callback_data="hrv_dev_phone_camera")],
+                [InlineKeyboardButton(text="✏️ Ввожу вручную", callback_data="hrv_dev_manual")],
+            ])
+        )
+        return
+
+    # Устройство уже есть — сразу к вводу RMSSD
+    await _ask_rmssd_input(callback.message, state, edit=True)
+
+
+async def _ask_rmssd_input(message, state: FSMContext, edit: bool = False):
+    """Попросить ввести RMSSD"""
+    text = (
         "❤️ *Введи RMSSD* (в мс)\n\n"
-        "Это главный показатель восстановления.\n"
+        "Главный показатель восстановления.\n"
         "Обычно от 15 до 100+ мс.\n\n"
-        "📱 Где найти:\n"
-        "├── Polar → Ортостатический тест → RMSSD\n"
-        "├── Elite HRV → Morning Reading\n"
-        "├── Kubios → Results → RMSSD\n"
-        "└── Apple Watch → HRV (через приложение)\n\n"
-        "Введи число:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="morning_hrv_skip")]
-        ])
+        "Введи число:"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="morning_hrv_skip")]
+    ])
+    if edit:
+        try:
+            await message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+        except:
+            await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await message.answer(text, parse_mode="Markdown", reply_markup=kb)
     await state.set_state(MorningStates.waiting_hrv_rmssd)
+
+
+# ФАЗА 3: Хэндлеры выбора HRV-устройства
+@router.callback_query(F.data.startswith("hrv_dev_"))
+async def hrv_device_selected(callback: CallbackQuery, state: FSMContext):
+    """Пользователь выбрал HRV-устройство"""
+    await callback.answer()
+    device_type = callback.data.replace("hrv_dev_", "")
+
+    # Сохраняем устройство
+    await save_hrv_device(callback.from_user.id, device_type)
+
+    device_info = DEVICE_ACCURACY.get(device_type, DEVICE_ACCURACY['manual'])
+    tier = device_info['tier']
+    tier_emoji = {'gold': '🥇', 'silver': '🥈', 'bronze': '🥉'}.get(tier, '📊')
+
+    metrics = DEVICE_AVAILABLE_METRICS.get(tier, ['rmssd', 'hr'])
+    metrics_text = ", ".join(m.upper() for m in metrics)
+
+    await callback.message.edit_text(
+        f"✅ *{device_info['model']}* — сохранено!\n\n"
+        f"{tier_emoji} Точность: {tier}\n"
+        f"📊 Доступные метрики: {metrics_text}\n\n"
+        f"Теперь бот будет спрашивать только те показатели, "
+        f"которые даёт твоё устройство.\n\n"
+        f"Давай введём первый замер!",
+        parse_mode="Markdown"
+    )
+    await asyncio.sleep(2)
+    await _ask_rmssd_input(callback.message, state, edit=False)
 
 
 @router.message(MorningStates.waiting_hrv_rmssd)
 async def morning_hrv_got_rmssd(message: Message, state: FSMContext):
-    """Получили RMSSD → сохраняем → предлагаем полный ввод"""
+    """ФАЗА 3: Получили RMSSD → сохраняем → адаптивный ввод по устройству"""
     try:
         value = float(message.text.strip().replace(",", "."))
-        if value < 5 or value > 300:
+        v = HRV_VALIDATION['rmssd']
+        if value < v['min'] or value > v['max']:
             await message.answer(
-                "⚠️ RMSSD обычно от 10 до 150 мс.\n"
+                f"⚠️ RMSSD обычно от {v['min']} до {v['max']} мс.\n"
                 "Проверь значение и введи ещё раз:"
             )
             return
     except ValueError:
         await message.answer("⚠️ Введи число! Например: 45")
         return
-    
-    # Сохраняем в hrv_records (только RMSSD, остальное NULL)
+
+    # Сохраняем в hrv_records
     today = date.today().isoformat()
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -36545,41 +37830,136 @@ async def morning_hrv_got_rmssd(message: Message, state: FSMContext):
             await db.commit()
     except Exception as e:
         print(f"❌ Ошибка сохранения HRV: {e}")
-    
-    # Обновляем baseline RMSSD
+
+    # ФАЗА 3: Обновляем smart baseline
     try:
-        await _update_hrv_rmssd_baseline(message.from_user.id, value)
+        await update_hrv_baseline_smart(message.from_user.id)
     except:
         pass
-    
+
     await state.update_data(morning_hrv_rmssd=value)
-    
-    # Простая интерпретация
+
+    # ФАЗА 3: Адаптивный ввод — проверяем устройство
+    user = await get_user(message.from_user.id)
+    tier = user.get('hrv_accuracy_tier', 'bronze') if user else 'bronze'
+
+    # Краткое подтверждение
     if value >= 50:
-        emoji, text_interp = "🟢", "отличное восстановление"
+        emoji_q = "🟢"
     elif value >= 30:
-        emoji, text_interp = "🟡", "нормальное восстановление"
+        emoji_q = "🟡"
     elif value >= 20:
-        emoji, text_interp = "🟠", "восстановление ниже среднего"
+        emoji_q = "🟠"
     else:
-        emoji, text_interp = "🔴", "низкое восстановление — мягкий день"
-    
-    await message.answer(
-        f"✅ RMSSD записан!\n\n"
-        f"❤️ RMSSD: {value:.0f} мс — {emoji} {text_interp}\n\n"
-        f"📋 Есть ещё показатели? Для биовозраста и полного анализа:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 + SDNN, LF/HF, ЧСС", callback_data="morning_hrv_full")],
-            [InlineKeyboardButton(text="✅ Готово", callback_data="morning_hrv_done")]
-        ])
-    )
+        emoji_q = "🔴"
+
+    if tier == 'gold':
+        # Gold: спрашиваем SDNN → LF/HF → ЧСС
+        await message.answer(
+            f"✅ RMSSD: {value:.0f} мс {emoji_q}\n\n"
+            f"📊 *SDNN* (мс)? Стандартное отклонение NN-интервалов.\n"
+            f"Введи число или нажми «Пропустить»:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="morning_hrv_skip_sdnn")]
+            ])
+        )
+        await state.set_state(MorningStates.waiting_hrv_sdnn)
+    elif tier == 'silver':
+        # Silver: спрашиваем ЧСС (SDNN/LF-HF обычно нет)
+        await message.answer(
+            f"✅ RMSSD: {value:.0f} мс {emoji_q}\n\n"
+            f"❤️ *ЧСС покоя* (уд/мин)?\nВведи число или нажми «Готово»:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="morning_hrv_skip_hr")],
+                [InlineKeyboardButton(text="✅ Готово", callback_data="morning_hrv_done")]
+            ])
+        )
+        await state.set_state(MorningStates.waiting_hrv_hr)
+    else:
+        # Bronze: только RMSSD + ЧСС (опционально)
+        await message.answer(
+            f"✅ RMSSD: {value:.0f} мс {emoji_q}\n\n"
+            f"❤️ *ЧСС покоя* (уд/мин)?\nВведи число или нажми «Готово»:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Готово", callback_data="morning_hrv_done")]
+            ])
+        )
+        await state.set_state(MorningStates.waiting_hrv_hr)
 
 
 @router.callback_query(F.data == "morning_hrv_done")
 async def morning_hrv_done(callback: CallbackQuery, state: FSMContext):
-    """Завершить чекин с только RMSSD"""
+    """ФАЗА 3: Завершить HRV ввод → умная интерпретация → алерты → чекин"""
     await callback.answer()
+    data = await state.get_data()
+    tid = callback.from_user.id
+
+    rmssd = data.get("morning_hrv_rmssd")
+    sdnn = data.get("morning_hrv_sdnn")
+    lfhf = data.get("morning_hrv_lfhf")
+    hr = data.get("morning_hrv_hr")
+
+    # Обновляем hrv_records с доп. данными
+    if sdnn or lfhf or hr:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("""
+                    UPDATE hrv_records SET sdnn = ?, lfhf = ?, hr_rest = ?
+                    WHERE id = (
+                        SELECT id FROM hrv_records
+                        WHERE telegram_id = ? AND date = ? AND time_of_day = 'morning'
+                        ORDER BY id DESC LIMIT 1
+                    )
+                """, (sdnn, lfhf, hr, tid, date.today().isoformat()))
+                await db.commit()
+        except:
+            pass
+
+    # ФАЗА 3: Умная интерпретация
+    if rmssd:
+        try:
+            interp = await interpret_hrv_smart(tid, rmssd, sdnn=sdnn, lfhf=lfhf, hr=hr)
+            if interp and interp.get('message'):
+                await callback.message.edit_text(
+                    interp['message'],
+                    parse_mode="Markdown"
+                )
+
+                # Сохраняем интерпретацию и vs_baseline_pct в hrv_records
+                try:
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute("""
+                            UPDATE hrv_records SET
+                                vs_baseline_pct = ?, interpretation = ?
+                            WHERE id = (
+                                SELECT id FROM hrv_records
+                                WHERE telegram_id = ? AND date = ? AND time_of_day = 'morning'
+                                ORDER BY id DESC LIMIT 1
+                            )
+                        """, (interp.get('vs_baseline_pct'), interp.get('interpretation'),
+                              tid, date.today().isoformat()))
+                        await db.commit()
+                except:
+                    pass
+
+                # ФАЗА 3: Проверяем алерты
+                try:
+                    hrv_alerts = await check_hrv_alerts(tid, rmssd, lfhf=lfhf)
+                    for alert in hrv_alerts:
+                        await callback.message.answer(
+                            alert['message'],
+                            parse_mode="Markdown"
+                        )
+                except:
+                    pass
+
+                await asyncio.sleep(2)
+        except Exception as e:
+            print(f"❌ interpret_hrv_smart error: {e}")
+
     try:
         await callback.message.delete()
     except:
@@ -36721,15 +38101,16 @@ async def morning_hrv_got_hr(message: Message, state: FSMContext):
 
 
 async def _save_full_hrv_and_complete(callback, state: FSMContext):
-    """Сохранить полные HRV данные и завершить чекин (callback)"""
+    """ФАЗА 3: Сохранить полные HRV + умная интерпретация + алерты (callback)"""
     data = await state.get_data()
     telegram_id = callback.from_user.id
     today = date.today().isoformat()
-    
+
     sdnn = data.get("morning_hrv_sdnn")
     lfhf = data.get("morning_hrv_lfhf")
     hr = data.get("morning_hrv_hr")
-    
+    rmssd = data.get("morning_hrv_rmssd", 0)
+
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
@@ -36743,37 +38124,62 @@ async def _save_full_hrv_and_complete(callback, state: FSMContext):
             await db.commit()
     except Exception as e:
         print(f"❌ Ошибка обновления HRV: {e}")
-    
-    rmssd = data.get("morning_hrv_rmssd", 0)
-    report = "✅ Полный HRV записан!\n\n"
-    report += f"❤️ RMSSD: {rmssd:.0f} мс\n"
-    if sdnn:
-        report += f"📊 SDNN: {sdnn:.0f} мс\n"
-    if lfhf:
-        status = "🟢" if lfhf < 2 else ("🟡" if lfhf < 3.5 else "🔴")
-        report += f"⚖️ LF/HF: {lfhf:.1f} {status}\n"
-    if hr:
-        report += f"💓 ЧСС: {hr} уд/мин\n"
-    report += "\n_Данные учтены для биовозраста!_"
-    
-    try:
-        await callback.message.edit_text(report, parse_mode="Markdown")
-    except:
-        await callback.message.answer(report, parse_mode="Markdown")
-    
+
+    # ФАЗА 3: Умная интерпретация
+    if rmssd:
+        try:
+            interp = await interpret_hrv_smart(telegram_id, rmssd, sdnn=sdnn, lfhf=lfhf, hr=hr)
+            if interp and interp.get('message'):
+                try:
+                    await callback.message.edit_text(interp['message'], parse_mode="Markdown")
+                except:
+                    await callback.message.answer(interp['message'], parse_mode="Markdown")
+
+                # Сохраняем интерпретацию
+                try:
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute("""
+                            UPDATE hrv_records SET vs_baseline_pct = ?, interpretation = ?
+                            WHERE id = (SELECT id FROM hrv_records WHERE telegram_id = ? AND date = ? AND time_of_day = 'morning' ORDER BY id DESC LIMIT 1)
+                        """, (interp.get('vs_baseline_pct'), interp.get('interpretation'), telegram_id, today))
+                        await db.commit()
+                except:
+                    pass
+
+                # Алерты
+                try:
+                    hrv_alerts_list = await check_hrv_alerts(telegram_id, rmssd, lfhf=lfhf)
+                    for alert in hrv_alerts_list:
+                        await callback.message.answer(alert['message'], parse_mode="Markdown")
+                except:
+                    pass
+            else:
+                # Fallback — простой отчёт
+                report = f"✅ HRV записан!\n❤️ RMSSD: {rmssd:.0f} мс"
+                if sdnn: report += f"\n📊 SDNN: {sdnn:.0f} мс"
+                if lfhf: report += f"\n⚖️ LF/HF: {lfhf:.1f}"
+                if hr: report += f"\n💓 ЧСС: {hr} уд/мин"
+                try:
+                    await callback.message.edit_text(report, parse_mode="Markdown")
+                except:
+                    pass
+        except Exception as e:
+            print(f"❌ interpret_hrv_smart error in full: {e}")
+
     await _complete_morning_checkin(callback, state)
 
 
 async def _save_full_hrv_and_complete_from_message(message, state: FSMContext):
-    """Сохранить полные HRV данные и завершить чекин (message)"""
+    """ФАЗА 3: Сохранить полные HRV + умная интерпретация + алерты (message)"""
     data = await state.get_data()
     telegram_id = message.from_user.id
     today = date.today().isoformat()
-    
+
     sdnn = data.get("morning_hrv_sdnn")
     lfhf = data.get("morning_hrv_lfhf")
     hr = data.get("morning_hrv_hr")
-    
+    rmssd = data.get("morning_hrv_rmssd", 0)
+
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
@@ -36787,20 +38193,35 @@ async def _save_full_hrv_and_complete_from_message(message, state: FSMContext):
             await db.commit()
     except Exception as e:
         print(f"❌ Ошибка обновления HRV: {e}")
-    
-    rmssd = data.get("morning_hrv_rmssd", 0)
-    report = "✅ Полный HRV записан!\n\n"
-    report += f"❤️ RMSSD: {rmssd:.0f} мс\n"
-    if sdnn:
-        report += f"📊 SDNN: {sdnn:.0f} мс\n"
-    if lfhf:
-        status = "🟢" if lfhf < 2 else ("🟡" if lfhf < 3.5 else "🔴")
-        report += f"⚖️ LF/HF: {lfhf:.1f} {status}\n"
-    if hr:
-        report += f"💓 ЧСС: {hr} уд/мин\n"
-    report += "\n_Данные учтены для биовозраста!_"
-    
-    await message.answer(report, parse_mode="Markdown")
+
+    # ФАЗА 3: Умная интерпретация
+    if rmssd:
+        try:
+            interp = await interpret_hrv_smart(telegram_id, rmssd, sdnn=sdnn, lfhf=lfhf, hr=hr)
+            if interp and interp.get('message'):
+                await message.answer(interp['message'], parse_mode="Markdown")
+
+                # Сохраняем интерпретацию
+                try:
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute("""
+                            UPDATE hrv_records SET vs_baseline_pct = ?, interpretation = ?
+                            WHERE id = (SELECT id FROM hrv_records WHERE telegram_id = ? AND date = ? AND time_of_day = 'morning' ORDER BY id DESC LIMIT 1)
+                        """, (interp.get('vs_baseline_pct'), interp.get('interpretation'), telegram_id, today))
+                        await db.commit()
+                except:
+                    pass
+
+                # Алерты
+                try:
+                    hrv_alerts_list = await check_hrv_alerts(telegram_id, rmssd, lfhf=lfhf)
+                    for alert in hrv_alerts_list:
+                        await message.answer(alert['message'], parse_mode="Markdown")
+                except:
+                    pass
+        except Exception as e:
+            print(f"❌ interpret_hrv_smart error in full_msg: {e}")
+
     await _complete_morning_checkin_from_message(message, state)
 
 
@@ -37210,6 +38631,46 @@ async def _complete_morning_checkin(callback, state: FSMContext):
     except Exception as e:
         print(f"⚠️ prodrome check error in morning: {e}")
 
+    # Детекция сдвига режима
+    try:
+        await post_morning_checkin_drift_check(tid, user)
+    except Exception as e:
+        logger.error(f"Drift check error: {e}")
+
+    # ═══ Напоминание о Ступени 2 онбординга ═══
+    try:
+        step2 = await check_step2_reminder(tid)
+        if step2:
+            await callback.message.answer(
+                step2["text"],
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=step2["buttons"])
+            )
+    except Exception as e:
+        logger.error(f"Step2 reminder error: {e}")
+
+    # ═══ Напоминание о наследственности (Неделя 2) ═══
+    try:
+        heredity_rem = await check_heredity_reminder(tid)
+        if heredity_rem:
+            await callback.message.answer(
+                heredity_rem["text"],
+                reply_markup=heredity_rem["reply_markup"]
+            )
+    except Exception as e:
+        logger.error(f"Heredity reminder error: {e}")
+
+    # ═══ Проверка результата плана отката биовозраста ═══
+    try:
+        rollback_check = await check_rollback_plan_result(tid)
+        if rollback_check:
+            await callback.message.answer(
+                rollback_check["text"], parse_mode="Markdown",
+                reply_markup=rollback_check["reply_markup"]
+            )
+    except Exception as e:
+        logger.error(f"Rollback plan check error: {e}")
+
     await state.clear()
 
 
@@ -37597,6 +39058,23 @@ async def start_evening_checkin(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("Сначала пройдите регистрацию: /start")
         await callback.answer()
         return
+    
+    # ═══ PRO-ГЕЙТ: Чекины — 3 дня trial ═══
+    tariff = await get_user_tariff(callback.from_user.id)
+    if tariff['type'] == 'free':
+        checkin_day = user.get("checkin_day", 1) or 1
+        if checkin_day > 3:
+            await callback.message.answer(
+                PRO_TEASERS["checkins_expired"],
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💎 Перейти на PRO", callback_data="show_tariffs")],
+                    [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")],
+                ])
+            )
+            await callback.answer()
+            return
+    # ═══ END PRO-ГЕЙТ ═══
     
     # ПОПРАВКА #139: Удаляем напоминание из ленты
     try:
@@ -38517,7 +39995,96 @@ _Ванна восстановит адаптационные резервы (З
     
     # БАГ 4: Чекин завершён
     await save_user(callback.from_user.id, {"evening_checkin_status": "completed"})
+
+    # ФАЗА 3: Предложить вечерний HRV (если есть устройство и утренний замер)
+    try:
+        user_ev = await get_user(callback.from_user.id)
+        device_type_ev = user_ev.get('hrv_device_type') if user_ev else None
+        if device_type_ev and device_type_ev != 'manual':
+            # Проверяем есть ли утренний замер сегодня
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT rmssd FROM hrv_records WHERE telegram_id = ? AND date = ? AND time_of_day = 'morning'",
+                    (callback.from_user.id, date.today().isoformat())
+                )
+                morning_rec = await cursor.fetchone()
+            if morning_rec and morning_rec[0]:
+                await callback.message.answer(
+                    "❤️ Вечерний HRV — как тело восстановилось за день?",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="📊 Ввести RMSSD", callback_data="evening_hrv_input")],
+                        [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="back_to_menu")]
+                    ])
+                )
+    except:
+        pass
     
+    await state.clear()
+
+
+# ════════════════════════════════════════════════════════════════
+# ФАЗА 3: ВЕЧЕРНИЙ HRV ЗАМЕР
+# ════════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "evening_hrv_input")
+async def evening_hrv_input(callback: CallbackQuery, state: FSMContext):
+    """Начать вечерний HRV замер"""
+    await callback.answer()
+    await callback.message.edit_text(
+        "❤️ *Вечерний RMSSD* (в мс)\n\n"
+        "Введи значение вечернего замера:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="back_to_menu")]
+        ])
+    )
+    await state.set_state(EveningStates.waiting_evening_hrv_rmssd)
+
+
+@router.message(EveningStates.waiting_evening_hrv_rmssd)
+async def evening_hrv_got_rmssd(message: Message, state: FSMContext):
+    """Получили вечерний RMSSD → сохраняем → показываем дельту"""
+    try:
+        value = float(message.text.strip().replace(",", "."))
+        v = HRV_VALIDATION['rmssd']
+        if value < v['min'] or value > v['max']:
+            await message.answer(f"⚠️ RMSSD обычно от {v['min']} до {v['max']} мс. Проверь.")
+            return
+    except ValueError:
+        await message.answer("⚠️ Введи число! Например: 38")
+        return
+
+    tid = message.from_user.id
+    today = date.today().isoformat()
+
+    # Сохраняем вечерний замер
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO hrv_records (telegram_id, date, time_of_day, rmssd)
+                VALUES (?, ?, 'evening', ?)
+            """, (tid, today, value))
+            await db.commit()
+    except Exception as e:
+        print(f"❌ Ошибка сохранения вечернего HRV: {e}")
+
+    # Находим утренний замер для дельты
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT rmssd FROM hrv_records WHERE telegram_id = ? AND date = ? AND time_of_day = 'morning' ORDER BY id DESC LIMIT 1",
+                (tid, today)
+            )
+            morning = await cursor.fetchone()
+
+        if morning and morning[0]:
+            delta_text = get_evening_hrv_delta_text(morning[0], value)
+            await message.answer(delta_text, parse_mode="Markdown")
+        else:
+            await message.answer(f"✅ Вечерний RMSSD: {value:.0f} мс — записан!")
+    except:
+        await message.answer(f"✅ Вечерний RMSSD: {value:.0f} мс — записан!")
+
     await state.clear()
 
 
@@ -41882,6 +43449,11 @@ async def show_weekly_report(callback: CallbackQuery):
     """Показать недельный отчёт с аналитикой"""
     await callback.answer()
     
+    # ═══ PRO-ГЕЙТ: Недельный отчёт ═══
+    if not await require_pro(callback, "weekly_reports"):
+        return
+    # ═══ END PRO-ГЕЙТ ═══
+    
     report = await generate_weekly_report(callback.from_user.id)
     
     # Проверяем наличие HRV данных
@@ -42160,7 +43732,7 @@ _Изменить цель вручную:
     await callback.message.edit_text(
         text,
         parse_mode="Markdown",
-        reply_markup=get_settings_keyboard()
+        reply_markup=get_settings_keyboard(user)
     )
     await callback.answer()
 
@@ -42189,6 +43761,387 @@ async def set_sleep_goal(callback: CallbackQuery, state: FSMContext):
     )
     await state.set_state(CircadianStates.setting_bedtime)
     await callback.answer()
+
+
+@router.callback_query(F.data == "edit_profile")
+async def edit_profile_handler(callback: CallbackQuery):
+    """Просмотр и редактирование профиля"""
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "—") if user else "—"
+    age = user.get("age_group", "—") if user else "—"
+    gender_map = {"female": "Женский", "male": "Мужской"}
+    gender = gender_map.get(user.get("gender", "") if user else "", "—")
+    chronotype_map = {"owl": "🦉 Сова", "pigeon": "🕊 Голубь", "lark": "🐦 Жаворонок"}
+    chrono = chronotype_map.get(user.get("chronotype", "") if user else "", "—")
+    
+    text = f"""👤 *Мои данные*
+
+━━━━━━━━━━━━━━━━━━━━━
+
+Имя: *{name}*
+Пол: *{gender}*
+Возраст: *{age}*
+Хронотип: *{chrono}*
+
+━━━━━━━━━━━━━━━━━━━━━
+
+Если что-то неверно — нажми «Изменить»."""
+    
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Изменить имя", callback_data="edit_name")],
+            [InlineKeyboardButton(text="◀️ К настройкам", callback_data="settings")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "edit_name")
+async def edit_name_handler(callback: CallbackQuery, state: FSMContext):
+    """Запросить новое имя"""
+    await callback.answer()
+    await callback.message.edit_text(
+        "✏️ Введи новое имя:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="edit_profile")]
+        ])
+    )
+    await state.set_state(OnboardingStates.waiting_name_edit)
+
+
+@router.message(OnboardingStates.waiting_name_edit)
+async def save_new_name(message: Message, state: FSMContext):
+    """Сохранить новое имя"""
+    new_name = message.text.strip()[:50]
+    await save_user(message.from_user.id, {"name": new_name})
+    await state.clear()
+    await message.answer(
+        f"✅ Имя обновлено: *{new_name}*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ К настройкам", callback_data="settings")]
+        ])
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# УМНАЯ ДЕТЕКЦИЯ СДВИГА РЕЖИМА
+# ═══════════════════════════════════════════════════════════════
+
+AHS_RECOVERY_TIMELINE = {
+    1: {"min_months": 2, "label": "гиперкортизол"},
+    2: {"min_months": 4, "label": "истощение надпочечников"},
+    3: {"min_months": 6, "label": "глубокое истощение надпочечников"},
+}
+
+
+def _drift_time_to_minutes(t: str) -> int:
+    """HH:MM → минуты (время до 06:00 = следующий день)"""
+    try:
+        parts = t.split(":")
+        h, m = int(parts[0]), int(parts[1])
+        mins = h * 60 + m
+        if mins < 360:
+            mins += 1440
+        return mins
+    except:
+        return 1380
+
+
+def _drift_time_diff(actual: str, target: str) -> int:
+    """Разница минут: actual - target (>0 = позже)"""
+    return _drift_time_to_minutes(actual) - _drift_time_to_minutes(target)
+
+
+def _drift_minutes_to_time(mins: int) -> str:
+    """Минуты → HH:MM"""
+    if mins >= 1440:
+        mins -= 1440
+    return f"{mins // 60:02d}:{mins % 60:02d}"
+
+
+async def detect_bedtime_drift(telegram_id: int) -> dict | None:
+    """Детекция устойчивого сдвига режима (>60 мин за 5+ дней)."""
+    user = await get_user(telegram_id)
+    if not user:
+        return None
+    
+    target = user.get("target_bedtime")
+    if not target:
+        return None
+    
+    last_asked = user.get("drift_last_asked")
+    if last_asked:
+        try:
+            if (datetime.now() - datetime.fromisoformat(last_asked)).days < 7:
+                return None
+        except:
+            pass
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT actual_bedtime, date FROM circadian_log "
+            "WHERE telegram_id = ? AND actual_bedtime IS NOT NULL "
+            "ORDER BY date DESC LIMIT 7",
+            (telegram_id,)
+        )
+        recent = await cursor.fetchall()
+    
+    if len(recent) < 5:
+        return None
+    
+    deviations = []
+    actual_minutes = []
+    for r in recent:
+        deviations.append(_drift_time_diff(r["actual_bedtime"], target))
+        actual_minutes.append(_drift_time_to_minutes(r["actual_bedtime"]))
+    
+    avg_deviation = sum(deviations) / len(deviations)
+    if abs(avg_deviation) < 60:
+        return None
+    
+    avg_actual = _drift_minutes_to_time(int(sum(actual_minutes) / len(actual_minutes)))
+    metrics = await _compare_drift_metrics(telegram_id, 14)
+    
+    return {
+        "target": target, "avg_actual": avg_actual,
+        "avg_deviation": avg_deviation,
+        "direction": "позже" if avg_deviation > 0 else "раньше",
+        "consecutive_days": len(recent), "metrics": metrics, "user": user,
+    }
+
+
+async def _compare_drift_metrics(telegram_id: int, days_back: int = 14) -> dict:
+    """Сравнивает энергию/сон/настроение: первая vs вторая половина."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT morning_energy, sleep_quality, mood, date FROM checkins "
+            "WHERE telegram_id = ? AND date >= date('now', ?) ORDER BY date ASC",
+            (telegram_id, f"-{days_back} days")
+        )
+        rows = await cursor.fetchall()
+    
+    if len(rows) < 6:
+        return {"enough_data": False}
+    
+    mid = len(rows) // 2
+    before, after = rows[:mid], rows[mid:]
+    
+    def avg(data, field):
+        vals = [r[field] for r in data if r[field] is not None]
+        return sum(vals) / len(vals) if vals else None
+    
+    return {
+        "enough_data": True,
+        "energy_before": avg(before, "morning_energy"),
+        "energy_after": avg(after, "morning_energy"),
+        "sleep_before": avg(before, "sleep_quality"),
+        "sleep_after": avg(after, "sleep_quality"),
+        "mood_before": avg(before, "mood"),
+        "mood_after": avg(after, "mood"),
+    }
+
+
+def _drift_metrics_worse(m: dict) -> bool:
+    """Метрики ухудшились?"""
+    diffs = []
+    for key in ["energy", "sleep", "mood"]:
+        b, a = m.get(f"{key}_before"), m.get(f"{key}_after")
+        if b and a:
+            diffs.append(a - b)
+    return len(diffs) > 0 and sum(diffs) / len(diffs) < -0.5
+
+
+def _drift_metrics_stable(m: dict) -> bool:
+    """Метрики стабильны или лучше?"""
+    diffs = []
+    for key in ["energy", "sleep", "mood"]:
+        b, a = m.get(f"{key}_before"), m.get(f"{key}_after")
+        if b and a:
+            diffs.append(a - b)
+    return len(diffs) > 0 and sum(diffs) / len(diffs) >= -0.3
+
+
+def _assess_recovery_resilience(user_data: dict) -> dict:
+    """Оценивает хрупкость vs устойчивость восстановления."""
+    ahs_stage = user_data.get("ahs_stage", 0)
+    ahs_mini = user_data.get("ahs_mini_score", 20)
+    if not ahs_stage and ahs_mini:
+        ahs_stage = 3 if ahs_mini <= 4 else 2 if ahs_mini <= 8 else 1 if ahs_mini <= 12 else 0
+    
+    if ahs_stage == 0:
+        return {"fragile": False, "reason": "надпочечники в норме, система устойчива 💪", "risk_level": "low"}
+    
+    months = 0
+    created = user_data.get("created_at", "")
+    if created:
+        try:
+            created_dt = datetime.fromisoformat(created.replace("Z", "+00:00")) if "T" in created else datetime.strptime(created, "%Y-%m-%d")
+            months = max(0, (datetime.now() - created_dt.replace(tzinfo=None)).days // 30)
+        except:
+            pass
+    
+    tl = AHS_RECOVERY_TIMELINE.get(ahs_stage, {"min_months": 4, "label": "утомление"})
+    
+    if months < tl["min_months"]:
+        if ahs_stage == 3:
+            reason = (
+                f"у тебя {tl['label']} — восстановление минимум "
+                f"{tl['min_months']} мес. Ты на {months}-м. "
+                "Система ещё хрупкая — сдвиг режима может откатить прогресс."
+            )
+        elif ahs_stage == 2:
+            reason = f"у тебя {tl['label']}. До устойчивости ещё ~{tl['min_months'] - months} мес."
+        else:
+            reason = "у тебя повышенный кортизол — тело компенсирует за счёт стресс-ответа."
+        return {"fragile": True, "reason": reason, "risk_level": "high" if ahs_stage == 3 else "medium"}
+    
+    first_ahs = user_data.get("first_ahs_mini_score")
+    current_ahs = user_data.get("ahs_mini_score")
+    if first_ahs and current_ahs and current_ahs > first_ahs + 3:
+        return {"fragile": False, "reason": f"за {months} месяцев ты хорошо восстановилась. Система стала гибче.", "risk_level": "low"}
+    return {"fragile": True, "reason": "восстановление идёт медленнее ожидаемого. Лучше придерживаться стабильного режима.", "risk_level": "medium"}
+
+
+def build_drift_message(name: str, drift: dict) -> str:
+    """Формирует сообщение о сдвиге с учётом метрик и устойчивости."""
+    m = drift["metrics"]
+    target, actual = drift["target"], drift["avg_actual"]
+    user_data = drift.get("user", {})
+    
+    header = (
+        f"💚 {name}, я заметила что последнюю неделю "
+        f"ты ложишься около *{actual}* вместо *{target}*.\n\n"
+    )
+    
+    if not m.get("enough_data"):
+        body = "Изменились обстоятельства?\n\nПонаблюдаю, как новый режим отразится на состоянии."
+    elif _drift_metrics_worse(m):
+        body = "И я вижу, что это отражается на самочувствии:\n"
+        if (m.get("sleep_after") or 0) - (m.get("sleep_before") or 0) < -0.5:
+            body += "   😴 Качество сна: снизилось\n"
+        if (m.get("energy_after") or 0) - (m.get("energy_before") or 0) < -0.5:
+            body += "   ⚡ Утренняя энергия: упала\n"
+        body += f"\nТело привыкло к старому ритму. Хочешь вернуться к *{target}*? Я помогу сдвинуться плавно."
+    elif _drift_metrics_stable(m):
+        res = _assess_recovery_resilience(user_data)
+        if res["fragile"]:
+            body = (
+                "Показатели пока стабильные — это хорошо.\n\n"
+                f"Но {res['reason']}\n\n"
+                "Я бы рекомендовала вернуться к прежнему режиму, "
+                "когда обстоятельства позволят."
+            )
+        else:
+            body = (
+                f"Показатели стабильные — {res['reason']}\n\n"
+                "Хочешь обновить цель? Тогда и напоминания подстроятся."
+            )
+    else:
+        body = (
+            "Пока непонятно, как это влияет — понаблюдаем.\n\n"
+            "Я буду отслеживать энергию, сон и настроение "
+            "и через неделю скажу точнее."
+        )
+    
+    return header + body
+
+
+def get_drift_keyboard(drift: dict) -> InlineKeyboardMarkup:
+    """Кнопки реакции на сдвиг режима."""
+    target, actual = drift["target"], drift["avg_actual"]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔄 Обновить цель → {actual}", callback_data=f"drift_accept_{actual}")],
+        [InlineKeyboardButton(text=f"🎯 Хочу вернуться к {target}", callback_data="drift_return")],
+        [InlineKeyboardButton(text="👀 Понаблюдаем ещё неделю", callback_data="drift_observe")],
+    ])
+
+
+@router.callback_query(F.data.startswith("drift_accept_"))
+async def drift_accept_handler(callback: CallbackQuery):
+    """Принять новый режим → обновить цель"""
+    await callback.answer()
+    new_time = callback.data.replace("drift_accept_", "")
+    await save_user(callback.from_user.id, {"target_bedtime": new_time})
+    # Пересчитываем напоминания если функция доступна
+    try:
+        await recalculate_all_reminders(callback.from_user.id)
+    except Exception:
+        pass
+    await callback.message.edit_text(
+        f"✅ Цель обновлена: ложиться в *{new_time}*\n\n"
+        "Все напоминания перестроены. Буду следить за самочувствием 💚",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Ок", callback_data="back_to_menu")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "drift_return")
+async def drift_return_handler(callback: CallbackQuery):
+    """Вернуться к цели → план плавного сдвига"""
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    target = user.get("target_bedtime", "22:00") if user else "22:00"
+    await callback.message.edit_text(
+        f"🎯 Хорошо! Будем возвращаться к *{target}* "
+        "плавно — по 15 минут в неделю.\n\n"
+        "Напоминания подстроятся на каждом шаге. Ты справишься 💚",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Ок", callback_data="back_to_menu")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "drift_observe")
+async def drift_observe_handler(callback: CallbackQuery):
+    """Понаблюдаем неделю"""
+    await callback.answer()
+    await save_user(callback.from_user.id, {
+        "drift_observe_until": (datetime.now() + timedelta(days=7)).isoformat()
+    })
+    await callback.message.edit_text(
+        "👀 Хорошо, понаблюдаем неделю.\n\n"
+        "Я буду отслеживать энергию, сон и настроение — "
+        "и через неделю скажу, как новый ритм влияет.\n\n"
+        "💡 _Напоминания пока подстрою под фактическое время._",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Ок", callback_data="back_to_menu")]
+        ])
+    )
+
+
+async def post_morning_checkin_drift_check(telegram_id: int, user: dict):
+    """Проверка сдвига режима — вызывается после утреннего чекина."""
+    observe_until = user.get("drift_observe_until")
+    if observe_until:
+        try:
+            if datetime.now() < datetime.fromisoformat(observe_until):
+                return
+            await save_user(telegram_id, {"drift_observe_until": None})
+        except:
+            pass
+    
+    drift = await detect_bedtime_drift(telegram_id)
+    if drift:
+        name = user.get("name", "друг")
+        try:
+            await bot.send_message(
+                telegram_id,
+                build_drift_message(name, drift),
+                parse_mode="Markdown",
+                reply_markup=get_drift_keyboard(drift)
+            )
+            await save_user(telegram_id, {"drift_last_asked": datetime.now().isoformat()})
+        except Exception as e:
+            logger.warning(f"Drift message failed for {telegram_id}: {e}")
 
 
 @router.callback_query(CircadianStates.setting_bedtime, F.data.startswith("bed_"))
@@ -43034,16 +44987,11 @@ async def start_soft_start_program(telegram_id: int):
         'soft_start_completed': 0
     })
     
-    # Записываем первое задание как отправленное
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT OR REPLACE INTO onboarding_tasks 
-            (telegram_id, task_number, task_id, sent_at)
-            VALUES (?, 1, 'blue_filter', ?)
-        """, (telegram_id, datetime.now().isoformat()))
-        await db.commit()
-    
-    # Отправляем первое задание
+    # ПОПРАВКА #XXX: Сначала отправляем, потом записываем в БД
+    # (как в send_soft_start_tasks для заданий 2-7)
+    # Иначе: если отправка упадёт — в БД задание "отправлено",
+    # и через 3 дня send_soft_start_checks спросит о выполнении
+    # задания, которое пользователь НЕ получал.
     task = SOFT_START_TASKS[1]
     try:
         await bot.send_message(
@@ -43051,8 +44999,20 @@ async def start_soft_start_program(telegram_id: int):
             task['text'],
             parse_mode="Markdown"
         )
+        
+        # Записываем ТОЛЬКО после успешной отправки
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO onboarding_tasks 
+                (telegram_id, task_number, task_id, sent_at)
+                VALUES (?, 1, 'blue_filter', ?)
+            """, (telegram_id, datetime.now().isoformat()))
+            await db.commit()
+        
     except Exception as e:
-        logging.error(f"Ошибка отправки задания мягкого старта: {e}")
+        logging.error(f"Задание мягкого старта не отправлено {telegram_id}: {e}")
+        # БД НЕ записываем → send_soft_start_checks НЕ спросит
+        # send_soft_start_tasks через сутки попробует снова
 
 
 async def send_tests_postponed_reminders():
@@ -43743,6 +45703,10 @@ async def main():
     scheduler.add_job(send_vitamin_analysis_reminders, "cron", minute="*")  # Было hour=10 — теперь per-user TZ
     # ПОПРАВКА #138: Напоминание о дыхании 4-7-8 перед сном
     scheduler.add_job(send_breathing_478_reminders, "cron", minute="*")
+    
+    scheduler.add_job(send_roadmap_checkin, "cron", minute="*")  # Маршрут: чек-ин каждые 3 дня
+    scheduler.add_job(send_monthly_roadmap_reviews, "cron", minute=0)  # Маршрут: ежемесячный пересмотр (каждый час)
+    scheduler.add_job(check_roadmap_auto_pause, "cron", hour="*/6")  # Маршрут: автопауза (каждые 6ч)
     # ПОПРАВКА: Мягкий старт — первые задания
     scheduler.add_job(send_soft_start_tasks, "cron", minute="*")
     scheduler.add_job(send_soft_start_checks, "cron", minute="*")
@@ -43847,6 +45811,552 @@ def get_hr_interpretation(value: int) -> str:
         return "🔴 Высокая — требует внимания"
 
 
+# ════════════════════════════════════════════════════════════════
+# ФАЗА 3: HRV SMART DIAGNOSTICS — КОНСТАНТЫ И ФУНКЦИИ
+# ════════════════════════════════════════════════════════════════
+
+DEVICE_ACCURACY = {
+    'polar_h10':    {'rmssd_correction': 1.0, 'confidence': 0.99, 'model': 'Polar H10', 'tier': 'gold'},
+    'garmin_watch': {'rmssd_correction': 1.0, 'confidence': 0.92, 'model': 'Garmin (часы)', 'tier': 'silver'},
+    'apple_watch':  {'rmssd_correction': 1.0, 'confidence': 0.90, 'model': 'Apple Watch', 'tier': 'silver'},
+    'samsung_watch':{'rmssd_correction': 1.0, 'confidence': 0.88, 'model': 'Samsung Galaxy Watch', 'tier': 'silver'},
+    'oura_ring':    {'rmssd_correction': 1.0, 'confidence': 0.90, 'model': 'Oura Ring', 'tier': 'silver'},
+    'whoop':        {'rmssd_correction': 1.0, 'confidence': 0.93, 'model': 'WHOOP', 'tier': 'silver'},
+    'phone_camera': {'rmssd_correction': 0.95,'confidence': 0.82, 'model': 'Камера телефона', 'tier': 'bronze'},
+    'manual':       {'rmssd_correction': 1.0, 'confidence': 0.70, 'model': 'Ручной ввод', 'tier': 'bronze'},
+}
+
+DEVICE_AVAILABLE_METRICS = {
+    'gold':   ['rmssd', 'sdnn', 'lfhf', 'hr'],
+    'silver': ['rmssd', 'hr'],
+    'bronze': ['rmssd', 'hr'],
+}
+
+HRV_VALIDATION = {
+    'rmssd': {'min': 5, 'max': 200, 'unit': 'мс'},
+    'sdnn':  {'min': 10, 'max': 300, 'unit': 'мс'},
+    'lfhf':  {'min': 0.1, 'max': 20.0, 'unit': 'ratio'},
+    'hr':    {'min': 35, 'max': 150, 'unit': 'уд/мин'},
+}
+
+
+async def get_primary_hrv_device(telegram_id: int) -> dict:
+    """Получить основное HRV-устройство пользователя"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM hrv_devices WHERE telegram_id = ? AND is_primary = 1 ORDER BY id DESC LIMIT 1",
+                (telegram_id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+    except:
+        pass
+    return None
+
+
+async def get_hrv_baseline_smart(telegram_id: int) -> dict:
+    """Получить baseline HRV (расширенный)"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM hrv_baseline WHERE telegram_id = ?",
+                (telegram_id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+    except:
+        pass
+    return None
+
+
+async def update_hrv_baseline_smart(telegram_id: int):
+    """
+    ФАЗА 3: Умный baseline.
+    Скользящее среднее за 7-14 утренних замеров.
+    Исключает аномалии (>2 SD).
+    Вызывается после каждого утреннего замера.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT rmssd, sdnn, lfhf, hr_rest, date FROM hrv_records
+                WHERE telegram_id = ? AND time_of_day = 'morning' AND rmssd IS NOT NULL
+                ORDER BY date DESC LIMIT 14
+            """, (telegram_id,))
+            records = [dict(r) for r in await cursor.fetchall()]
+
+            count = len(records)
+            if count == 0:
+                return None
+
+            rmssd_vals = [r['rmssd'] for r in records if r['rmssd']]
+            sdnn_vals = [r['sdnn'] for r in records if r.get('sdnn')]
+            lfhf_vals = [r['lfhf'] for r in records if r.get('lfhf')]
+            hr_vals = [r['hr_rest'] for r in records if r.get('hr_rest')]
+
+            baseline_ready = 1 if count >= 7 else 0
+
+            if rmssd_vals:
+                mean_r = statistics.mean(rmssd_vals)
+                std_r = statistics.stdev(rmssd_vals) if len(rmssd_vals) > 1 else 0
+                # Убираем аномалии (>2 SD)
+                if std_r > 0:
+                    clean = [v for v in rmssd_vals if abs(v - mean_r) <= 2 * std_r]
+                    if clean:
+                        rmssd_vals = clean
+                rmssd_baseline = round(statistics.mean(rmssd_vals), 1)
+                rmssd_std = round(statistics.stdev(rmssd_vals), 1) if len(rmssd_vals) > 1 else 0
+            else:
+                rmssd_baseline = None
+                rmssd_std = 0
+
+            sdnn_baseline = round(statistics.mean(sdnn_vals), 1) if sdnn_vals else None
+            lfhf_baseline = round(statistics.mean(lfhf_vals), 2) if lfhf_vals else None
+            hr_baseline = round(statistics.mean(hr_vals)) if hr_vals else None
+
+            # Проверяем есть ли запись
+            cursor2 = await db.execute(
+                "SELECT telegram_id FROM hrv_baseline WHERE telegram_id = ?", (telegram_id,)
+            )
+            existing = await cursor2.fetchone()
+
+            if existing:
+                await db.execute("""
+                    UPDATE hrv_baseline SET
+                        rmssd_baseline = ?, sdnn_baseline = ?, lfhf_baseline = ?,
+                        hr_baseline = ?, measurements_count = ?,
+                        baseline_ready = ?, baseline_days = ?, rmssd_std = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE telegram_id = ?
+                """, (rmssd_baseline, sdnn_baseline, lfhf_baseline,
+                      hr_baseline, count, baseline_ready, count, rmssd_std,
+                      telegram_id))
+            else:
+                await db.execute("""
+                    INSERT INTO hrv_baseline
+                        (telegram_id, rmssd_baseline, sdnn_baseline, lfhf_baseline,
+                         hr_baseline, measurements_count, baseline_ready, baseline_days,
+                         rmssd_std, baseline_started_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (telegram_id, rmssd_baseline, sdnn_baseline, lfhf_baseline,
+                      hr_baseline, count, baseline_ready, count, rmssd_std,
+                      datetime.now().isoformat()))
+
+            await db.commit()
+
+            # Обновить быстрый доступ в users
+            await save_user(telegram_id, {'hrv_baseline_ready': baseline_ready})
+
+            return {
+                'rmssd_baseline': rmssd_baseline, 'rmssd_std': rmssd_std,
+                'sdnn_baseline': sdnn_baseline, 'lfhf_baseline': lfhf_baseline,
+                'hr_baseline': hr_baseline, 'measurements_count': count,
+                'baseline_ready': baseline_ready, 'baseline_days': count,
+            }
+    except Exception as e:
+        print(f"❌ update_hrv_baseline_smart error: {e}")
+        return None
+
+
+def _get_baseline_progress_msg(count: int) -> str:
+    """Сообщение о прогрессе набора baseline"""
+    if count == 1:
+        return "❤️ Первый замер HRV! Начинаю набирать твою персональную норму (нужно 7 дней)."
+    elif count < 7:
+        left = 7 - count
+        return f"❤️ HRV день {count}/7. Ещё {left} {'день' if left == 1 else 'дня' if left < 5 else 'дней'} до персональной нормы."
+    elif count == 7:
+        return "🎉 Baseline готов! Теперь сравниваю с ТВОЕЙ нормой, а не средней по возрасту."
+    else:
+        return ""
+
+
+def _apply_bgs_context(state: str, rmssd: float, bgs_stage: int, baseline: dict) -> dict:
+    """Корректирует интерпретацию HRV на основе стадии БГС"""
+    result = {'override_state': None, 'warning': None, 'note': None}
+
+    if bgs_stage == 0 or not bgs_stage:
+        return result
+
+    if bgs_stage == 1:
+        if state in ("excellent", "normal"):
+            result['note'] = (
+                "💡 БГС: фаза тревоги. HRV пока в норме — "
+                "организм мобилизован. Не перегружай."
+            )
+        else:
+            result['warning'] = "острый стресс (БГС стадия 1)"
+            result['note'] = (
+                "💡 Это временное снижение (острый стресс). "
+                "Обычно восстанавливается за 2-4 недели."
+            )
+    elif bgs_stage == 2:
+        if state == "excellent":
+            result['override_state'] = "normal"
+            result['warning'] = "скрытое напряжение (БГС стадия 2)"
+            result['note'] = (
+                "⚠️ HRV выглядит хорошо, но БГС показывает "
+                "хронический стресс. Кортизол \"маскирует\" истощение."
+            )
+        elif state == "normal":
+            result['note'] = (
+                "⚠️ При БГС стадия 2 даже нормальный HRV — "
+                "сигнал быть мягче. Приоритет: сон и стресс-менеджмент."
+            )
+        else:
+            result['override_state'] = "low"
+            result['note'] = (
+                "🔴 HRV снижен + БГС стадия 2 = адаптация на пределе.\n"
+                "Восстановительный режим. Приоритет: сон, магний, дыхание 4-7-8."
+            )
+    elif bgs_stage == 3:
+        if state in ("excellent", "normal"):
+            result['override_state'] = "reduced"
+            result['warning'] = "истощение надпочечников (БГС стадия 3)"
+            result['note'] = (
+                "⚠️ HRV выглядит нормально, но БГС = стадия истощения.\n"
+                "Парадокс: кортизол упал → симпатика не давит → HRV \"ок\".\n"
+                "Но это НЕ настоящее восстановление. Режим: максимально мягкий."
+            )
+        else:
+            result['override_state'] = "low"
+            result['note'] = (
+                "🔴 БГС стадия 3 + низкий HRV = организм в режиме выживания.\n"
+                "Приоритет #1: сон. Приоритет #2: питание.\n"
+                "Рекомендую консультацию эндокринолога (кортизол, ДГЭА)."
+            )
+
+    return result
+
+
+def _get_day_recommendation(state: str, causes: list, bgs_stage: int = 0) -> dict:
+    """Рекомендация на день по HRV + БГС"""
+    recommendations = {
+        "excellent": {
+            "emoji": "🟢", "mode": "Полный режим",
+            "actions": ["Хороший день для нагрузки", "Организм в ресурсе — используй это"]
+        },
+        "normal": {
+            "emoji": "🟢", "mode": "Обычный режим",
+            "actions": ["Всё по плану", "Умеренная нагрузка ОК"]
+        },
+        "reduced": {
+            "emoji": "🟡", "mode": "Мягкий режим",
+            "actions": ["Прогулка вместо тренировки", "Дыхание 4-7-8 (5 мин)", "Лечь на 30 мин раньше"]
+        },
+        "low": {
+            "emoji": "🔴", "mode": "Восстановительный день",
+            "actions": ["Никаких интенсивных нагрузок", "Дыхание + прогулка", "Лечь на 1 час раньше"]
+        },
+    }
+
+    if "поздняя лютеиновая фаза" in causes:
+        return {"emoji": "🌙", "mode": "Цикл — мягкий режим",
+                "actions": ["Это временно (фаза цикла, 3-5 дней)", "Магний 400мг, лёгкие прогулки"]}
+
+    rec = recommendations.get(state, recommendations["normal"])
+
+    # Коррекция по БГС
+    if bgs_stage == 2:
+        if state == "excellent":
+            rec = {"emoji": "🟡", "mode": "Умеренный режим",
+                   "actions": ["HRV хороший, но надпочечники устали", "Умеренная нагрузка, не интенсивная"]}
+        elif state == "normal":
+            rec = {"emoji": "🟡", "mode": "Мягкий режим",
+                   "actions": ["Прогулка вместо тренировки", "Дыхание 4-7-8 утром и вечером"]}
+    elif bgs_stage == 3:
+        rec = {"emoji": "🔴", "mode": "Режим восстановления",
+               "actions": ["Приоритет: сон 8-9ч + питание", "Только лёгкие прогулки", "Дыхание 4-7-8 трижды в день"]}
+
+    return rec
+
+
+async def interpret_hrv_smart(telegram_id: int, rmssd: float,
+                              sdnn: float = None, lfhf: float = None,
+                              hr: int = None) -> dict:
+    """
+    ФАЗА 3: Умная интерпретация HRV.
+    Учитывает: baseline, БГС, цикл, сезон, устройство.
+    """
+    user = await get_user(telegram_id)
+    baseline = await get_hrv_baseline_smart(telegram_id)
+    device = await get_primary_hrv_device(telegram_id)
+    bgs_stage = 0
+    if user:
+        try:
+            bgs_stage = int(user.get('bgs_stage', 0) or 0)
+        except:
+            bgs_stage = 0
+
+    result = {
+        'rmssd': rmssd, 'sdnn': sdnn, 'lfhf': lfhf, 'hr': hr,
+        'interpretation': 'normal', 'emoji': '🟡',
+        'vs_baseline_pct': None, 'bio_age_hrv': None,
+        'corrections_applied': [], 'message': '', 'bgs_note': None,
+        'recommendation': None, 'baseline_progress': None,
+    }
+
+    # ─── 1. Сравнение с baseline ───
+    causes = []
+    if baseline and baseline.get('baseline_ready') and baseline.get('rmssd_baseline'):
+        bl = baseline['rmssd_baseline']
+        std = baseline.get('rmssd_std') or (bl * 0.15)
+        pct = (rmssd - bl) / bl * 100
+        result['vs_baseline_pct'] = round(pct, 1)
+
+        if rmssd >= bl + std:
+            result['interpretation'] = 'excellent'
+            result['emoji'] = '🟢'
+        elif rmssd >= bl - std * 0.5:
+            result['interpretation'] = 'normal'
+            result['emoji'] = '🟡'
+        elif rmssd >= bl - std * 1.5:
+            result['interpretation'] = 'warning'
+            result['emoji'] = '🟠'
+        else:
+            result['interpretation'] = 'critical'
+            result['emoji'] = '🔴'
+    else:
+        # Нет baseline → популяционные нормы (fallback)
+        age = user.get('exact_age', 40) if user else 40
+        age_group = get_age_group(age)
+        interp = get_rmssd_interpretation(rmssd, age_group)
+        if '🟢' in interp:
+            result['interpretation'] = 'excellent'
+            result['emoji'] = '🟢'
+        elif '🟡' in interp:
+            result['interpretation'] = 'normal'
+            result['emoji'] = '🟡'
+        elif '🟠' in interp:
+            result['interpretation'] = 'warning'
+            result['emoji'] = '🟠'
+        else:
+            result['interpretation'] = 'critical'
+            result['emoji'] = '🔴'
+
+        # Показать прогресс набора baseline
+        bl_count = baseline.get('measurements_count', 0) if baseline else 0
+        result['baseline_progress'] = _get_baseline_progress_msg(bl_count + 1)
+
+    # ─── 2. Коррекция по циклу (женщины) ───
+    gender = user.get('gender', '') if user else ''
+    cycle_day = None
+    if user:
+        try:
+            cycle_day = int(user.get('cycle_day', 0) or 0)
+        except:
+            cycle_day = 0
+    if gender == 'female' and cycle_day and 21 <= cycle_day <= 28:
+        causes.append("поздняя лютеиновая фаза")
+        result['corrections_applied'].append(f'цикл день {cycle_day}: нормальное снижение')
+
+    # ─── 3. БГС-коррекция ───
+    state = result['interpretation']
+    if state == 'warning':
+        state = 'reduced'
+    elif state == 'critical':
+        state = 'low'
+
+    bgs_context = _apply_bgs_context(state, rmssd, bgs_stage, baseline)
+    if bgs_context.get('override_state'):
+        state = bgs_context['override_state']
+    if bgs_context.get('warning'):
+        causes.append(bgs_context['warning'])
+    result['bgs_note'] = bgs_context.get('note')
+
+    # ─── 4. Рекомендация на день ───
+    result['recommendation'] = _get_day_recommendation(state, causes, bgs_stage)
+
+    # ─── 5. Формируем текстовое сообщение ───
+    lines = ["💓 *Утренний HRV*\n"]
+    lines.append(f"RMSSD: {rmssd:.0f} мс")
+    if result['vs_baseline_pct'] is not None:
+        pct = result['vs_baseline_pct']
+        sign = "+" if pct > 0 else ""
+        lines[-1] += f" ({sign}{pct:.0f}% от baseline)"
+    if hr:
+        lines.append(f"ЧСС покоя: {hr} уд/мин")
+    if sdnn:
+        lines.append(f"SDNN: {sdnn:.0f} мс")
+    if lfhf:
+        lfhf_interp = get_lfhf_interpretation(lfhf)
+        lines.append(f"LF/HF: {lfhf:.1f} {lfhf_interp.split(' ', 1)[0]}")
+
+    # Интерпретация
+    interp_map = {
+        'excellent': '🟢 Отличное восстановление!',
+        'normal': '🟢 В пределах нормы.',
+        'reduced': '🟡 Восстановление неполное.',
+        'low': '🔴 Значительно ниже нормы. Режим восстановления.',
+    }
+    lines.append(f"\n{interp_map.get(state, '🟡 Норма')}")
+
+    if causes:
+        cause_str = ", ".join(causes[:3])
+        lines.append(f"Вероятная причина: {cause_str}")
+
+    # БГС-примечание
+    if result['bgs_note']:
+        lines.append(f"\n{result['bgs_note']}")
+
+    # Рекомендация
+    rec = result['recommendation']
+    if rec:
+        lines.append(f"\n📋 *{rec['mode']}:*")
+        for action in rec['actions'][:3]:
+            lines.append(f"• {action}")
+
+    # Прогресс baseline
+    if result['baseline_progress']:
+        lines.append(f"\n{result['baseline_progress']}")
+
+    result['message'] = "\n".join(lines)
+    return result
+
+
+async def check_hrv_alerts(telegram_id: int, new_rmssd: float, lfhf: float = None) -> list:
+    """
+    ФАЗА 3 ШАГ 7: Проверка алертов после утреннего замера.
+    4 типа: critical_low, declining_3d, high_lfhf, sudden_drop.
+    """
+    baseline = await get_hrv_baseline_smart(telegram_id)
+    alerts = []
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT rmssd, lfhf, date FROM hrv_records
+                WHERE telegram_id = ? AND time_of_day = 'morning' AND rmssd IS NOT NULL
+                ORDER BY date DESC LIMIT 5
+            """, (telegram_id,))
+            recent = [dict(r) for r in await cursor.fetchall()]
+    except:
+        recent = []
+
+    # 1. Критически низкий HRV (<50% baseline)
+    if baseline and baseline.get('baseline_ready') and baseline.get('rmssd_baseline'):
+        bl = baseline['rmssd_baseline']
+        if new_rmssd < bl * 0.5:
+            alerts.append({
+                'type': 'critical_low', 'severity': 'red',
+                'message': (
+                    f"🚨 RMSSD {new_rmssd:.0f} мс — менее 50% от твоей нормы ({bl:.0f})!\n"
+                    f"Это может быть: начало болезни, сильный стресс, перетренированность.\n"
+                    f"Сегодня: только восстановление."
+                ),
+            })
+
+    # 2. HRV падает 3+ дня подряд
+    if len(recent) >= 3:
+        vals = [r['rmssd'] for r in recent[:3] if r.get('rmssd')]
+        if len(vals) >= 3 and all(vals[i] > vals[i+1] for i in range(len(vals)-1)):
+            total_drop = vals[0] - vals[-1]
+            if total_drop > 5:
+                alerts.append({
+                    'type': 'declining_3d', 'severity': 'yellow',
+                    'message': (
+                        f"⚠️ HRV снижается 3 дня подряд: {' → '.join(str(int(v)) for v in vals)} мс.\n"
+                        f"Возможно: накопленный недосып, стресс, начало болезни.\n"
+                        f"Рекомендация: ранний отбой + мягкий день."
+                    ),
+                })
+
+    # 3. LF/HF > 4.0 (симпатическая перегрузка)
+    if lfhf and lfhf > 4.0:
+        alerts.append({
+            'type': 'high_lfhf', 'severity': 'yellow',
+            'message': (
+                f"⚠️ LF/HF = {lfhf:.1f} — симпатика перегружена.\n"
+                f"Рекомендация: когерентное дыхание 5-5 (3 мин)."
+            ),
+        })
+
+    # 4. Резкое падение (>30% от вчера)
+    if len(recent) >= 2 and recent[1].get('rmssd') and recent[1]['rmssd'] > 0:
+        yesterday = recent[1]['rmssd']
+        drop_pct = (yesterday - new_rmssd) / yesterday * 100
+        if drop_pct > 30:
+            alerts.append({
+                'type': 'sudden_drop', 'severity': 'orange',
+                'message': (
+                    f"⚠️ HRV упал на {drop_pct:.0f}% за ночь ({yesterday:.0f} → {new_rmssd:.0f}).\n"
+                    f"Что было вчера? Алкоголь, поздний отбой, стресс?\n"
+                    f"Сегодня: мягкий режим."
+                ),
+            })
+
+    # Сохраняем алерты в БД
+    for alert in alerts:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("""
+                    INSERT INTO hrv_alerts (telegram_id, alert_type, alert_data, triggered_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                """, (telegram_id, alert['type'], json.dumps(alert, ensure_ascii=False)))
+                await db.commit()
+        except:
+            pass
+
+    return alerts
+
+
+async def save_hrv_device(telegram_id: int, device_type: str):
+    """Сохранить HRV-устройство"""
+    device_info = DEVICE_ACCURACY.get(device_type, DEVICE_ACCURACY['manual'])
+    tier = device_info['tier']
+    metrics = json.dumps(DEVICE_AVAILABLE_METRICS.get(tier, ['rmssd', 'hr']))
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Убрать is_primary у старых
+            await db.execute(
+                "UPDATE hrv_devices SET is_primary = 0 WHERE telegram_id = ?",
+                (telegram_id,)
+            )
+            await db.execute("""
+                INSERT INTO hrv_devices (telegram_id, device_type, device_model, accuracy_tier, available_metrics, is_primary)
+                VALUES (?, ?, ?, ?, ?, 1)
+            """, (telegram_id, device_type, device_info['model'], tier, metrics))
+            await db.commit()
+
+        # Обновить users
+        await save_user(telegram_id, {
+            'hrv_device_type': device_type,
+            'hrv_accuracy_tier': tier,
+            'hrv_available_metrics': metrics,
+            'has_hrv_device': 1,
+        })
+    except Exception as e:
+        print(f"❌ save_hrv_device error: {e}")
+
+
+def get_evening_hrv_delta_text(morning_rmssd: float, evening_rmssd: float) -> str:
+    """Интерпретация дельты утро→вечер HRV"""
+    delta = evening_rmssd - morning_rmssd
+    pct = (delta / morning_rmssd * 100) if morning_rmssd > 0 else 0
+
+    text = f"📊 Утро: {morning_rmssd:.0f} мс → Вечер: {evening_rmssd:.0f} мс\n"
+    text += f"Дельта: {delta:+.0f} мс ({pct:+.0f}%)\n\n"
+
+    if pct > 10:
+        text += "Тело хорошо восстановилось за день ✅"
+    elif pct > -10:
+        text += "Стабильно. День прошёл без перегрузки."
+    elif pct > -25:
+        text += "Дневная нагрузка сказалась. Ложись пораньше."
+    else:
+        text += "⚠️ Серьёзная нагрузка. Режим восстановления."
+
+    return text
+
+
 @router.callback_query(F.data == "hrv_menu")
 async def hrv_menu(callback: CallbackQuery):
     """Меню HRV"""
@@ -43867,12 +46377,1423 @@ async def hrv_menu(callback: CallbackQuery):
             [InlineKeyboardButton(text="🧘 Практики по HRV", callback_data="hrv_meditation_advice")],  # ПОПРАВКА #143
             [InlineKeyboardButton(text="📈 Тренды", callback_data="hrv_trends")],
             [InlineKeyboardButton(text="📋 Моя статистика", callback_data="hrv_stats")],
+            [InlineKeyboardButton(text="🎯 Мои паттерны", callback_data="hrv_my_patterns")],
             [InlineKeyboardButton(text="🖼 Мои скриншоты", callback_data="hrv_my_photos")],  # ПОПРАВКА #125
             [InlineKeyboardButton(text="💎 Про Polar H10", callback_data="recommend_polar")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
         ])
     )
     await callback.answer()
+
+
+# ═══════════════════════════════════════════════════════════════
+# ФАЗА 3, ЧАТ 2: ШАГИ 8-11
+# ШАГ 8:  Корреляционный движок HRV ↔ Сон/Стресс/Ванны/День недели
+# ШАГ 9:  «Мои паттерны» — персональная аналитика
+# ШАГ 10: Новая формула bio_age (v2) с коррекциями
+# ШАГ 11: Пересмотр стадии БГС по HRV + анализам
+# ═══════════════════════════════════════════════════════════════
+
+
+# ────────────────────────────────────────────────
+# ШАГ 8: КОРРЕЛЯЦИОННЫЙ ДВИЖОК
+# ────────────────────────────────────────────────
+
+def _pearson_correlation(x: list, y: list) -> float:
+    """Коэффициент корреляции Пирсона для двух списков."""
+    n = len(x)
+    if n < 5:
+        return 0.0
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+    num = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+    den_x = sum((xi - mean_x) ** 2 for xi in x) ** 0.5
+    den_y = sum((yi - mean_y) ** 2 for yi in y) ** 0.5
+    if den_x == 0 or den_y == 0:
+        return 0.0
+    return round(num / (den_x * den_y), 3)
+
+
+def _classify_correlation(r: float) -> str:
+    """Классификация силы корреляции."""
+    r = abs(r)
+    if r >= 0.7:
+        return 'strong'
+    elif r >= 0.4:
+        return 'moderate'
+    elif r >= 0.2:
+        return 'weak'
+    return 'none'
+
+
+async def calculate_hrv_correlations(telegram_id: int, days: int = 30) -> dict:
+    """
+    ШАГ 8: Анализирует корреляции HRV с факторами за N дней.
+    Возвращает словарь корреляций.
+    """
+    correlations = {}
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+
+            # ─── Загрузка HRV утренних замеров ───
+            cursor = await db.execute("""
+                SELECT date, rmssd, sdnn, lfhf, hr_rest
+                FROM hrv_records
+                WHERE telegram_id = ? AND time_of_day = 'morning'
+                      AND rmssd IS NOT NULL AND rmssd > 0
+                ORDER BY date DESC LIMIT ?
+            """, (telegram_id, days))
+            hrv_rows = [dict(r) for r in await cursor.fetchall()]
+            if len(hrv_rows) < 7:
+                return correlations
+            hrv_by_date = {r['date']: r for r in hrv_rows}
+
+            # ─── Загрузка утренних чекинов ───
+            cursor = await db.execute("""
+                SELECT date, sleep_quality, morning_energy, wake_feeling,
+                       hrv_rmssd, cold_wash_done, stress, energy, mood
+                FROM daily_checkins
+                WHERE telegram_id = ? AND checkin_type = 'morning'
+                ORDER BY date DESC LIMIT ?
+            """, (telegram_id, days + 5))
+            morning_checkins = {dict(r)['date']: dict(r) for r in await cursor.fetchall()}
+
+            # ─── Загрузка вечерних чекинов ───
+            cursor = await db.execute("""
+                SELECT date, stress, energy, mood, sleepiness
+                FROM daily_checkins
+                WHERE telegram_id = ? AND checkin_type = 'evening'
+                ORDER BY date DESC LIMIT ?
+            """, (telegram_id, days + 5))
+            evening_checkins = {dict(r)['date']: dict(r) for r in await cursor.fetchall()}
+
+            # ─── Загрузка circadian_log (время отбоя) ───
+            cursor = await db.execute("""
+                SELECT date, actual_bedtime, actual_waketime
+                FROM circadian_log
+                WHERE telegram_id = ?
+                ORDER BY date DESC LIMIT ?
+            """, (telegram_id, days + 5))
+            circadian = {dict(r)['date']: dict(r) for r in await cursor.fetchall()}
+
+            # ─── Загрузка sleep_factors (алкоголь и др.) ───
+            cursor = await db.execute("""
+                SELECT date, alcohol, caffeine, bath_routine
+                FROM sleep_factors
+                WHERE telegram_id = ?
+                ORDER BY date DESC LIMIT ?
+            """, (telegram_id, days + 5))
+            sleep_factors = {dict(r)['date']: dict(r) for r in await cursor.fetchall()}
+
+            # ─── Загрузка hydro_sessions (ванны/душ) ───
+            cursor = await db.execute("""
+                SELECT date, session_type, duration_min
+                FROM hydro_sessions
+                WHERE telegram_id = ?
+                ORDER BY date DESC LIMIT ?
+            """, (telegram_id, days + 5))
+            hydro_rows = [dict(r) for r in await cursor.fetchall()]
+            hydro_dates = set(r['date'] for r in hydro_rows)
+
+            # ─── Загрузка workouts ───
+            cursor = await db.execute("""
+                SELECT date, workout_type, intensity, duration_min
+                FROM workouts
+                WHERE telegram_id = ?
+                ORDER BY date DESC LIMIT ?
+            """, (telegram_id, days + 5))
+            workout_rows = [dict(r) for r in await cursor.fetchall()]
+            workout_dates = set(r['date'] for r in workout_rows)
+
+    except Exception as e:
+        print(f"❌ calculate_hrv_correlations data load error: {e}")
+        return correlations
+
+    # ═══ 1. КАЧЕСТВО СНА → УТРЕННИЙ HRV ═══
+    sleep_rmssd_pairs = []
+    for d, hrv in hrv_by_date.items():
+        mc = morning_checkins.get(d)
+        if mc and mc.get('sleep_quality') and mc['sleep_quality'] > 0:
+            sleep_rmssd_pairs.append((mc['sleep_quality'], hrv['rmssd']))
+
+    if len(sleep_rmssd_pairs) >= 7:
+        x = [p[0] for p in sleep_rmssd_pairs]
+        y = [p[1] for p in sleep_rmssd_pairs]
+        r = _pearson_correlation(x, y)
+        if abs(r) >= 0.2:
+            # Пороговый эффект
+            low = [p[1] for p in sleep_rmssd_pairs if p[0] <= 2]
+            high = [p[1] for p in sleep_rmssd_pairs if p[0] >= 4]
+            drop_pct = 0
+            if low and high:
+                avg_low = sum(low) / len(low)
+                avg_high = sum(high) / len(high)
+                if avg_high > 0:
+                    drop_pct = round((1 - avg_low / avg_high) * 100)
+            correlations['sleep_quality'] = {
+                'r': r,
+                'strength': _classify_correlation(r),
+                'data_points': len(sleep_rmssd_pairs),
+                'drop_pct': drop_pct,
+                'emoji': '😴',
+                'description': f'Плохой сон → HRV утром –{drop_pct}%' if drop_pct > 0 else f'Качество сна ↔ HRV: r={r:.2f}',
+                'action': 'Улучши качество сна → HRV вырастет',
+            }
+
+    # ═══ 2. СТРЕСС ВЕЧЕРОМ → УТРЕННИЙ HRV (следующий день) ═══
+    stress_rmssd_pairs = []
+    for d, hrv in hrv_by_date.items():
+        # Стресс вечером ПРЕДЫДУЩЕГО дня
+        try:
+            prev = (date.fromisoformat(d) - timedelta(days=1)).isoformat()
+        except:
+            continue
+        ec = evening_checkins.get(prev)
+        if ec and ec.get('stress') and ec['stress'] > 0:
+            stress_rmssd_pairs.append((ec['stress'], hrv['rmssd']))
+
+    if len(stress_rmssd_pairs) >= 7:
+        x = [p[0] for p in stress_rmssd_pairs]
+        y = [p[1] for p in stress_rmssd_pairs]
+        r = _pearson_correlation(x, y)
+        if abs(r) >= 0.2:
+            high_stress = [p[1] for p in stress_rmssd_pairs if p[0] >= 4]
+            low_stress = [p[1] for p in stress_rmssd_pairs if p[0] <= 2]
+            drop_pct = 0
+            if high_stress and low_stress:
+                avg_h = sum(high_stress) / len(high_stress)
+                avg_l = sum(low_stress) / len(low_stress)
+                if avg_l > 0:
+                    drop_pct = round((1 - avg_h / avg_l) * 100)
+            correlations['stress_evening'] = {
+                'r': r,
+                'strength': _classify_correlation(r),
+                'data_points': len(stress_rmssd_pairs),
+                'drop_pct': drop_pct,
+                'emoji': '😰',
+                'description': f'Стресс ≥4 вечером → HRV утром –{drop_pct}%' if drop_pct > 0 else f'Стресс ↔ HRV: r={r:.2f}',
+                'action': 'Дыхание перед сном снижает эффект стресса на HRV',
+            }
+
+    # ═══ 3. ВРЕМЯ ОТБОЯ → УТРЕННИЙ HRV ═══
+    bedtime_rmssd_pairs = []
+    for d, hrv in hrv_by_date.items():
+        try:
+            prev = (date.fromisoformat(d) - timedelta(days=1)).isoformat()
+        except:
+            continue
+        cl = circadian.get(prev)
+        if cl and cl.get('actual_bedtime'):
+            try:
+                bt_str = cl['actual_bedtime']
+                parts = bt_str.split(':')
+                bt_minutes = int(parts[0]) * 60 + int(parts[1])
+                if bt_minutes < 360:
+                    bt_minutes += 1440  # после полуночи
+                bedtime_rmssd_pairs.append((bt_minutes, hrv['rmssd']))
+            except:
+                continue
+
+    if len(bedtime_rmssd_pairs) >= 7:
+        x = [p[0] for p in bedtime_rmssd_pairs]
+        y = [p[1] for p in bedtime_rmssd_pairs]
+        r = _pearson_correlation(x, y)
+        if abs(r) >= 0.2:
+            early = [p[1] for p in bedtime_rmssd_pairs if p[0] <= 23 * 60]
+            late = [p[1] for p in bedtime_rmssd_pairs if p[0] >= 24 * 60]
+            desc = f'Время отбоя ↔ HRV: r={r:.2f}'
+            if early and late:
+                avg_early = round(sum(early) / len(early), 1)
+                avg_late = round(sum(late) / len(late), 1)
+                desc = f'До 23:00 → RMSSD {avg_early}, после 00:00 → RMSSD {avg_late}'
+            correlations['bedtime'] = {
+                'r': r,
+                'strength': _classify_correlation(r),
+                'data_points': len(bedtime_rmssd_pairs),
+                'emoji': '⏰',
+                'description': desc,
+                'action': 'Ложись раньше → HRV будет выше',
+            }
+
+    # ═══ 4. ВАННЫ / ГИДРОТЕРАПИЯ → HRV СЛЕДУЮЩЕЕ УТРО ═══
+    if hydro_dates:
+        bath_rmssd = []
+        no_bath_rmssd = []
+        for d, hrv in hrv_by_date.items():
+            try:
+                prev = (date.fromisoformat(d) - timedelta(days=1)).isoformat()
+            except:
+                continue
+            if prev in hydro_dates:
+                bath_rmssd.append(hrv['rmssd'])
+            else:
+                no_bath_rmssd.append(hrv['rmssd'])
+
+        if len(bath_rmssd) >= 3 and len(no_bath_rmssd) >= 3:
+            avg_bath = sum(bath_rmssd) / len(bath_rmssd)
+            avg_no = sum(no_bath_rmssd) / len(no_bath_rmssd)
+            diff = avg_bath - avg_no
+            diff_pct = round(diff / avg_no * 100) if avg_no > 0 else 0
+            if abs(diff_pct) >= 5:
+                correlations['bath_effect'] = {
+                    'r': abs(diff_pct) / 100,  # pseudo-r
+                    'strength': 'moderate' if abs(diff_pct) >= 10 else 'weak',
+                    'data_points': len(bath_rmssd) + len(no_bath_rmssd),
+                    'emoji': '🛁',
+                    'description': f'После ванны/душа → RMSSD {diff_pct:+d}% утром',
+                    'action': 'Ванна вечером помогает восстановлению' if diff_pct > 0 else 'Проверь режим процедур',
+                    'avg_bath': round(avg_bath, 1),
+                    'avg_no_bath': round(avg_no, 1),
+                }
+
+    # ═══ 5. ДЕНЬ НЕДЕЛИ → HRV ═══
+    weekday_data = {}
+    for d, hrv in hrv_by_date.items():
+        try:
+            wd = date.fromisoformat(d).weekday()
+            weekday_data.setdefault(wd, []).append(hrv['rmssd'])
+        except:
+            continue
+
+    if len(weekday_data) >= 5:
+        wd_avgs = {}
+        for wd, vals in weekday_data.items():
+            if len(vals) >= 2:
+                wd_avgs[wd] = round(sum(vals) / len(vals), 1)
+        if len(wd_avgs) >= 5:
+            wd_names = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+            best_wd = max(wd_avgs, key=wd_avgs.get)
+            worst_wd = min(wd_avgs, key=wd_avgs.get)
+            spread = wd_avgs[best_wd] - wd_avgs[worst_wd]
+            if spread >= 5:
+                correlations['weekday'] = {
+                    'r': min(spread / 30, 1.0),
+                    'strength': 'moderate' if spread >= 10 else 'weak',
+                    'data_points': sum(len(v) for v in weekday_data.values()),
+                    'emoji': '📅',
+                    'description': f'{wd_names[worst_wd]} — худший HRV ({wd_avgs[worst_wd]}), {wd_names[best_wd]} — лучший ({wd_avgs[best_wd]})',
+                    'action': f'{wd_names[worst_wd]} = мягкий старт, не грузись',
+                    'weekday_avgs': {wd_names[k]: v for k, v in wd_avgs.items()},
+                }
+
+    # ═══ 6. ТРЕНИРОВКИ → HRV СЛЕДУЮЩЕЕ УТРО ═══
+    if workout_dates:
+        train_rmssd = []
+        no_train_rmssd = []
+        for d, hrv in hrv_by_date.items():
+            try:
+                prev = (date.fromisoformat(d) - timedelta(days=1)).isoformat()
+            except:
+                continue
+            if prev in workout_dates:
+                train_rmssd.append(hrv['rmssd'])
+            else:
+                no_train_rmssd.append(hrv['rmssd'])
+
+        if len(train_rmssd) >= 3 and len(no_train_rmssd) >= 3:
+            avg_t = sum(train_rmssd) / len(train_rmssd)
+            avg_n = sum(no_train_rmssd) / len(no_train_rmssd)
+            diff_pct = round((avg_t - avg_n) / avg_n * 100) if avg_n > 0 else 0
+            if abs(diff_pct) >= 5:
+                correlations['workout_effect'] = {
+                    'r': abs(diff_pct) / 100,
+                    'strength': 'moderate' if abs(diff_pct) >= 10 else 'weak',
+                    'data_points': len(train_rmssd) + len(no_train_rmssd),
+                    'emoji': '🏋️',
+                    'description': f'После тренировки → RMSSD {diff_pct:+d}% утром',
+                    'action': 'Тренировка повышает HRV!' if diff_pct > 0 else 'Возможна перетренированность — следи за интенсивностью',
+                }
+
+    # ═══ 7. АЛКОГОЛЬ → HRV ═══
+    alcohol_rmssd = []
+    no_alcohol_rmssd = []
+    for d, hrv in hrv_by_date.items():
+        try:
+            prev = (date.fromisoformat(d) - timedelta(days=1)).isoformat()
+        except:
+            continue
+        sf = sleep_factors.get(prev)
+        if sf:
+            alc = sf.get('alcohol', '')
+            if alc and alc not in ('none', 'нет', '0', ''):
+                alcohol_rmssd.append(hrv['rmssd'])
+            else:
+                no_alcohol_rmssd.append(hrv['rmssd'])
+
+    if len(alcohol_rmssd) >= 2 and len(no_alcohol_rmssd) >= 5:
+        avg_a = sum(alcohol_rmssd) / len(alcohol_rmssd)
+        avg_n = sum(no_alcohol_rmssd) / len(no_alcohol_rmssd)
+        diff_pct = round((avg_a - avg_n) / avg_n * 100) if avg_n > 0 else 0
+        if abs(diff_pct) >= 5:
+            correlations['alcohol'] = {
+                'r': abs(diff_pct) / 100,
+                'strength': 'moderate' if abs(diff_pct) >= 15 else 'weak',
+                'data_points': len(alcohol_rmssd) + len(no_alcohol_rmssd),
+                'emoji': '🍷',
+                'description': f'После алкоголя → RMSSD {diff_pct:+d}%',
+                'action': 'Алкоголь подавляет восстановление нервной системы',
+            }
+
+    # ═══ 8. НЕДЕЛЬНЫЙ ТРЕНД ═══
+    if len(hrv_rows) >= 14:
+        first_half = hrv_rows[len(hrv_rows)//2:]
+        second_half = hrv_rows[:len(hrv_rows)//2]
+        avg_first = sum(r['rmssd'] for r in first_half) / len(first_half)
+        avg_second = sum(r['rmssd'] for r in second_half) / len(second_half)
+        trend_pct = round((avg_second - avg_first) / avg_first * 100) if avg_first > 0 else 0
+        if abs(trend_pct) >= 5:
+            correlations['weekly_trend'] = {
+                'r': abs(trend_pct) / 100,
+                'strength': 'moderate' if abs(trend_pct) >= 10 else 'weak',
+                'data_points': len(hrv_rows),
+                'emoji': '📈' if trend_pct > 0 else '📉',
+                'description': f'Тренд за {len(hrv_rows)} дней: RMSSD {trend_pct:+d}%',
+                'action': 'Программа работает! 🎉' if trend_pct > 0 else 'Организм под нагрузкой — восстановление приоритет',
+            }
+
+    # ═══ 9. LF/HF ТРЕНД (если есть данные) ═══
+    lfhf_records = [(r['date'], r['lfhf']) for r in hrv_rows if r.get('lfhf') and r['lfhf'] > 0]
+    if len(lfhf_records) >= 10:
+        first_half = lfhf_records[len(lfhf_records)//2:]
+        second_half = lfhf_records[:len(lfhf_records)//2]
+        avg_first_lf = sum(v for _, v in first_half) / len(first_half)
+        avg_second_lf = sum(v for _, v in second_half) / len(second_half)
+        lf_change_pct = round((avg_second_lf - avg_first_lf) / avg_first_lf * 100) if avg_first_lf > 0 else 0
+        if abs(lf_change_pct) >= 5:
+            if lf_change_pct < 0:
+                desc = f'LF/HF снизился на {abs(lf_change_pct)}% → нервная система омолаживается! ✨'
+                action = 'Баланс улучшается — парасимпатика растёт'
+            else:
+                desc = f'LF/HF вырос на {lf_change_pct}% → симпатика усиливается'
+                action = 'Больше дыхательных практик и восстановления'
+            correlations['lfhf_trend'] = {
+                'r': abs(lf_change_pct) / 100,
+                'strength': 'moderate' if abs(lf_change_pct) >= 15 else 'weak',
+                'data_points': len(lfhf_records),
+                'emoji': '✨' if lf_change_pct < 0 else '⚡',
+                'description': desc,
+                'action': action,
+            }
+
+    return correlations
+
+
+async def _save_hrv_patterns(telegram_id: int, correlations: dict):
+    """Сохраняет обнаруженные паттерны в БД."""
+    try:
+        today = date.today().isoformat()
+        async with aiosqlite.connect(DB_PATH) as db:
+            for ptype, data in correlations.items():
+                if data.get('strength', 'none') in ('none',):
+                    continue
+                # Проверяем, есть ли уже такой паттерн
+                cursor = await db.execute(
+                    "SELECT id FROM hrv_patterns WHERE telegram_id = ? AND pattern_type = ?",
+                    (telegram_id, ptype)
+                )
+                existing = await cursor.fetchone()
+                if existing:
+                    await db.execute("""
+                        UPDATE hrv_patterns SET
+                            description = ?, strength = ?, confidence = ?,
+                            data_points = ?, last_confirmed = ?, emoji = ?,
+                            action_text = ?
+                        WHERE id = ?
+                    """, (
+                        data.get('description', ''),
+                        data.get('r', 0),
+                        data.get('strength', 'weak'),
+                        data.get('data_points', 0),
+                        today,
+                        data.get('emoji', '📊'),
+                        data.get('action', ''),
+                        existing[0],
+                    ))
+                else:
+                    await db.execute("""
+                        INSERT INTO hrv_patterns
+                            (telegram_id, pattern_type, description, strength, confidence,
+                             data_points, emoji, actionable, action_text, discovered_at, last_confirmed)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        telegram_id, ptype,
+                        data.get('description', ''),
+                        data.get('r', 0),
+                        data.get('strength', 'weak'),
+                        data.get('data_points', 0),
+                        data.get('emoji', '📊'),
+                        1 if data.get('action') else 0,
+                        data.get('action', ''),
+                        today, today,
+                    ))
+            await db.commit()
+    except Exception as e:
+        print(f"❌ _save_hrv_patterns error: {e}")
+
+
+async def _get_weekly_heatmap(telegram_id: int) -> str:
+    """Текстовая heatmap за последнюю неделю: HRV + Сон + Стресс."""
+    try:
+        today_d = date.today()
+        week_start = today_d - timedelta(days=6)
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+
+            cursor = await db.execute("""
+                SELECT date, rmssd FROM hrv_records
+                WHERE telegram_id = ? AND time_of_day = 'morning'
+                      AND date >= ? AND rmssd IS NOT NULL
+                ORDER BY date
+            """, (telegram_id, week_start.isoformat()))
+            hrv_week = {dict(r)['date']: dict(r)['rmssd'] for r in await cursor.fetchall()}
+
+            cursor = await db.execute("""
+                SELECT date, sleep_quality, stress FROM daily_checkins
+                WHERE telegram_id = ? AND checkin_type = 'morning' AND date >= ?
+                ORDER BY date
+            """, (telegram_id, week_start.isoformat()))
+            checkins_week = {dict(r)['date']: dict(r) for r in await cursor.fetchall()}
+
+            # Получаем baseline для цветов
+            cursor = await db.execute(
+                "SELECT rmssd_baseline, rmssd_std FROM hrv_baseline WHERE telegram_id = ?",
+                (telegram_id,)
+            )
+            bl_row = await cursor.fetchone()
+            bl = dict(bl_row) if bl_row else {}
+
+        bl_rmssd = bl.get('rmssd_baseline') or 35
+        bl_std = bl.get('rmssd_std') or (bl_rmssd * 0.15)
+
+        wd_names = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+        lines = ["```"]
+        header = "     " + "  ".join(f"{wd_names[i]:>4}" for i in range(7))
+        lines.append(header)
+
+        # HRV строка
+        hrv_line = "HRV  "
+        sleep_line = "Сон  "
+        stress_line = "Стр  "
+
+        for i in range(7):
+            d = (week_start + timedelta(days=i)).isoformat()
+            # HRV
+            rmssd = hrv_week.get(d)
+            if rmssd:
+                if rmssd >= bl_rmssd + bl_std:
+                    hrv_line += "  🟢"
+                elif rmssd >= bl_rmssd - bl_std * 0.5:
+                    hrv_line += "  🟡"
+                elif rmssd >= bl_rmssd - bl_std * 1.5:
+                    hrv_line += "  🟠"
+                else:
+                    hrv_line += "  🔴"
+            else:
+                hrv_line += "  ── "
+
+            # Сон
+            ck = checkins_week.get(d, {})
+            sq = ck.get('sleep_quality')
+            if sq:
+                sleep_line += f"  {sq}/5"
+            else:
+                sleep_line += "  ── "
+
+            # Стресс
+            st = ck.get('stress')
+            if st:
+                stress_line += f"  {st}/5"
+            else:
+                stress_line += "  ── "
+
+        lines.append(hrv_line)
+        lines.append(sleep_line)
+        lines.append(stress_line)
+        lines.append("```")
+        return "\n".join(lines)
+
+    except Exception as e:
+        print(f"❌ _get_weekly_heatmap error: {e}")
+        return ""
+
+
+# ────────────────────────────────────────────────
+# ШАГ 9: «МОИ ПАТТЕРНЫ» — ПЕРСОНАЛЬНАЯ АНАЛИТИКА
+# ────────────────────────────────────────────────
+
+@router.callback_query(F.data == "hrv_my_patterns")
+async def hrv_my_patterns_handler(callback: CallbackQuery):
+    """Показывает персональные паттерны HRV."""
+    tid = callback.from_user.id
+    await callback.answer()
+
+    try:
+        # Проверяем количество замеров
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM hrv_records WHERE telegram_id = ? AND time_of_day = 'morning' AND rmssd IS NOT NULL",
+                (tid,)
+            )
+            count = (await cursor.fetchone())[0]
+
+        if count < 7:
+            left = 7 - count
+            await callback.message.edit_text(
+                f"🎯 *Мои паттерны HRV*\n\n"
+                f"Для анализа паттернов нужно минимум 7 замеров.\n"
+                f"Сейчас: {count}. Ещё {left}!\n\n"
+                f"Продолжай измерять HRV каждое утро — скоро увидишь свои закономерности.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="◀️ Назад", callback_data="hrv_menu")]
+                ])
+            )
+            return
+
+        # Считаем корреляции
+        correlations = await calculate_hrv_correlations(tid, days=60)
+        await _save_hrv_patterns(tid, correlations)
+
+        # Формируем сообщение
+        user = await get_user(tid)
+        name = user.get('name', 'друг') if user else 'друг'
+
+        lines = [f"🎯 *{name}, твои паттерны HRV*"]
+        lines.append(f"(на основе {count} замеров)\n")
+
+        if not correlations:
+            lines.append("Пока не обнаружено значимых корреляций.")
+            lines.append("Продолжай замеры — чем больше данных, тем точнее анализ!")
+        else:
+            # Сортируем по силе
+            sorted_corr = sorted(correlations.items(), key=lambda x: abs(x[1].get('r', 0)), reverse=True)
+            for ptype, data in sorted_corr:
+                emoji = data.get('emoji', '📊')
+                desc = data.get('description', '')
+                strength = data.get('strength', '')
+                action = data.get('action', '')
+                r_val = data.get('r', 0)
+
+                strength_label = {'strong': '💪 сильная', 'moderate': '📊 средняя', 'weak': '📎 слабая'}.get(strength, '')
+
+                lines.append(f"{emoji} *{desc}*")
+                if strength_label and abs(r_val) >= 0.2:
+                    lines.append(f"   Связь: {strength_label} (r={r_val:.2f})")
+                if action:
+                    lines.append(f"   💡 {action}")
+                lines.append("")
+
+        # Недельная heatmap
+        heatmap = await _get_weekly_heatmap(tid)
+        if heatmap:
+            lines.append("📊 *Неделя:*")
+            lines.append(heatmap)
+
+        # Обновляем статус
+        await save_user(tid, {
+            'hrv_patterns_unlocked': 1,
+            'hrv_patterns_last_shown': date.today().isoformat()
+        })
+
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3950] + "\n\n_(сокращено)_"
+
+        await callback.message.edit_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="hrv_my_patterns")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="hrv_menu")]
+            ])
+        )
+
+    except Exception as e:
+        print(f"❌ hrv_my_patterns_handler error: {e}")
+        await callback.message.edit_text(
+            "❌ Ошибка при анализе паттернов. Попробуй позже.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="hrv_menu")]
+            ])
+        )
+
+
+async def generate_patterns_for_weekly_report(telegram_id: int) -> str:
+    """
+    Генерирует блок паттернов для еженедельного отчёта.
+    Возвращает 1-3 строки инсайтов.
+    """
+    try:
+        correlations = await calculate_hrv_correlations(telegram_id, days=30)
+        if not correlations:
+            return ""
+
+        lines = []
+        sorted_corr = sorted(correlations.items(), key=lambda x: abs(x[1].get('r', 0)), reverse=True)
+        for ptype, data in sorted_corr[:2]:
+            emoji = data.get('emoji', '📊')
+            desc = data.get('description', '')
+            lines.append(f"   {emoji} {desc}")
+
+        if lines:
+            return "💡 *HRV инсайты:*\n" + "\n".join(lines)
+        return ""
+    except:
+        return ""
+
+
+async def check_patterns_unlocked(telegram_id: int) -> str:
+    """
+    Проверяет: набралось 20+ замеров → пора показать паттерны?
+    Вызывается в утреннем чекине.
+    """
+    try:
+        user = await get_user(telegram_id)
+        if not user:
+            return ""
+        if user.get('hrv_patterns_unlocked'):
+            return ""  # уже показывали
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM hrv_records WHERE telegram_id = ? AND time_of_day = 'morning' AND rmssd IS NOT NULL",
+                (telegram_id,)
+            )
+            count = (await cursor.fetchone())[0]
+
+        if count >= 20:
+            name = user.get('name', 'друг')
+            await save_user(telegram_id, {'hrv_patterns_unlocked': 1})
+            return (
+                f"\n\n🎯 *{name}, у меня накопилось {count} замеров HRV!*\n"
+                f"Я нашла твои персональные паттерны — "
+                f"нажми «🎯 Мои паттерны» в меню HRV!"
+            )
+        return ""
+    except:
+        return ""
+
+
+# ────────────────────────────────────────────────
+# ШАГ 10: НОВАЯ ФОРМУЛА BIO_AGE v2
+# ────────────────────────────────────────────────
+
+def calculate_hrv_bio_age_v2(
+    rmssd: float,
+    lfhf: float = None,
+    sdnn: float = None,
+    chronological_age: int = 40,
+    baseline_rmssd: float = None,
+    bgs_stage: int = 0,
+    device_confidence: float = 0.9,
+    gender: str = 'female',
+    cycle_day: int = None,
+) -> dict:
+    """
+    Улучшенный расчёт биовозраста по HRV.
+
+    Отличия от v1:
+    1. Учитывает baseline (персональная норма)
+    2. Коррекция по БГС стадии
+    3. Коррекция по полу и циклу
+    4. Более детальная градация по LF/HF
+    5. SDNN как дополнительный фактор
+    6. Confidence устройства
+    7. Сезонная коррекция
+    """
+
+    # ─── Базовый расчёт по RMSSD ───
+    rmssd_norms = {
+        25: 55, 30: 48, 35: 42, 40: 37,
+        45: 33, 50: 29, 55: 26, 60: 23,
+        65: 20, 70: 18, 75: 15, 80: 12
+    }
+
+    # Гендерная коррекция: женщины +5% RMSSD при тех же условиях
+    effective_rmssd = rmssd
+    if gender == 'female':
+        effective_rmssd = rmssd * 0.95  # Нормализуем к мужской шкале
+
+    bio_age = 80  # начинаем с максимума
+    for age, norm in sorted(rmssd_norms.items()):
+        if effective_rmssd >= norm:
+            bio_age = age
+
+    # ─── Коррекция по LF/HF (более детальная) ───
+    lfhf_correction = 0
+    if lfhf is not None and lfhf > 0:
+        if lfhf < 1.0:
+            lfhf_correction = -4   # Отличный вагусный тонус
+        elif lfhf < 1.5:
+            lfhf_correction = -2   # Хороший баланс
+        elif lfhf < 2.5:
+            lfhf_correction = 0    # Норма
+        elif lfhf < 3.5:
+            lfhf_correction = 2    # Лёгкий дисбаланс
+        elif lfhf < 5.0:
+            lfhf_correction = 4    # Симпатическое доминирование
+        else:
+            lfhf_correction = 7    # Серьёзная перегрузка
+    bio_age += lfhf_correction
+
+    # ─── Коррекция по SDNN ───
+    sdnn_correction = 0
+    if sdnn is not None and sdnn > 0:
+        if sdnn > 100:
+            sdnn_correction = -2   # Высокий адаптационный резерв
+        elif sdnn < 30:
+            sdnn_correction = 3    # Низкий резерв
+    bio_age += sdnn_correction
+
+    # ─── Коррекция по БГС ───
+    bgs_correction = 0
+    if bgs_stage == 3:
+        bgs_correction = -5   # HRV занижен из-за истощения, не реальный возраст
+    elif bgs_stage == 2:
+        bgs_correction = -2
+    bio_age += bgs_correction
+
+    # ─── Коррекция по циклу ───
+    cycle_correction = 0
+    if gender == 'female' and cycle_day and 21 <= cycle_day <= 28:
+        cycle_correction = -3   # HRV снижен в лютеиновой фазе — норма
+    bio_age += cycle_correction
+
+    # ─── Сезонная коррекция ───
+    season_correction = 0
+    month = datetime.now().month
+    if month in [11, 12, 1, 2]:  # Зима
+        season_correction = -2   # HRV зимой ниже — норма
+    bio_age += season_correction
+
+    # ─── Confidence (размытие к паспортному) ───
+    confidence = min(max(device_confidence, 0.5), 1.0)
+    bio_age = round(bio_age * confidence + chronological_age * (1 - confidence))
+
+    # Ограничиваем разумным диапазоном
+    bio_age = max(18, min(bio_age, 90))
+
+    difference = chronological_age - bio_age
+
+    return {
+        'bio_age_hrv': bio_age,
+        'bio_age_raw': bio_age - bgs_correction - cycle_correction - season_correction,
+        'difference': difference,
+        'corrections': {
+            'lfhf': lfhf_correction,
+            'sdnn': sdnn_correction,
+            'bgs': bgs_correction,
+            'cycle': cycle_correction,
+            'season': season_correction,
+            'confidence': confidence,
+        },
+    }
+
+
+async def get_hrv_bio_age_smart(telegram_id: int) -> dict:
+    """
+    Получает умный биовозраст по HRV для пользователя.
+    Использует последний замер + все коррекции.
+    """
+    try:
+        user = await get_user(telegram_id)
+        if not user:
+            return None
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT rmssd, sdnn, lfhf, hr_rest
+                FROM hrv_records
+                WHERE telegram_id = ? AND time_of_day = 'morning' AND rmssd IS NOT NULL
+                ORDER BY date DESC LIMIT 1
+            """, (telegram_id,))
+            latest = await cursor.fetchone()
+            if not latest:
+                return None
+            latest = dict(latest)
+
+        age = user.get('exact_age', 40) or 40
+        try:
+            age = int(age)
+        except:
+            age = 40
+
+        bgs_stage = 0
+        try:
+            bgs_stage = int(user.get('bgs_stage', 0) or 0)
+        except:
+            bgs_stage = 0
+
+        gender = user.get('gender', 'female') or 'female'
+        cycle_day = 0
+        try:
+            cycle_day = int(user.get('cycle_day', 0) or 0)
+        except:
+            cycle_day = 0
+
+        device = await get_primary_hrv_device(telegram_id)
+        device_type = device.get('device_type', 'manual') if device else 'manual'
+        dev_info = DEVICE_ACCURACY.get(device_type, DEVICE_ACCURACY['manual'])
+        confidence = dev_info.get('confidence', 0.7)
+
+        return calculate_hrv_bio_age_v2(
+            rmssd=latest['rmssd'],
+            lfhf=latest.get('lfhf'),
+            sdnn=latest.get('sdnn'),
+            chronological_age=age,
+            bgs_stage=bgs_stage,
+            device_confidence=confidence,
+            gender=gender,
+            cycle_day=cycle_day,
+        )
+    except Exception as e:
+        print(f"❌ get_hrv_bio_age_smart error: {e}")
+        return None
+
+
+# ────────────────────────────────────────────────
+# ШАГ 11: ПЕРЕСМОТР СТАДИИ БГС
+# ────────────────────────────────────────────────
+
+# Нормы кортизола слюна (нмоль/л)
+CORTISOL_SALIVA_RANGES = {
+    'morning': {'low': 5, 'normal_low': 15, 'normal_high': 25, 'high': 40},
+    'evening': {'low': 0.5, 'normal_low': 1, 'normal_high': 5, 'high': 10},
+}
+
+
+def _classify_bgs_from_labs(labs: dict) -> int:
+    """
+    Определяет стадию БГС по анализам.
+    Кортизол утро/вечер (нмоль/л слюна), ДГЭА-С.
+    """
+    cort_am = labs.get('cortisol_morning', 0) or 0
+    cort_pm = labs.get('cortisol_evening', 0) or 0
+    dhea = labs.get('dhea_s', 0) or 0
+    dhea_low_norm = labs.get('dhea_s_low_norm', 150) or 150  # нижняя граница нормы
+
+    # Стадия 3: всё низкое (истощение)
+    if cort_am < 10 and dhea < dhea_low_norm * 0.7:
+        return 3
+
+    # Стадия 2: кортизол высокий + ДГЭА падает
+    if cort_am > 25 and dhea < dhea_low_norm:
+        return 2
+
+    # Стадия 1: кортизол повышен, ДГЭА ещё ОК
+    if cort_am > 25 or cort_pm > 5:
+        return 1
+
+    return 0  # Норма
+
+
+def _classify_bgs_from_hrv(baseline: dict, age: int) -> int:
+    """
+    Предполагаемая стадия БГС по HRV baseline.
+    Вспомогательная оценка, не заменяет тесты.
+    """
+    if not baseline or not baseline.get('rmssd_baseline'):
+        return None
+
+    rmssd = baseline['rmssd_baseline']
+    age_group = get_age_group(age)
+    norms = RMSSD_NORMS.get(age_group, RMSSD_NORMS["30-39"])
+
+    if rmssd < norms['low']:
+        return 3  # Истощение
+    elif rmssd < norms['mid']:
+        return 2  # Напряжение
+    else:
+        return 1  # Норма/компенсация
+
+
+STAGE_NAMES = {0: "норма", 1: "тревога", 2: "сопротивление", 3: "истощение"}
+
+
+async def reassess_bgs_stage(telegram_id: int, source: str, new_data: dict) -> dict:
+    """
+    Пересмотр стадии БГС по тесту или анализам.
+    source: 'test' | 'lab' | 'hrv_auto'
+    """
+    user = await get_user(telegram_id)
+    if not user:
+        return None
+
+    old_stage = 0
+    try:
+        old_stage = int(user.get('bgs_stage', 0) or 0)
+    except:
+        old_stage = 0
+
+    name = user.get('name', 'друг')
+
+    # ─── Определение новой стадии ───
+    if source == 'test':
+        ahs_score = new_data.get('ahs_score', 0)
+        # Классификация AHS: 0-30 норма, 31-50 стадия 1, 51-70 стадия 2, 71+ стадия 3
+        if ahs_score >= 71:
+            new_stage = 3
+        elif ahs_score >= 51:
+            new_stage = 2
+        elif ahs_score >= 31:
+            new_stage = 1
+        else:
+            new_stage = 0
+    elif source == 'lab':
+        new_stage = _classify_bgs_from_labs(new_data)
+    elif source == 'hrv_auto':
+        baseline = await get_hrv_baseline_smart(telegram_id)
+        age = user.get('exact_age', 40) or 40
+        try:
+            age = int(age)
+        except:
+            age = 40
+        new_stage = _classify_bgs_from_hrv(baseline, age)
+        if new_stage is None:
+            return None
+    else:
+        return None
+
+    # ─── Сохранение истории ───
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO bgs_assessments
+                    (telegram_id, date, source, old_stage, new_stage,
+                     ahs_score, cortisol_morning, cortisol_evening, dhea_s, raw_data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                telegram_id, date.today().isoformat(), source,
+                old_stage, new_stage,
+                new_data.get('ahs_score'),
+                new_data.get('cortisol_morning'),
+                new_data.get('cortisol_evening'),
+                new_data.get('dhea_s'),
+                json.dumps(new_data, ensure_ascii=False),
+            ))
+            await db.commit()
+    except Exception as e:
+        print(f"❌ save bgs_assessment error: {e}")
+
+    # ─── Обновление пользователя ───
+    await save_user(telegram_id, {
+        'bgs_stage': new_stage,
+        'bgs_last_assessed': date.today().isoformat(),
+        'bgs_assessment_source': source,
+    })
+
+    # ─── Формирование сообщения ───
+    source_text = {'test': 'по тесту БГС', 'lab': 'по анализам', 'hrv_auto': 'по данным HRV'}.get(source, source)
+
+    if new_stage < old_stage:
+        message = _build_bgs_improvement_msg(name, old_stage, new_stage, source_text)
+    elif new_stage > old_stage:
+        message = _build_bgs_worsening_msg(name, old_stage, new_stage, source_text)
+    else:
+        message = (
+            f"📊 *{name}, стадия БГС без изменений*\n\n"
+            f"Стадия: {STAGE_NAMES.get(new_stage, '?')} ({source_text})\n\n"
+            f"Продолжай программу — динамику увидим на следующей оценке."
+        )
+
+    return {
+        'old_stage': old_stage,
+        'new_stage': new_stage,
+        'message': message,
+    }
+
+
+def _build_bgs_improvement_msg(name: str, old_stage: int, new_stage: int, source_text: str) -> str:
+    """Сообщение при улучшении стадии БГС."""
+    old_name = STAGE_NAMES.get(old_stage, '?')
+    new_name = STAGE_NAMES.get(new_stage, '?')
+
+    header = (
+        f"🎉 *{name}, стадия БГС улучшилась!*\n\n"
+        f"Было: {old_name} (ст. {old_stage}) → Стало: {new_name} (ст. {new_stage})\n"
+        f"({source_text})\n"
+    )
+
+    # Что разблокировалось
+    unlocks = {
+        (3, 2): (
+            "\n🔓 *Что меняется:*\n"
+            "• Раньше: только восстановительный режим\n"
+            "• Теперь: мягкий режим разрешён\n"
+            "✅ Лёгкие прогулки 30-40 мин, йога\n"
+            "⛔ Интенсивные тренировки — пока нет"
+        ),
+        (3, 1): (
+            "\n🔓 *Два уровня вверх — отличная динамика!*\n"
+            "✅ Умеренные тренировки разрешены\n"
+            "✅ Обычный режим в дни хорошего HRV"
+        ),
+        (3, 0): (
+            "\n🔓 *Полное восстановление!*\n"
+            "✅ Полный режим — любые нагрузки по HRV\n"
+            "✅ Рекомендации по состоянию, без ограничений"
+        ),
+        (2, 1): (
+            "\n🔓 *Хронический стресс отступает:*\n"
+            "✅ Умеренные тренировки\n"
+            "✅ Обычный режим в хорошие дни\n"
+            "⚡ Не перегружайся — острая фаза ещё идёт"
+        ),
+        (2, 0): "\n🔓 Полный режим разблокирован!",
+        (1, 0): "\n🔓 Никаких ограничений — режим по HRV.",
+    }
+
+    unlock_text = unlocks.get((old_stage, new_stage), "\n🔓 Рекомендации пересчитаны 💚")
+    return header + unlock_text
+
+
+def _build_bgs_worsening_msg(name: str, old_stage: int, new_stage: int, source_text: str) -> str:
+    """Сообщение при ухудшении стадии БГС."""
+    old_name = STAGE_NAMES.get(old_stage, '?')
+    new_name = STAGE_NAMES.get(new_stage, '?')
+
+    text = (
+        f"⚠️ *{name}, стадия БГС изменилась*\n\n"
+        f"Было: {old_name} (ст. {old_stage}) → Стало: {new_name} (ст. {new_stage})\n"
+        f"({source_text})\n\n"
+    )
+
+    if new_stage == 3:
+        text += (
+            "🔴 *Режим восстановления:*\n"
+            "• Приоритет #1: сон 8-9 часов\n"
+            "• Приоритет #2: питание (белок + жиры)\n"
+            "• Только лёгкие прогулки\n"
+            "• Магний 400мг + витамин С\n"
+            "📋 Рекомендую: консультация эндокринолога"
+        )
+    elif new_stage == 2:
+        text += (
+            "🟡 *Мягкий режим:*\n"
+            "• Снизить нагрузки\n"
+            "• Приоритет: сон + стресс-менеджмент\n"
+            "• Дыхание 4-7-8 дважды в день"
+        )
+    elif new_stage == 1:
+        text += (
+            "💡 *Острый стресс:*\n"
+            "Это временно — обычно проходит за 2-4 недели.\n"
+            "Не перегружайся, даже если чувствуешь силы."
+        )
+
+    text += "\n\nМаршрут адаптирован под новую стадию."
+    return text
+
+
+async def check_bgs_reassessment_needed(telegram_id: int) -> dict:
+    """
+    Проверяет: пора ли пересдать тест БГС?
+    Вызывается в утреннем чекине.
+    Возвращает dict с text и buttons, или None.
+    """
+    try:
+        user = await get_user(telegram_id)
+        if not user:
+            return None
+
+        bgs_stage = 0
+        try:
+            bgs_stage = int(user.get('bgs_stage', 0) or 0)
+        except:
+            bgs_stage = 0
+
+        if bgs_stage == 0:
+            return None
+
+        last_assessed = user.get('bgs_last_assessed')
+        if not last_assessed:
+            return None
+
+        # Проверяем, не отложено ли напоминание
+        remind_later = user.get('bgs_remind_later_date')
+        if remind_later:
+            try:
+                if date.today() < date.fromisoformat(remind_later):
+                    return None
+            except:
+                pass
+
+        try:
+            days_since = (date.today() - date.fromisoformat(last_assessed)).days
+        except:
+            return None
+
+        # Интервалы пересдачи по стадиям
+        intervals = {3: 42, 2: 35, 1: 28}
+        needed_days = intervals.get(bgs_stage, 42)
+
+        if days_since < needed_days:
+            return None
+
+        name = user.get('name', 'друг')
+
+        if bgs_stage == 3:
+            text = (
+                f"📋 *{name}, прошло {days_since} дней с последней оценки БГС.*\n\n"
+                "Пора проверить прогресс!\n\n"
+                "Лучший вариант — анализы:\n"
+                "• Кортизол слюна (4 точки)\n"
+                "• ДГЭА-С\n\n"
+                "Или можно пересдать тест БГС (быстрее, но менее точно)."
+            )
+            buttons = [
+                [InlineKeyboardButton(text="📋 Пересдать тест БГС", callback_data="reassess_bgs_test")],
+                [InlineKeyboardButton(text="🔬 Я сдал(а) анализы", callback_data="input_bgs_labs")],
+                [InlineKeyboardButton(text="⏰ Напомни через неделю", callback_data="bgs_remind_later")],
+            ]
+        else:
+            text = (
+                f"📋 *{name}, пора проверить восстановление!*\n\n"
+                f"Последняя оценка БГС — {days_since} дней назад.\n"
+                "Пересдадим тест?"
+            )
+            buttons = [
+                [InlineKeyboardButton(text="📋 Пересдать тест", callback_data="reassess_bgs_test")],
+                [InlineKeyboardButton(text="⏰ Позже", callback_data="bgs_remind_later")],
+            ]
+
+        return {
+            'text': text,
+            'buttons': InlineKeyboardMarkup(inline_keyboard=buttons),
+        }
+    except Exception as e:
+        print(f"❌ check_bgs_reassessment_needed error: {e}")
+        return None
+
+
+# ─── Callback: Отложить напоминание БГС ───
+@router.callback_query(F.data == "bgs_remind_later")
+async def bgs_remind_later_handler(callback: CallbackQuery):
+    """Откладывает напоминание о пересдаче БГС на 7 дней."""
+    remind_date = (date.today() + timedelta(days=7)).isoformat()
+    await save_user(callback.from_user.id, {'bgs_remind_later_date': remind_date})
+    await callback.answer("⏰ Напомню через неделю!")
+    try:
+        await callback.message.edit_text(
+            "⏰ Хорошо, напомню через неделю!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+            ])
+        )
+    except:
+        pass
+
+
+# ─── Callback: Пересдать тест БГС ───
+@router.callback_query(F.data == "reassess_bgs_test")
+async def reassess_bgs_test_handler(callback: CallbackQuery, state: FSMContext):
+    """Начинает пересдачу теста БГС (редирект на AHS тест)."""
+    await callback.answer()
+    # Перенаправляем на тест AHS (адаптируем под существующий хэндлер)
+    await callback.message.edit_text(
+        "📋 *Пересдача теста БГС*\n\n"
+        "Ответь на вопросы теста — это займёт 2-3 минуты.\n"
+        "По результатам пересчитаю стадию и обновлю рекомендации.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Начать тест", callback_data="start_bgs_retest")],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="back_to_menu")]
+        ])
+    )
+
+
+# ─── Состояния для ввода анализов ───
+class BGSLabStates(StatesGroup):
+    """Состояния ввода лабораторных анализов для БГС."""
+    waiting_cortisol_morning = State()
+    waiting_cortisol_evening = State()
+    waiting_dhea = State()
+    confirming_labs = State()
+
+
+@router.callback_query(F.data == "input_bgs_labs")
+async def input_bgs_labs_handler(callback: CallbackQuery, state: FSMContext):
+    """Начинает ввод результатов анализов."""
+    await callback.answer()
+    await state.set_state(BGSLabStates.waiting_cortisol_morning)
+    await callback.message.edit_text(
+        "🔬 *Ввод результатов анализов*\n\n"
+        "Шаг 1 из 3: *Кортизол утро* (слюна)\n\n"
+        "Введи значение в нмоль/л:\n"
+        "(обычно 5-40 нмоль/л)\n\n"
+        "Если в мкг/дл — умножь на 27.6",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_menu")]
+        ])
+    )
+
+
+@router.message(BGSLabStates.waiting_cortisol_morning)
+async def bgs_lab_cortisol_morning(message: Message, state: FSMContext):
+    """Получает кортизол утро."""
+    try:
+        val = float(message.text.replace(',', '.').strip())
+        if val < 0.1 or val > 100:
+            await message.answer("⚠️ Значение вне диапазона (0.1-100 нмоль/л). Попробуй ещё раз.")
+            return
+        await state.update_data(cortisol_morning=val)
+        await state.set_state(BGSLabStates.waiting_cortisol_evening)
+        await message.answer(
+            f"✅ Кортизол утро: {val} нмоль/л\n\n"
+            "Шаг 2 из 3: *Кортизол вечер* (слюна)\n\n"
+            "Введи значение в нмоль/л:\n"
+            "(обычно 0.5-10 нмоль/л)\n\n"
+            "Если нет вечернего — напиши 0",
+            parse_mode="Markdown"
+        )
+    except ValueError:
+        await message.answer("⚠️ Введи число (например: 18.5)")
+
+
+@router.message(BGSLabStates.waiting_cortisol_evening)
+async def bgs_lab_cortisol_evening(message: Message, state: FSMContext):
+    """Получает кортизол вечер."""
+    try:
+        val = float(message.text.replace(',', '.').strip())
+        if val < 0 or val > 50:
+            await message.answer("⚠️ Значение вне диапазона (0-50 нмоль/л). Попробуй ещё раз.")
+            return
+        await state.update_data(cortisol_evening=val if val > 0 else None)
+        await state.set_state(BGSLabStates.waiting_dhea)
+        await message.answer(
+            f"✅ Кортизол вечер: {val if val > 0 else 'нет данных'}\n\n"
+            "Шаг 3 из 3: *ДГЭА-С* (кровь)\n\n"
+            "Введи значение в мкг/дл:\n"
+            "(обычно 50-500 мкг/дл)\n\n"
+            "Если нет — напиши 0",
+            parse_mode="Markdown"
+        )
+    except ValueError:
+        await message.answer("⚠️ Введи число (например: 3.2)")
+
+
+@router.message(BGSLabStates.waiting_dhea)
+async def bgs_lab_dhea(message: Message, state: FSMContext):
+    """Получает ДГЭА-С и показывает результат."""
+    try:
+        val = float(message.text.replace(',', '.').strip())
+        if val < 0 or val > 1000:
+            await message.answer("⚠️ Значение вне диапазона (0-1000 мкг/дл). Попробуй ещё раз.")
+            return
+
+        data = await state.get_data()
+        labs = {
+            'cortisol_morning': data.get('cortisol_morning', 0),
+            'cortisol_evening': data.get('cortisol_evening'),
+            'dhea_s': val if val > 0 else None,
+            'dhea_s_low_norm': 150,  # default нижняя граница
+        }
+
+        await state.clear()
+
+        # Пересчитываем стадию
+        result = await reassess_bgs_stage(message.from_user.id, 'lab', labs)
+
+        if result:
+            await message.answer(
+                result['message'],
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📊 Мой HRV", callback_data="hrv_menu")],
+                    [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+                ])
+            )
+        else:
+            await message.answer(
+                "❌ Не удалось пересчитать стадию. Проверь данные.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+                ])
+            )
+    except ValueError:
+        await message.answer("⚠️ Введи число (например: 280)")
+
+
+async def get_bgs_hrv_consensus(telegram_id: int) -> dict:
+    """
+    Консенсус-оценка стадии БГС: AHS тест + HRV + анализы.
+    Возвращает dict с final_stage, confidence, reasoning.
+    """
+    try:
+        user = await get_user(telegram_id)
+        if not user:
+            return None
+
+        ahs_stage = 0
+        try:
+            ahs_stage = int(user.get('bgs_stage', 0) or 0)
+        except:
+            ahs_stage = 0
+
+        baseline = await get_hrv_baseline_smart(telegram_id)
+        age = user.get('exact_age', 40) or 40
+        try:
+            age = int(age)
+        except:
+            age = 40
+
+        hrv_stage = _classify_bgs_from_hrv(baseline, age)
+
+        # Проверяем анализы
+        cortisol_stage = None
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("""
+                    SELECT cortisol_morning, cortisol_evening, dhea_s, new_stage
+                    FROM bgs_assessments
+                    WHERE telegram_id = ? AND source = 'lab'
+                    ORDER BY date DESC LIMIT 1
+                """, (telegram_id,))
+                lab_row = await cursor.fetchone()
+                if lab_row:
+                    cortisol_stage = dict(lab_row).get('new_stage')
+        except:
+            pass
+
+        evidence = {
+            'ahs_stage': ahs_stage,
+            'hrv_stage': hrv_stage,
+            'cortisol_stage': cortisol_stage,
+            'final_stage': ahs_stage,
+            'confidence': 'low',
+            'reasoning': '',
+        }
+
+        # Консенсус
+        stages = [s for s in [ahs_stage, hrv_stage, cortisol_stage] if s is not None]
+        if len(stages) >= 2:
+            from collections import Counter
+            most_common = Counter(stages).most_common(1)[0]
+            evidence['final_stage'] = most_common[0]
+            evidence['confidence'] = 'high' if most_common[1] >= 2 else 'medium'
+
+        # Расхождение
+        if hrv_stage is not None and abs(ahs_stage - hrv_stage) >= 2:
+            evidence['reasoning'] = (
+                f"Расхождение: тест БГС → стадия {ahs_stage}, "
+                f"HRV → стадия {hrv_stage}. "
+                f"Рекомендую сдать кортизол слюна для уточнения."
+            )
+
+        return evidence
+    except Exception as e:
+        print(f"❌ get_bgs_hrv_consensus error: {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# КОНЕЦ ФАЗЫ 3, ЧАТ 2 (Шаги 8-11)
+# ═══════════════════════════════════════════════════════════════
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -44968,7 +48889,7 @@ async def hrv_got_hr(message: Message, state: FSMContext):
         text += training_day["message"]
         
         # Проверяем алерты
-        alerts = await check_hrv_alerts(message.from_user.id, rmssd)
+        alerts = await check_hrv_alerts_legacy(message.from_user.id, rmssd)
         if alerts:
             for alert in alerts:
                 text += "\n\n" + "━" * 25 + "\n"
@@ -45223,9 +49144,9 @@ async def update_hrv_tracking(telegram_id: int, current_rmssd: float, training_s
         return falling_days
 
 
-async def check_hrv_alerts(telegram_id: int, current_rmssd: float) -> list:
+async def check_hrv_alerts_legacy(telegram_id: int, current_rmssd: float) -> list:
     """
-    Проверить HRV алерты:
+    Проверить HRV алерты (LEGACY версия):
     1. Падение 3+ дня → перетренированность
     2. Резкое падение -30% → предвестник болезни
     3. Нет роста 8 недель → troubleshooting
@@ -48257,17 +52178,325 @@ async def onb_tests_later(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "onb_start_tests")
 async def onb_start_tests(callback: CallbackQuery, state: FSMContext):
-    """ОНБОРДИНГ 2.0: Начать тесты → PSS-10"""
+    """ОНБОРДИНГ 2.0: Начать тесты → Композитный мини-тест"""
     await callback.answer()
     
     await save_user(callback.from_user.id, {"onboarding_phase": 3})
     
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    
     await callback.message.edit_text(
-        "💡 Начнём с теста на стресс.\n\n"
-        "10 вопросов, ~3 минуты.\n"
-        "Отвечайте за последний месяц.",
+        f"📝 *{name}, быстрая диагностика*\n\n"
+        "18 вопросов за 5 минут — оценим:\n"
+        "• Стресс и тревожность\n"
+        "• Качество сна\n"
+        "• Энергию и надпочечники\n"
+        "• Циркадные ритмы\n\n"
+        "После этого — ещё 2 коротких теста.\n"
+        "Итого ~10 минут на всё.",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➡️ Начать", callback_data="stress_test_start")]
+            [InlineKeyboardButton(text="➡️ Начать", callback_data="mini_test_go_onb")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "mini_test_go_onb")
+async def mini_test_go_onb(callback: CallbackQuery, state: FSMContext):
+    """Первый вопрос мини-теста в онбординге"""
+    await callback.answer()
+    await state.clear()
+    await state.update_data(mini_test_answers={}, is_onboarding=True)
+    
+    q = MINI_TEST_QUESTIONS[1]
+    text = f"{q['block_title']}\n\n{q['text']}"
+    
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=get_mini_test_keyboard(1)
+    )
+    await state.set_state(MiniTestStates.waiting_mq1)
+
+
+# ═══════════════════════════════════════════════════════════════
+# ДВУХСТУПЕНЧАТЫЙ ОНБОРДИНГ — ЧАСТИЧНЫЙ ОТЧЁТ + СТУПЕНЬ 2
+# ═══════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "onb_step1_complete")
+async def onb_step1_complete(callback: CallbackQuery, state: FSMContext):
+    """Ступень 1 завершена: показываем частичный отчёт + выбор"""
+    await callback.answer("Формирую отчёт...")
+    
+    telegram_id = callback.from_user.id
+    user = await get_user(telegram_id)
+    name = user.get("name", "друг") if user else "друг"
+    
+    # Получаем данные мини-теста
+    pss4 = gad2 = sqs = ahs = circ_mini = 0
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM mini_test_results WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 1",
+                (telegram_id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                pss4 = row["pss4_score"] or 0
+                gad2 = row["gad2_score"] or 0
+                sqs = row["sqs_mini_score"] or 0
+                ahs = row["ahs_mini_score"] or 0
+                circ_mini = row["circ_mini_score"] or 0
+    except Exception as e:
+        print(f"⚠️ step1 mini test fetch: {e}")
+    
+    # Получаем циркадку
+    circ_score = 0
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT circadian_score FROM circadian_tests WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 1",
+                (telegram_id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                circ_score = row[0] or 0
+    except Exception as e:
+        print(f"⚠️ step1 circadian fetch: {e}")
+    
+    # Уровни
+    def pss4_lvl(s):
+        if s <= 5: return "🟢 низкий"
+        elif s <= 10: return "🟡 умеренный"
+        else: return "🔴 высокий"
+    
+    def gad2_lvl(s):
+        if s < 3: return "🟢 норма"
+        else: return "🔴 повышена"
+    
+    def sqs_lvl(s):
+        if s >= 13: return "🟢 хороший"
+        elif s >= 8: return "🟡 средний"
+        else: return "🔴 плохой"
+    
+    def ahs_lvl(s):
+        if s >= 13: return "🟢 норма"
+        elif s >= 8: return "🟡 нагрузка"
+        else: return "🔴 истощение"
+    
+    def circ_lvl(s):
+        if s >= 45: return "🟢 отличный"
+        elif s >= 30: return "🟡 умеренный"
+        elif s >= 15: return "🟠 сниженный"
+        else: return "🔴 критический"
+    
+    # Сообщение 1: Результаты
+    msg1 = (
+        f"📋 *{name}, ТВОЯ ДИАГНОСТИКА*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 *РЕЗУЛЬТАТЫ:*\n\n"
+        f"├─ 😰 Стресс: {pss4}/16 {pss4_lvl(pss4)}\n"
+        f"├─ 😟 Тревога: {gad2}/6 {gad2_lvl(gad2)}\n"
+        f"├─ 😴 Сон: {sqs}/18 {sqs_lvl(sqs)}\n"
+        f"├─ ⚡ Надпочечники: {ahs}/16 {ahs_lvl(ahs)}\n"
+        f"└─ 🌅 Циркадка: {circ_score}/60 {circ_lvl(circ_score)}\n"
+    )
+    
+    await callback.message.edit_text(msg1, parse_mode="Markdown")
+    await asyncio.sleep(0.5)
+    
+    # Приоритет (что выделить)
+    alerts = []
+    if pss4 > 10:
+        alerts.append("⚠️ Стресс высокий — это приоритет")
+    if gad2 >= 3:
+        alerts.append("⚠️ Тревожность повышена — учту")
+    if sqs < 8:
+        alerts.append("⚠️ Сон страдает — будем работать")
+    if ahs < 8:
+        alerts.append("⚠️ Надпочечники истощены — нужна поддержка")
+    if circ_score < 15:
+        alerts.append("⚠️ Циркадные ритмы нарушены — ключевой фактор")
+    
+    alerts_text = "\n".join(alerts) if alerts else "✅ Критических отклонений нет"
+    
+    # Сообщение 2: Что видно + что пока нет
+    msg2 = (
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔍 *ЧТО УЖЕ ВИДНО:*\n"
+        f"{alerts_text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💡 *{name}, это базовая картина.*\n\n"
+        f"Для *полной картины* не хватает:\n\n"
+        f"🔒 *Хронотип* — без него расписание\n"
+        f"   не персонализировано под твой ритм\n\n"
+        f"🔒 *Когнитивный профиль* — точка «ДО»\n"
+        f"   для памяти, фокуса, ясности мышления\n\n"
+        f"🔒 *Визуальный профиль* — точка «ДО»\n"
+        f"   для кожи, глаз, волос, отёков\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"⏱ Ещё *18 вопросов, \\~4 минуты* — и картина\n"
+        f"станет полной."
+    )
+    
+    await callback.message.answer(
+        msg2,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="▶️ Пройти сейчас (4 мин)", 
+                callback_data="onb_step2_now"
+            )],
+            [InlineKeyboardButton(
+                text="⏰ Завтра — напомни", 
+                callback_data="onb_step2_tomorrow"
+            )],
+        ])
+    )
+
+
+@router.callback_query(F.data == "onb_step2_now")
+async def onb_step2_now(callback: CallbackQuery, state: FSMContext):
+    """Продолжение онбординга — Ступень 2"""
+    await callback.answer()
+    
+    # Снимаем pending если был
+    await save_user(callback.from_user.id, {"onboarding_step2_pending": 0})
+    
+    await callback.message.edit_text(
+        "💪 Отлично! Осталось 3 блока:\n\n"
+        "🦉 Хронотип — 4 вопроса\n"
+        "🪞 Внешность — 8 вопросов\n"
+        "🧠 Когнитивка — 11 вопросов\n\n"
+        "Всего \\~4 минуты.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Начать", callback_data="chronotype_test_menu")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "onb_step2_tomorrow")
+async def onb_step2_tomorrow(callback: CallbackQuery):
+    """Откладывает Ступень 2 на завтра"""
+    await callback.answer()
+    
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    await save_user(callback.from_user.id, {
+        "onboarding_step2_pending": 1,
+        "onboarding_step2_remind_date": tomorrow,
+        "step2_remind_count": 0,
+    })
+    
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    
+    await callback.message.edit_text(
+        f"👌 Хорошо, {name}!\n\n"
+        "Напомню завтра утром после чекина.\n\n"
+        "А пока можешь изучить базовые\n"
+        "рекомендации и начать с малого 💚",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 К результатам", callback_data="summary_report")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "onb_step2_decline")
+async def onb_step2_decline(callback: CallbackQuery):
+    """Пользователь отказался от Ступени 2"""
+    await callback.answer()
+    
+    await save_user(callback.from_user.id, {
+        "onboarding_step2_pending": 0,
+    })
+    
+    await callback.message.edit_text(
+        "Хорошо, больше не буду напоминать.\n\n"
+        "Если захочешь пройти — тесты всегда\n"
+        "доступны в меню «Диагностика» 💚",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")],
+        ])
+    )
+
+
+async def check_step2_reminder(telegram_id: int) -> dict | None:
+    """Проверяет, нужно ли напомнить о Ступени 2 (вызывать после утреннего чекина)"""
+    user = await get_user(telegram_id)
+    if not user:
+        return None
+    
+    if not user.get("onboarding_step2_pending"):
+        return None
+    
+    remind_count = user.get("step2_remind_count", 0) or 0
+    if remind_count >= 3:
+        # Больше 3 раз не напоминаем
+        return None
+    
+    remind_date = user.get("onboarding_step2_remind_date")
+    if remind_date and remind_date > date.today().isoformat():
+        return None  # Ещё не время
+    
+    name = user.get("name", "друг")
+    
+    # Инкрементируем счётчик
+    await save_user(telegram_id, {"step2_remind_count": remind_count + 1})
+    
+    if remind_count >= 2:
+        # Последнее напоминание — более мотивирующее
+        return {
+            "text": (
+                f"💚 {name}, последний раз напоминаю —\n"
+                "осталось 4 минуты до полной диагностики.\n\n"
+                "Без этих тестов:\n"
+                "❌ Нет точки «ДО» — через месяц не увидишь прогресс\n"
+                "❌ Хронотип неизвестен — расписание общее\n\n"
+                "С ними:\n"
+                "✅ Полная карта состояния\n"
+                "✅ Сравнение «ДО и ПОСЛЕ» через месяц\n"
+                "✅ Персональное расписание под твой ритм"
+            ),
+            "buttons": [
+                [InlineKeyboardButton(text="▶️ Пройти (4 мин)", callback_data="onb_step2_now")],
+                [InlineKeyboardButton(text="❌ Не хочу", callback_data="onb_step2_decline")],
+            ],
+        }
+    else:
+        return {
+            "text": (
+                f"💚 {name}, помнишь — остались\n"
+                "3 коротких теста для полной картины.\n\n"
+                "🦉 Хронотип + 🪞 Внешность + 🧠 Когнитивка\n"
+                "18 вопросов, 4 минуты.\n\n"
+                "Без них не увижу взаимосвязи между системами\n"
+                "и не смогу зафиксировать точку «ДО»."
+            ),
+            "buttons": [
+                [InlineKeyboardButton(text="▶️ Пройти сейчас", callback_data="onb_step2_now")],
+                [InlineKeyboardButton(text="⏰ Позже", callback_data="onb_step2_later")],
+            ],
+        }
+
+
+@router.callback_query(F.data == "onb_step2_later")
+async def onb_step2_later(callback: CallbackQuery):
+    """Отложить Ступень 2 ещё на день"""
+    await callback.answer()
+    
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    await save_user(callback.from_user.id, {
+        "onboarding_step2_remind_date": tomorrow,
+    })
+    
+    await callback.message.edit_text(
+        "Хорошо, напомню завтра 💚",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")],
         ])
     )
 
@@ -48278,14 +52507,15 @@ async def onb_start_tests(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "onb_test_pause_1")
 async def onb_test_pause_1(callback: CallbackQuery, state: FSMContext):
-    """ОНБОРДИНГ 2.0: Микро-пауза 1 (после хронотипа)"""
+    """ОНБОРДИНГ 2.0: Микро-пауза 1 (после хронотипа → завершение)"""
     await callback.answer()
     
     await callback.message.edit_text(
-        "Треть пути! 3 из 7 тестов позади. 💪\n"
-        "Осталось ещё 4, ~10 минут.",
+        "Почти всё! Осталось 2 быстрых оценки —\n"
+        "зафиксируем отправную точку.\n"
+        "Через месяц сравним, как изменилось. 💪",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➡️ Продолжить", callback_data="sleep_test_menu")],
+            [InlineKeyboardButton(text="➡️ Продолжить", callback_data="onb_rejuv_intro")],
         ])
     )
 
@@ -48487,6 +52717,7 @@ async def onb_cog_start(callback: CallbackQuery, state: FSMContext):
         assessment_type="full",
         is_baseline=True,
         from_onboarding=True,
+        hide_cancel=True,  # Убираем кнопку "Отмена" во время онбординга
         questions=COGNITIVE_QUESTIONS_ORDER["full"].copy(),
         current_question_index=0,
         answers={}
@@ -48575,10 +52806,11 @@ async def save_onb_cog_result(callback: CallbackQuery, state: FSMContext):
         ))
         await db.commit()
     
-    # Отмечаем фазу, но НЕ ставим onboarding_completed = 1 
-    # (он ставится ТОЛЬКО в show_summary_detailed после проверки ВСЕХ тестов)
+    # Отмечаем фазу И завершение онбординга
+    # Мини-тест + циркадка + хронотип + rejuv + cognitive = достаточно
     await save_user(callback.from_user.id, {
         "onboarding_phase": 4,
+        "onboarding_completed": 1,
     })
     
     avg = total / 6 if total else 3.0
@@ -48591,13 +52823,81 @@ async def save_onb_cog_result(callback: CallbackQuery, state: FSMContext):
     
     await state.clear()
     
+    # Показываем описание бесплатного периода вместо прямого перехода к отчёту
+    user = await get_user(callback.from_user.id)
+    
     await callback.message.edit_text(
         f"🧠 Когнитивный профиль записан {emoji}\n"
         f"Средний балл: {avg:.1f}/5 (сумма {total}/30)\n\n"
         "Ясность, память, фокус — зафиксировано.\n"
         "Через месяц увидим динамику!",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Сводный отчёт", callback_data="integrated_assessment")]
+            [InlineKeyboardButton(text="➡️ Что дальше?", callback_data="free_period_intro")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "free_period_intro")
+async def free_period_intro_handler(callback: CallbackQuery):
+    """Показ описания бесплатного периода после онбординга"""
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    await show_free_period_intro(callback, user)
+
+
+# ═══════════════════════════════════════════════════════════════
+# ОПИСАНИЕ БЕСПЛАТНОГО ПЕРИОДА — ПОСЛЕ ОНБОРДИНГА
+# ═══════════════════════════════════════════════════════════════
+
+FREE_PERIOD_TEXT = """💚 *{name}, диагностика готова!*
+
+Вот что ты получаешь бесплатно:
+
+📊 *Твоя картина здоровья*
+Сводный отчёт: стресс, сон, циркадка,
+надпочечники, когнитивка — всё в одном месте.
+
+🧬 *Биологический возраст*
+Расчёт на основе 12 параметров.
+Увидишь, где тело старше паспорта.
+
+🌅 *Базовые рекомендации*
+Направления для работы + 3 действия по каждому.
+Дыхание, свет, режим — то, что уже работает.
+
+🧠 *Когнитивный трекер*
+Фиксируешь точку «ДО». Через месяц сравнишь.
+
+🪞 *Трекер изменений*
+Глаза, кожа, энергия — увидишь разницу.
+
+━━━━━━━━━━━━━━━━━━━━━
+
+🔒 *Что доступно в PRO:*
+
+Полные тесты → точные протоколы
+💊 Персональные витамины и добавки
+🛁 Капилляротерапия (ванны Залманова)
+✅ Ежедневные чекины с Авророй
+📊 Еженедельные отчёты прогресса
+💓 HRV-мониторинг
+🍽 Персональное питание
+
+💡 _Начни с бесплатного — увидишь первые результаты
+через 2-3 недели. Потом решишь._
+"""
+
+
+async def show_free_period_intro(callback, user: dict):
+    """Показывает описание бесплатного периода после онбординга"""
+    name = user.get('name', 'друг') if user else 'друг'
+    
+    await callback.message.edit_text(
+        FREE_PERIOD_TEXT.format(name=name),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Посмотреть мой отчёт", callback_data="summary_report")],
+            [InlineKeyboardButton(text="💎 Узнать про PRO", callback_data="show_tariffs")],
         ])
     )
 
@@ -48720,6 +53020,12 @@ async def stress_test_menu(callback: CallbackQuery):
 async def stress_test_start(callback: CallbackQuery, state: FSMContext):
     """Начало теста на стресс"""
     await callback.answer()
+    
+    # Проверка доступа PRO
+    access = await check_pro_test_access(callback.from_user.id, "stress_test_start")
+    if not access['allowed']:
+        await show_test_locked(callback, access)
+        return
     
     await callback.message.edit_text(
         "📋 *PSS-10: Шкала воспринимаемого стресса*\n\n"
@@ -49483,6 +53789,110 @@ async def stress_test_history(callback: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════
+# УМНОЕ НАСЛЕДОВАНИЕ: Пропуск дублирующих вопросов между тестами
+# ═══════════════════════════════════════════════════════════════
+
+async def get_cached_test_answers(telegram_id: int, test_type: str) -> dict:
+    """Получить кэшированные ответы теста, если пройден <24ч назад"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT answers_json FROM test_answers_cache
+                WHERE telegram_id = ? AND test_type = ?
+                AND created_at > datetime('now', '-24 hours')
+                ORDER BY created_at DESC LIMIT 1
+            """, (telegram_id, test_type))
+            row = await cursor.fetchone()
+            if row:
+                return json.loads(row["answers_json"])
+    except Exception as e:
+        print(f"⚠️ get_cached_test_answers error: {e}")
+    return {}
+
+
+def map_composite_to_circadian(composite: dict) -> dict:
+    """Маппинг ответов композитного теста → баллы циркадного теста"""
+    inherited = {}
+    
+    # Композит Q16 (утренний свет) → Циркадный Q1
+    # Композит: 0=нет, 1=иск.свет, 2=иногда, 3=стараюсь, 4=всегда
+    # Циркадный: 0=каждый день ... 5=нет
+    light = composite.get("mq16")
+    if light is not None:
+        mapping = {0: 5, 1: 5, 2: 2, 3: 1, 4: 0}
+        inherited[1] = mapping.get(light, 3)
+    
+    # Композит Q18 (экраны перед сном) → Циркадный Q4
+    screens = composite.get("mq18")
+    if screens is not None:
+        mapping = {0: 0, 1: 2, 2: 4, 3: 5}
+        inherited[4] = mapping.get(screens, 3)
+    
+    # Композит sqs_m4 (самочувствие утром) → Циркадный Q8
+    morning = composite.get("sqs_m4")
+    if morning is not None:
+        # sqs_m4: 0=плохо ... 4=отлично → инвертируем для циркадного
+        mapping = {0: 5, 1: 4, 2: 2, 3: 1, 4: 0}
+        inherited[8] = mapping.get(morning, 2)
+    
+    # Композит mq13 (второе дыхание) → Циркадный Q9
+    second_wind = composite.get("mq13")
+    if second_wind is not None:
+        mapping = {0: 5, 1: 4, 2: 2, 3: 0}
+        inherited[9] = mapping.get(second_wind, 2)
+    
+    # Композит mq17 (стабильность режима) — НЕ наследуется в Q10 (Q10 теперь про время ужина)
+    
+    return inherited
+
+
+async def get_circadian_inherited(telegram_id: int) -> dict:
+    """Получить наследованные ответы для циркадного теста"""
+    composite = await get_cached_test_answers(telegram_id, "composite")
+    if composite:
+        return map_composite_to_circadian(composite)
+    return {}
+
+
+def find_next_circadian_q(current_q: int, inherited: dict) -> int:
+    """Найти следующий вопрос, который не наследован. None если все отвечены."""
+    q = current_q
+    while q <= 12:
+        if q not in inherited:
+            return q
+        q += 1
+    return None  # Все вопросы покрыты
+
+
+async def show_circadian_question(callback_or_msg, state: FSMContext, q_num: int):
+    """Показать вопрос циркадного теста с учётом наследования"""
+    data = await state.get_data()
+    total_questions = data.get("circ_total_questions", 12)
+    answered = data.get("circ_answered_count", 0)
+    
+    q = CIRCADIAN_QUESTIONS[q_num]
+    text = f"*Вопрос {answered + 1} из {total_questions}:*\n\n❓ {q['text']}"
+    
+    # Определяем edit или answer
+    if hasattr(callback_or_msg, 'message'):
+        # CallbackQuery
+        await callback_or_msg.message.edit_text(
+            text, parse_mode="Markdown",
+            reply_markup=get_circadian_keyboard(q_num)
+        )
+    else:
+        # Message
+        await callback_or_msg.answer(
+            text, parse_mode="Markdown",
+            reply_markup=get_circadian_keyboard(q_num)
+        )
+    
+    await state.update_data(circ_current_q=q_num)
+    await state.set_state(CircadianTestStates.in_test)
+
+
+# ═══════════════════════════════════════════════════════════════
 # ХЕНДЛЕРЫ - ТЕСТ ЦИРКАДНЫХ РИТМОВ (12 вопросов)
 # ═══════════════════════════════════════════════════════════════
 
@@ -49490,29 +53900,26 @@ async def stress_test_history(callback: CallbackQuery):
 CIRCADIAN_QUESTIONS = {
     1: {
         "text": "Вы получаете яркий свет (>1000 люкс) в первые 30-60 минут после пробуждения?",
-        "hint": "💡 Свет — главный синхронизатор циркадных часов!",
         "options": [
             ("Да, каждый день (прогулка/лайтбокс)", 0),
             ("Большинство дней (5-6 из 7)", 1),
-            ("Иногда (3-4 дня)", 2),
-            ("Редко (1-2 дня)", 4),
+            ("3-4 дня в неделю", 2),
+            ("1-2 дня в неделю", 4),
             ("Нет, сразу в помещение", 5),
         ]
     },
     2: {
         "text": "Вы завтракаете в течение 1 часа после пробуждения?",
-        "hint": "🍳 Еда — второй синхронизатор после света!",
         "options": [
-            ("Да, всегда", 0),
-            ("Большинство дней", 1),
-            ("Иногда", 2),
-            ("Редко", 4),
+            ("Да, каждый день", 0),
+            ("5-6 дней в неделю", 1),
+            ("3-4 дня в неделю", 2),
+            ("1-2 дня в неделю", 4),
             ("Почти никогда / только кофе", 5),
         ]
     },
     3: {
         "text": "Ваше время пробуждения стабильно (±30 минут)?",
-        "hint": "⏰ Разница будни/выходные >2ч = 'социальный джетлаг'!",
         "options": [
             ("Да, включая выходные", 0),
             ("Будни стабильно, выходные ±1 час", 2),
@@ -49521,18 +53928,16 @@ CIRCADIAN_QUESTIONS = {
         ]
     },
     4: {
-        "text": "Вы избегаете синего света (экраны) за 2-3 часа до сна?",
-        "hint": "📱 Синий свет подавляет мелатонин на 50%+!",
+        "text": "Вы убираете экраны (телефон, ТВ, компьютер) и холодный свет ламп за 2-3 часа до сна?",
         "options": [
-            ("Да, всегда (amber очки/режим)", 0),
-            ("Обычно (night mode)", 1),
-            ("Иногда", 3),
-            ("Редко / нет", 5),
+            ("Убираю экраны + тёплый свет вечером", 0),
+            ("Включаю ночной режим на телефоне", 2),
+            ("Сижу в телефоне до последнего", 4),
+            ("Засыпаю с телефоном / ТВ", 5),
         ]
     },
     5: {
         "text": "Во сколько вы обычно засыпаете в будни?",
-        "hint": "🌙 Пик глимфатической очистки мозга: 23:00-03:00",
         "options": [
             ("До 22:00", 0),
             ("22:00-23:00", 0),
@@ -49542,19 +53947,16 @@ CIRCADIAN_QUESTIONS = {
         ]
     },
     6: {
-        "text": "В какое время суток вы наиболее продуктивны?",
-        "hint": "🧠 Здоровый ритм: пик энергии утром!",
+        "text": "Как быстро вы «включаетесь» утром?",
         "options": [
-            ("Утром (06:00-10:00)", 0),
-            ("До обеда (10:00-13:00)", 1),
-            ("После обеда (14:00-17:00)", 2),
-            ("Вечером (18:00-22:00)", 4),
-            ("Ночью (после 22:00)", 5),
+            ("Сразу бодрый, без раскачки", 0),
+            ("15-30 минут прихожу в себя", 1),
+            ("Час+ до нормального состояния", 3),
+            ("До обеда как в тумане", 5),
         ]
     },
     7: {
         "text": "Сколько кофеина вам нужно утром, чтобы 'проснуться'?",
-        "hint": "☕ Зависимость от кофеина = признак сбитой циркадки!",
         "options": [
             ("Не нужен / 1 чашка по желанию", 0),
             ("1-2 чашки обязательно", 2),
@@ -49564,48 +53966,44 @@ CIRCADIAN_QUESTIONS = {
     },
     8: {
         "text": "Вы спите 7-9 часов, но всё равно чувствуете усталость утром?",
-        "hint": "😴 Ключевой признак циркадной рассинхронизации!",
         "options": [
             ("Нет, просыпаюсь отдохнувшим", 0),
-            ("Иногда", 2),
-            ("Часто", 4),
-            ("Почти всегда", 5),
+            ("1-2 раза в неделю", 2),
+            ("Через день", 4),
+            ("Почти каждый день", 5),
         ]
     },
     9: {
         "text": "Вы чувствуете прилив энергии ('второе дыхание') после 20:00?",
-        "hint": "⚡ 'Второе дыхание' = кортизол не снижается вовремя!",
         "options": [
-            ("Нет, вечером сонливость", 0),
-            ("Иногда", 2),
-            ("Часто", 4),
-            ("Почти всегда, продуктивен вечером", 5),
+            ("Нет, вечером клонит в сон", 0),
+            ("1-2 раза в неделю", 2),
+            ("Через день", 4),
+            ("Почти каждый вечер", 5),
         ]
     },
     10: {
-        "text": "Насколько регулярен ваш режим сна/бодрствования?",
-        "hint": "📅 Стабильность важнее 'идеального' времени!",
+        "text": "Во сколько вы обычно ужинаете?",
         "options": [
-            ("Очень регулярный (±30 мин)", 0),
-            ("Достаточно регулярный (±1 час)", 1),
-            ("Нерегулярный (±2 часа)", 3),
-            ("Хаотичный (каждый день разное)", 5),
+            ("До 18:00", 0),
+            ("18:00-19:00", 0),
+            ("19:00-20:00", 1),
+            ("20:00-21:00", 3),
+            ("После 21:00", 5),
         ]
     },
     11: {
         "text": "Вы используете телефон/планшет лёжа в постели?",
-        "hint": "📵 Постель = только для сна! Ассоциация важна.",
         "options": [
             ("Никогда", 0),
-            ("Редко, по необходимости", 1),
-            ("Часто, но не перед сном", 2),
-            ("Каждый день перед сном", 4),
+            ("Иногда по необходимости (будильник)", 1),
+            ("Листаю ленту, но не перед сном", 2),
+            ("Каждый вечер перед сном", 4),
             ("Засыпаю с телефоном в руках", 5),
         ]
     },
     12: {
         "text": "Сколько времени вы проводите на улице (дневной свет) в среднем за день?",
-        "hint": "☀️ Дневной свет укрепляет циркадный ритм!",
         "options": [
             ("2+ часа", 0),
             ("1-2 часа", 1),
@@ -49650,7 +54048,7 @@ async def chronotype_test_start(callback: CallbackQuery, state: FSMContext):
         f"{name}, ответьте честно — как бы вы жили,\n"
         f"если бы не было обязательств?\n"
         f"(работа, дети, будильники)\n\n"
-        f"*Вопрос 1 из 5:*\n\n"
+        f"*Вопрос 1 из 4:*\n\n"
         f"❓ {q['text']}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -49669,7 +54067,7 @@ async def chronotype_q1(callback: CallbackQuery, state: FSMContext):
                for text, val in q["options"]]
     
     await callback.message.edit_text(
-        f"*Вопрос 2 из 5:*\n\n❓ {q['text']}",
+        f"*Вопрос 2 из 4:*\n\n❓ {q['text']}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
@@ -49687,7 +54085,7 @@ async def chronotype_q2(callback: CallbackQuery, state: FSMContext):
                for text, val in q["options"]]
     
     await callback.message.edit_text(
-        f"*Вопрос 3 из 5:*\n\n❓ {q['text']}",
+        f"*Вопрос 3 из 4:*\n\n❓ {q['text']}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
@@ -49705,7 +54103,7 @@ async def chronotype_q3(callback: CallbackQuery, state: FSMContext):
                for text, val in q["options"]]
     
     await callback.message.edit_text(
-        f"*Вопрос 4 из 5:*\n\n❓ {q['text']}",
+        f"*Вопрос 4 из 4:*\n\n❓ {q['text']}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
@@ -49714,36 +54112,17 @@ async def chronotype_q3(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(ChronotypeStates.waiting_q4, F.data.startswith("chrono4_"))
 async def chronotype_q4(callback: CallbackQuery, state: FSMContext):
+    """Финальный вопрос хронотипа → результат"""
     await callback.answer()
     val = callback.data.split("_")[1]
     await state.update_data(chrono4=val)
-    
-    q = CHRONOTYPE_QUESTIONS[5]
-    buttons = [[InlineKeyboardButton(text=text, callback_data=f"chrono5_{val}")] 
-               for text, val in q["options"]]
-    
-    await callback.message.edit_text(
-        f"*Вопрос 5 из 5:*\n\n❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
-    await state.set_state(ChronotypeStates.waiting_q5)
-
-
-@router.callback_query(ChronotypeStates.waiting_q5, F.data.startswith("chrono5_"))
-async def chronotype_q5(callback: CallbackQuery, state: FSMContext):
-    """ПОПРАВКА #86: Краткий отчёт + Продолжить (без выбора)"""
-    await callback.answer()
-    val = callback.data.split("_")[1]
-    await state.update_data(chrono5=val)
     
     data = await state.get_data()
     answers = {
         'q1': data.get('chrono1'),
         'q2': data.get('chrono2'),
         'q3': data.get('chrono3'),
-        'q4': data.get('chrono4'),
-        'q5': val
+        'q4': val
     }
     
     # Определяем хронотип
@@ -49760,10 +54139,10 @@ async def chronotype_q5(callback: CallbackQuery, state: FSMContext):
     
     # ПОПРАВКА #139: Результат с глимфатикой + целевое время + джетлаг
     CHRONO_BEDTIMES = {
-        "lark": "22:00", "pigeon": "23:00",
-        "owl": "23:45", "night_owl": "00:30",
+        "lark": "22:00", "pigeon": "22:15",
+        "owl": "22:45", "night_owl": "23:30",
     }
-    target = CHRONO_BEDTIMES.get(chronotype, "23:00")
+    target = CHRONO_BEDTIMES.get(chronotype, "22:15")
     
     # Маппинг на glymphatic risk
     chrono_to_glyph = {
@@ -49773,28 +54152,44 @@ async def chronotype_q5(callback: CallbackQuery, state: FSMContext):
     glyph = get_glymphatic_risk(chrono_to_glyph.get(chronotype, "neutral"))
     risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(glyph["risk"], "⚪")
     
-    # Социальный джетлаг из Q5
+    # Социальный джетлаг из Q4 (выходные)
     jetlag_warning = ""
-    if val == "owl":  # Q5: на 3+ часа позже в выходные
+    if val == "owl":  # Q4: на 3+ часа позже в выходные
         jetlag_warning = "\n\n⚠️ *Социальный джетлаг!*\nРазница >2ч будни/выходные бьёт по глимфатике.\nФиксируй подъём ±30 мин 7 дней/нед!"
     
     if chronotype == 'night_owl':
         emoji = "🦉🦉"
         type_name = "ПОЗДНЯЯ СОВА"
+        chrono_note = (
+            "\n\nСейчас ты ложишься очень поздно и теряешь\n"
+            "больше 2 часов из пика глимфатики (очистка мозга).\n\n"
+            f"Целевой отбой: *{target}*.\n"
+            "Будем двигаться по 15 минут в неделю. Не рывком. 💚"
+        )
     elif chronotype == 'owl':
         emoji = "🦉"
         type_name = "СОВА"
+        chrono_note = (
+            "\n\nТвой мозг хочет засыпать поздно, но глимфатика\n"
+            "(очистка мозга от токсинов) работает с 23:00 до 03:00.\n\n"
+            f"Чтобы поймать этот пик — тебе нужно ЛЕЧЬ в *{target}*,\n"
+            "тогда глубокий сон начнётся к 23:30.\n\n"
+            "Это реально с утренней светотерапией. Я помогу! 💚"
+        )
     elif chronotype == 'pigeon':
         emoji = "🕊️"
         type_name = "ГОЛУБЬ"
+        chrono_note = ""
     else:
         emoji = "🐦"
         type_name = "ЖАВОРОНОК"
+        chrono_note = ""
     
     text = (
         f"{emoji} {name}, ТВОЙ ХРОНОТИП — *{type_name}*\n\n"
         f"🌙 Твой оптимальный отбой: *{target}*\n"
         f"🧠 Глимфатика: {risk_emoji} {glyph['risk'].upper()}"
+        f"{chrono_note}"
         f"{jetlag_warning}"
     )
 
@@ -50036,7 +54431,7 @@ async def chronotype_menu(callback: CallbackQuery, state: FSMContext):
         
         await callback.message.edit_text(
             "🕐 *ТЕСТ ХРОНОТИПА*\n\n"
-            "*Вопрос 1 из 5:*\n\n"
+            "*Вопрос 1 из 4:*\n\n"
             f"❓ {q['text']}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -50091,17 +54486,25 @@ async def circadian_test_menu(callback: CallbackQuery, state: FSMContext):
     # Проверим последний тест
     last_test = await get_last_circadian_test(callback.from_user.id)
     
-    # Если онбординг НЕ завершён — сразу начинаем тест без меню
+    # Если онбординг НЕ завершён — запускаем с наследованием
     if not onboarding_done:
-        q = CIRCADIAN_QUESTIONS[1]
-        await callback.message.edit_text(
-            f"🌅 *ТЕСТ ЦИРКАДНЫХ РИТМОВ*\n\n"
-            f"*Вопрос 1 из 12:*\n\n"
-            f"❓ {q['text']}",
-            parse_mode="Markdown",
-            reply_markup=get_circadian_keyboard(1)
-        )
-        await state.set_state(CircadianTestStates.waiting_c1)
+        # Загружаем наследованные ответы
+        inherited = await get_circadian_inherited(callback.from_user.id)
+        skipped_count = len(inherited)
+        total_questions = 12 - skipped_count
+        
+        inherited_state = {}
+        for q_num, score in inherited.items():
+            inherited_state[f"c{q_num}"] = score
+        inherited_state["circ_inherited"] = inherited
+        inherited_state["circ_total_questions"] = total_questions
+        inherited_state["circ_answered_count"] = 0
+        inherited_state["circ_skipped_count"] = skipped_count
+        await state.update_data(**inherited_state)
+        
+        first_q = find_next_circadian_q(1, inherited)
+        if first_q:
+            await show_circadian_question(callback, state, first_q)
         return
     
     # Если онбординг завершён — показываем меню
@@ -50145,230 +54548,123 @@ async def circadian_test_menu(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "circadian_test_start")
 async def circadian_test_start(callback: CallbackQuery, state: FSMContext):
-    """Начало теста циркадных ритмов"""
+    """Начало теста циркадных ритмов — с умным наследованием"""
     await callback.answer()
     
-    q = CIRCADIAN_QUESTIONS[1]
-    await callback.message.edit_text(
-        f"🌅 *ТЕСТ ЦИРКАДНЫХ РИТМОВ*\n\n"
-        f"*Вопрос 1 из 12:*\n\n"
-        f"❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=get_circadian_keyboard(1)
-    )
-    await state.set_state(CircadianTestStates.waiting_c1)
+    # Загружаем наследованные ответы из композитного теста
+    inherited = await get_circadian_inherited(callback.from_user.id)
+    skipped_count = len(inherited)
+    total_questions = 12 - skipped_count
+    
+    # Записываем наследованные баллы в state
+    inherited_state = {}
+    for q_num, score in inherited.items():
+        inherited_state[f"c{q_num}"] = score
+    inherited_state["circ_inherited"] = inherited
+    inherited_state["circ_total_questions"] = total_questions
+    inherited_state["circ_answered_count"] = 0
+    inherited_state["circ_skipped_count"] = skipped_count
+    await state.update_data(**inherited_state)
+    
+    # Находим первый НЕ наследованный вопрос
+    first_q = find_next_circadian_q(1, inherited)
+    
+    if first_q is None:
+        # Все вопросы покрыты наследованием (маловероятно, но обработаем)
+        data = await state.get_data()
+        result = calculate_circadian_results(data)
+        await save_circadian_test(callback.from_user.id, data, result)
+        await state.clear()
+        score_val = result.get("circadian_score", 0)
+        
+        user_check = await get_user(callback.from_user.id)
+        onb_done = user_check.get("onboarding_completed", 0) if user_check else 0
+        next_cb = "onb_step1_complete" if not onb_done else "chronotype_test_menu"
+        next_text = "📋 Мои результаты" if not onb_done else "➡️ Тест: Хронотип"
+        
+        await callback.message.edit_text(
+            f"🌅 *Циркадка: {score_val}/60*\n✅ Все ответы взяты из предыдущих тестов!",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=next_text, callback_data=next_cb)]
+            ])
+        )
+        return
+    
+    await show_circadian_question(callback, state, first_q)
 
 
-# Хендлеры для 12 вопросов
-@router.callback_query(CircadianTestStates.waiting_c1, F.data.startswith("circ1_"))
-async def circadian_q1(callback: CallbackQuery, state: FSMContext):
+# Универсальный хендлер для всех вопросов циркадного теста
+@router.callback_query(CircadianTestStates.in_test, F.data.startswith("circ"))
+async def circadian_answer_universal(callback: CallbackQuery, state: FSMContext):
+    """Обработка любого ответа циркадного теста"""
     await callback.answer()
+    
+    # Парсим: circ{N}_{score}_{i}
     parts = callback.data.split("_")
+    q_num = int(parts[0].replace("circ", ""))
     score = int(parts[1])
-    await state.update_data(c1=score)
     
-    q = CIRCADIAN_QUESTIONS[2]
-    await callback.message.edit_text(
-        f"*Вопрос 2 из 12:*\n\n❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=get_circadian_keyboard(2)
-    )
-    await state.set_state(CircadianTestStates.waiting_c2)
-
-
-@router.callback_query(CircadianTestStates.waiting_c2, F.data.startswith("circ2_"))
-async def circadian_q2(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    score = int(callback.data.split("_")[1])
-    await state.update_data(c2=score)
-    
-    q = CIRCADIAN_QUESTIONS[3]
-    await callback.message.edit_text(
-        f"*Вопрос 3 из 12:*\n\n❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=get_circadian_keyboard(3)
-    )
-    await state.set_state(CircadianTestStates.waiting_c3)
-
-
-@router.callback_query(CircadianTestStates.waiting_c3, F.data.startswith("circ3_"))
-async def circadian_q3(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    score = int(callback.data.split("_")[1])
-    await state.update_data(c3=score)
-    
-    q = CIRCADIAN_QUESTIONS[4]
-    await callback.message.edit_text(
-        f"*Вопрос 4 из 12:*\n\n❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=get_circadian_keyboard(4)
-    )
-    await state.set_state(CircadianTestStates.waiting_c4)
-
-
-@router.callback_query(CircadianTestStates.waiting_c4, F.data.startswith("circ4_"))
-async def circadian_q4(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    score = int(callback.data.split("_")[1])
-    await state.update_data(c4=score)
-    
-    q = CIRCADIAN_QUESTIONS[5]
-    await callback.message.edit_text(
-        f"*Вопрос 5 из 12:*\n\n❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=get_circadian_keyboard(5)
-    )
-    await state.set_state(CircadianTestStates.waiting_c5)
-
-
-@router.callback_query(CircadianTestStates.waiting_c5, F.data.startswith("circ5_"))
-async def circadian_q5(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    score = int(callback.data.split("_")[1])
-    await state.update_data(c5=score)
-    
-    q = CIRCADIAN_QUESTIONS[6]
-    await callback.message.edit_text(
-        f"*Вопрос 6 из 12:*\n\n❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=get_circadian_keyboard(6)
-    )
-    await state.set_state(CircadianTestStates.waiting_c6)
-
-
-@router.callback_query(CircadianTestStates.waiting_c6, F.data.startswith("circ6_"))
-async def circadian_q6(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    score = int(callback.data.split("_")[1])
-    await state.update_data(c6=score)
-    
-    q = CIRCADIAN_QUESTIONS[7]
-    await callback.message.edit_text(
-        f"*Вопрос 7 из 12:*\n\n❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=get_circadian_keyboard(7)
-    )
-    await state.set_state(CircadianTestStates.waiting_c7)
-
-
-@router.callback_query(CircadianTestStates.waiting_c7, F.data.startswith("circ7_"))
-async def circadian_q7(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    score = int(callback.data.split("_")[1])
-    await state.update_data(c7=score)
-    
-    q = CIRCADIAN_QUESTIONS[8]
-    await callback.message.edit_text(
-        f"*Вопрос 8 из 12:*\n\n❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=get_circadian_keyboard(8)
-    )
-    await state.set_state(CircadianTestStates.waiting_c8)
-
-
-@router.callback_query(CircadianTestStates.waiting_c8, F.data.startswith("circ8_"))
-async def circadian_q8(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    score = int(callback.data.split("_")[1])
-    await state.update_data(c8=score)
-    
-    q = CIRCADIAN_QUESTIONS[9]
-    await callback.message.edit_text(
-        f"*Вопрос 9 из 12:*\n\n❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=get_circadian_keyboard(9)
-    )
-    await state.set_state(CircadianTestStates.waiting_c9)
-
-
-@router.callback_query(CircadianTestStates.waiting_c9, F.data.startswith("circ9_"))
-async def circadian_q9(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    score = int(callback.data.split("_")[1])
-    await state.update_data(c9=score)
-    
-    q = CIRCADIAN_QUESTIONS[10]
-    await callback.message.edit_text(
-        f"*Вопрос 10 из 12:*\n\n❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=get_circadian_keyboard(10)
-    )
-    await state.set_state(CircadianTestStates.waiting_c10)
-
-
-@router.callback_query(CircadianTestStates.waiting_c10, F.data.startswith("circ10_"))
-async def circadian_q10(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    score = int(callback.data.split("_")[1])
-    await state.update_data(c10=score)
-    
-    q = CIRCADIAN_QUESTIONS[11]
-    await callback.message.edit_text(
-        f"*Вопрос 11 из 12:*\n\n❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=get_circadian_keyboard(11)
-    )
-    await state.set_state(CircadianTestStates.waiting_c11)
-
-
-@router.callback_query(CircadianTestStates.waiting_c11, F.data.startswith("circ11_"))
-async def circadian_q11(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    score = int(callback.data.split("_")[1])
-    await state.update_data(c11=score)
-    
-    q = CIRCADIAN_QUESTIONS[12]
-    await callback.message.edit_text(
-        f"*Вопрос 12 из 12:*\n\n❓ {q['text']}",
-        parse_mode="Markdown",
-        reply_markup=get_circadian_keyboard(12)
-    )
-    await state.set_state(CircadianTestStates.waiting_c12)
-
-
-@router.callback_query(CircadianTestStates.waiting_c12, F.data.startswith("circ12_"))
-async def circadian_q12_final(callback: CallbackQuery, state: FSMContext):
-    """Финальный вопрос — показываем результаты"""
-    await callback.answer()
-    score = int(callback.data.split("_")[1])
-    await state.update_data(c12=score)
-    
-    # Получаем все данные
+    # Сохраняем ответ
     data = await state.get_data()
+    answered = data.get("circ_answered_count", 0) + 1
+    await state.update_data(**{f"c{q_num}": score, "circ_answered_count": answered})
     
-    # Рассчитываем результаты
+    # Находим следующий вопрос
+    inherited = data.get("circ_inherited", {})
+    next_q = find_next_circadian_q(q_num + 1, inherited)
+    
+    if next_q is not None:
+        await show_circadian_question(callback, state, next_q)
+        return
+    
+    # ═══ ФИНАЛИЗАЦИЯ: все вопросы отвечены ═══
+    data = await state.get_data()
+    data[f"c{q_num}"] = score  # последний ответ
+    
     result = calculate_circadian_results(data)
-    
-    # Сохраняем в БД
     await save_circadian_test(callback.from_user.id, data, result)
     
+    skipped_count = data.get("circ_skipped_count", 0)
     await state.clear()
     
-    # ПОПРАВКА #120: Короткий результат
-    score = result.get("circadian_score", 0)
+    # Результат
+    circ_score = result.get("circadian_score", 0)
     
-    if score >= 45:
+    if circ_score >= 45:
         status_emoji = "🟢"
         level = "отличный"
-    elif score >= 30:
+    elif circ_score >= 30:
         status_emoji = "🟡"
         level = "умеренный"
-    elif score >= 15:
+    elif circ_score >= 15:
         status_emoji = "🟠"
         level = "сниженный"
     else:
         status_emoji = "🔴"
         level = "критический"
     
-    short_text = f"""🌅 *Циркадка: {score}/60* {status_emoji}
+    skipped_note = ""
+    if skipped_count > 0:
+        skipped_note = f"\n\n💡 _{skipped_count} ответов взяла из предыдущих тестов_"
+    
+    short_text = f"""🌅 *Циркадка: {circ_score}/60* {status_emoji}
 _{level}_
 
-✅ Записала! Идём дальше."""
+✅ Записала! Идём дальше.{skipped_note}"""
 
-    # ПОПРАВКА #126: Только кнопка "Дальше" — красная кнопка показывается в сводном отчёте
-    buttons = [
-        [InlineKeyboardButton(text="➡️ Тест: Хронотип", callback_data="chronotype_test_menu")]
-    ]
+    # Проверяем: если онбординг не завершён → частичный отчёт (Ступень 1)
+    user = await get_user(callback.from_user.id)
+    onboarding_done = user.get("onboarding_completed", 0) if user else 0
+    
+    if not onboarding_done:
+        buttons = [
+            [InlineKeyboardButton(text="📋 Мои результаты", callback_data="onb_step1_complete")]
+        ]
+    else:
+        buttons = [
+            [InlineKeyboardButton(text="➡️ Тест: Хронотип", callback_data="chronotype_test_menu")]
+        ]
     
     await callback.message.edit_text(
         short_text,
@@ -50598,6 +54894,17 @@ async def save_circadian_test(telegram_id: int, data: dict, result: dict):
         except Exception:
             # Колонка может не существовать в старой БД
             pass
+        
+        # Кэшируем ответы для наследования следующими тестами (SQS, AHS)
+        try:
+            answers_cache = {f"c{i}": data.get(f"c{i}", 0) for i in range(1, 13)}
+            await db.execute("""
+                INSERT INTO test_answers_cache (telegram_id, test_type, answers_json, created_at)
+                VALUES (?, 'circadian', ?, datetime('now'))
+            """, (telegram_id, json.dumps(answers_cache)))
+            await db.commit()
+        except Exception as e:
+            print(f"⚠️ Кэш циркадного теста: {e}")
     
     # Отмечаем завершение теста
     await save_user(telegram_id, {"last_test_completed_at": datetime.now().isoformat()})
@@ -52906,6 +57213,30 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
             "Эпигенетика позволяет «выключать» нежелательные гены\n"
             "через образ жизни.*"
         )
+    elif not user.get("heredity_completed") and not user.get("h1_dementia"):
+        # Наследственность не заполнена — заглушка
+        try:
+            created = user.get("created_at")
+            days_in = 0
+            if created:
+                days_in = (date.today() - datetime.fromisoformat(str(created).replace("Z", "+00:00")).date()).days
+        except:
+            days_in = 0
+        
+        if days_in >= 7:
+            heredity_text = (
+                "\n━━━━━━━━━━━━━━━━━━━━━\n"
+                "🧬 *НАСЛЕДСТВЕННОСТЬ:*\n\n"
+                "❗ Не заполнена — семейные риски не учтены.\n"
+                "_6 вопросов, 1 минута — нажми кнопку ниже._"
+            )
+        else:
+            heredity_text = (
+                "\n━━━━━━━━━━━━━━━━━━━━━\n"
+                "🧬 *НАСЛЕДСТВЕННОСТЬ:*\n\n"
+                "⏳ Через неделю предложу короткий тест\n"
+                "(6 вопросов) — учтём семейные риски."
+            )
     
     # === ПРОФИЛЬ (давление, дермографизм) ===
     blood_pressure = user.get('blood_pressure', '')
@@ -53038,6 +57369,18 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
             buttons.append([InlineKeyboardButton(text=f"▶️ Продолжить диагностику (осталось {tests_remaining})", callback_data="circadian_test_start_locked")])
         elif not data.get("ahs"):
             buttons.append([InlineKeyboardButton(text=f"▶️ Продолжить диагностику (осталось {tests_remaining})", callback_data="ahs_test_start_locked")])
+    
+    # Кнопка наследственности если не заполнена и 7+ дней
+    if not user.get("heredity_completed") and not user.get("h1_dementia"):
+        try:
+            created = user.get("created_at")
+            if created:
+                days_in_h = (date.today() - datetime.fromisoformat(str(created).replace("Z", "+00:00")).date()).days
+                if days_in_h >= 7:
+                    buttons.append([InlineKeyboardButton(text="🧬 Заполнить наследственность (1 мин)", callback_data="onb_heredity_start")])
+        except:
+            pass
+    
     buttons.append([InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")])
     
     await callback.message.answer(
@@ -53096,6 +57439,16 @@ async def show_summary_detailed(callback: CallbackQuery):
         'circadian_score': circadian.get("circadian_score", 0),
     }
     
+    # Обогащаем данными когнитивного трекера (если есть)
+    try:
+        cog_baseline = await get_cognitive_baseline(callback.from_user.id)
+        if cog_baseline:
+            syndrome_data['cognitive_mental_clarity'] = cog_baseline.get('mental_clarity')
+            syndrome_data['cognitive_short_term_memory'] = cog_baseline.get('short_term_memory')
+            syndrome_data['cognitive_concentration'] = cog_baseline.get('concentration')
+    except Exception:
+        pass
+    
     # Рассчитываем синдромы
     include_hrv = user.get('has_polar_h10', 0) == 1 or user.get('hrv_device') is not None
     syndromes = calculate_all_syndromes(syndrome_data, include_hrv)
@@ -53122,12 +57475,14 @@ async def show_summary_detailed(callback: CallbackQuery):
     if tariff['type'] == 'free':
         # Бесплатный — показываем тизер и кнопку тарифов
         buttons = [
+            [InlineKeyboardButton(text="🗺️ Построить маршрут", callback_data="roadmap_generate")],
             [InlineKeyboardButton(text="🔓 Открыть полный доступ", callback_data="show_tariffs")],
             [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
         ]
     else:
         # Платный — показываем все кнопки
         buttons = [
+            [InlineKeyboardButton(text="🗺️ Построить маршрут", callback_data="roadmap_generate")],
             [InlineKeyboardButton(text="📋 Подробный отчёт", callback_data="detailed_report")],
             [InlineKeyboardButton(text="🎯 Цели и план", callback_data="goals_and_plan")],
             [InlineKeyboardButton(text="💊 Витамины", callback_data="vitamins_protocol")],
@@ -53156,6 +57511,11 @@ async def show_detailed_report(callback: CallbackQuery):
     ПОПРАВКА #130: ПОДРОБНЫЙ отчёт — объясняет ПОЧЕМУ и ЧТО делать.
     """
     await callback.answer("Загружаю подробный отчёт...")
+    
+    # ═══ PRO-ГЕЙТ: Подробный отчёт ═══
+    if not await require_pro(callback, "detailed_report"):
+        return
+    # ═══ END PRO-ГЕЙТ ═══
     
     data = await collect_summary_data(callback.from_user.id)
     name = data.get("name", "друг")
@@ -53979,60 +58339,52 @@ async def show_vitamins_protocol(callback: CallbackQuery):
 
 @router.callback_query(F.data == "show_tariffs")
 async def show_tariffs_handler(callback: CallbackQuery):
-    """
-    ПОПРАВКА #132+136: Показать экран выбора тарифа (3 тарифа).
-    """
+    """Экран тарифов — сначала что бесплатно, потом PRO."""
     await callback.answer()
     
     tariff = await get_user_tariff(callback.from_user.id)
+    user = await get_user(callback.from_user.id)
+    name = user.get('name', 'друг') if user else 'друг'
     
-    text = """💎 *ТАРИФЫ*
+    text = f"""💎 *{name}, выбери свой уровень*
 
-🌱 *Как устроена программа*
+━━━━━━━━━━━━━━━━━━━━━
 
-Это не курс на 3 месяца.
-Это начало нового образа жизни с сопровождением.
+🆓 *БЕСПЛАТНО* — у тебя сейчас
 
-*Этап 1 → Фундамент.*
-Сон, ритм, капилляры, нервная система.
-Тело выходит из режима выживания.
+├─ 📊 Экспресс-диагностика
+├─ 📋 Сводный отчёт
+├─ 🧬 Биологический возраст
+├─ 🌅 Базовые рекомендации
+├─ 🧠 Когнитивный трекер
+└─ 📝 Повторный мини-тест
 
-*Этап 2 → Точная настройка.*
-Питание, добавки, практики
-под твою биологию и генетику.
-
-*Этап 3 → Трансформация.*
-Глубокие практики, которые меняют качество жизни.
-
-Ты прошла диагностику — это бесплатно.
-Чтобы работать дальше — выбери свой уровень:
+_Направления для работы — без конкретных протоколов._
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 💚 *БАЗОВЫЙ* — 3000₽ / 3 месяца
 
-Твой личный навигатор здоровья.
-Каждый день бот отслеживает состояние,
-находит закономерности и ведёт к целям.
+Аврора ведёт тебя каждый день.
+Точные протоколы, а не просто «поработай над сном».
 
-├─ 📋 Расшифровка диагностики
-├─ 🎯 Персональный маршрут
+├─ 🔥 Полные тесты → точные диагнозы
+├─ 💊 Витамины и добавки (общий протокол)
 ├─ ✅ Ежедневные чекины
-├─ 💓 HRV-мониторинг
-├─ 💊 Витамины по протоколу БГС
 ├─ 🛁 Капилляротерапия
-└─ 📊 Еженедельные отчёты
+├─ 💓 HRV-мониторинг
+├─ 📊 Еженедельные отчёты
+└─ 🎯 Персональный маршрут
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 💎 *ПЕРСОНАЛЬНЫЙ* — 7000₽ / 3 месяца
 
-Всё из базового + глубокая персонализация.
+Всё из базового + под твою биологию.
 
+├─ 💊 Витамины по твоим анализам крови
+├─ 🍽 Персональное питание
 ├─ 🕵️ Пищевой детектив (пульс-тест)
-├─ 🔬 Мониторинг анализов
-├─ 💊 Витамины по твоим анализам
-├─ 🥗 Персональное питание
 └─ 🛒 Список покупок на неделю
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -54042,10 +58394,9 @@ async def show_tariffs_handler(callback: CallbackQuery):
 Всё из персонального + генетический коуч.
 
 ├─ 🧬 Генетический профиль (13 генов)
-├─ 🎯 Темп, поддержка, интенсивность под генотип
 ├─ 💊 Витамины под генетику
-├─ 🥗 Питание под генотип
-└─ 🛡️ Управление наследственностью
+├─ 🍽 Питание под генотип
+└─ 🛡️ Управление наследственными рисками
 
 ━━━━━━━━━━━━━━━━━━━━━
 """
@@ -59328,6 +63679,2524 @@ def calculate_summary_bio_age(passport_age: int, data: dict) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
+# МАРШРУТНАЯ КАРТА ОМОЛОЖЕНИЯ — ПРОТОКОЛЫ И GAP-СИСТЕМА (Чат 42)
+# ═══════════════════════════════════════════════════════════════
+
+# ── РЕЕСТР ПРОТОКОЛОВ ──
+
+ROADMAP_PROTOCOLS = {
+    # ── УРОВЕНЬ 1: ФУНДАМЕНТ ──
+    "sleep": {
+        "name": "Сон-протокол", "emoji": "😴", "level": 1, "gap_key": "sleep",
+        "duration_weeks": {"light": 3, "medium": 6, "heavy": 8},
+        "unlock": {"bgs_max": None},
+        "expected_reduction": "0.5-2.0 года",
+    },
+    "bgs_recovery": {
+        "name": "БГС-восстановление", "emoji": "⚡", "level": 1, "gap_key": "hpa",
+        "duration_weeks": {"stage_1": 4, "stage_2": 8, "stage_3": 12},
+        "unlock": {"bgs_min": 1},
+        "expected_reduction": "0.5-1.5 года",
+        "blocks_protocols": ["hiit", "vo2max_intense"],
+    },
+    # ── УРОВЕНЬ 2: СТРЕСС И ВОСПАЛЕНИЕ ──
+    "stress": {
+        "name": "Стресс-протокол", "emoji": "🧘", "level": 2, "gap_key": "stress",
+        "duration_weeks": {"light": 3, "medium": 5, "heavy": 8},
+        "unlock": {"bgs_max": 3},
+        "expected_reduction": "0.5-2.0 года",
+    },
+    "detox": {
+        "name": "Лёгкий детокс", "emoji": "🧹", "level": 2, "gap_key": None,
+        "duration_weeks": {"standard": 3},
+        "unlock": {"bgs_max": 2, "sleep_gap_max": 3.0, "trigger": "energy_low"},
+        "expected_reduction": "поддержка энергии",
+    },
+    # ── УРОВЕНЬ 3: ЭНЕРГИЯ И ДВИЖЕНИЕ ──
+    "vo2max_walking": {
+        "name": "Кардио: ходьба", "emoji": "🚶", "level": 3, "gap_key": "vo2max",
+        "duration_weeks": {"standard": 6},
+        "unlock": {"bgs_max": 3},
+        "expected_reduction": "0.5-1.0 года",
+    },
+    "vo2max_moderate": {
+        "name": "Кардио: умеренный", "emoji": "🏃", "level": 3, "gap_key": "vo2max",
+        "duration_weeks": {"standard": 8},
+        "unlock": {"bgs_max": 2, "sleep_gap_max": 2.5, "min_weeks_in_bot": 4},
+        "expected_reduction": "1.0-3.0 года",
+    },
+    "vo2max_hiit": {
+        "name": "Кардио: HIIT", "emoji": "💥", "level": 3, "gap_key": "vo2max",
+        "duration_weeks": {"standard": 8},
+        "unlock": {"bgs_max": 1, "sleep_gap_max": 2.0, "min_weeks_in_bot": 8},
+        "expected_reduction": "2.0-4.0 года",
+    },
+    # ── УРОВЕНЬ 4: ОПТИМИЗАЦИЯ ──
+    "genetic_supplements": {
+        "name": "Нутрицевтики по генотипу", "emoji": "💊", "level": 4, "gap_key": None,
+        "duration_weeks": {"standard": 12},
+        "unlock": {"has_genetics": True, "bgs_max": 2},
+        "expected_reduction": "поддержка",
+    },
+    "cognitive_training": {
+        "name": "Когнитивный тренинг", "emoji": "🧠", "level": 4, "gap_key": None,
+        "duration_weeks": {"standard": 8},
+        "unlock": {"bgs_max": 2, "min_weeks_in_bot": 8},
+        "expected_reduction": "когнитивный индекс",
+    },
+}
+
+# Маппинг маршрутного блока → practice block (для доставки задач)
+ROADMAP_TO_PRACTICE = {
+    'sleep_light':    {'practice_block': 'sleep',        'breathing': 'breathing_478'},
+    'sleep_medium':   {'practice_block': 'sleep',        'breathing': 'breathing_478'},
+    'sleep_heavy':    {'practice_block': 'sleep',        'breathing': 'breathing_478'},
+    'stress_light':   {'practice_block': 'antistress',   'breathing': 'coherent_breathing'},
+    'stress_medium':  {'practice_block': 'antistress',   'breathing': 'coherent_breathing'},
+    'stress_heavy':   {'practice_block': 'antistress',   'breathing': 'resonant_breathing'},
+    'bgs_recovery_stage_1': {'practice_block': 'antistress', 'breathing': 'breathing_478'},
+    'bgs_recovery_stage_2': {'practice_block': 'antistress', 'breathing': 'breathing_478'},
+    'bgs_recovery_stage_3': {'practice_block': 'antistress', 'breathing': 'breathing_478'},
+    'vo2max_walking': {'practice_block': 'capillary_work', 'breathing': None},
+    'vo2max_moderate': {'practice_block': 'energy_focus', 'breathing': None},
+    'vo2max_hiit':    {'practice_block': 'energy_focus',  'breathing': 'box_breathing'},
+    'detox':          {'practice_block': 'antistress',    'breathing': 'breathing_478'},
+    'cognitive_training': {'practice_block': 'attention', 'breathing': 'alternate_nostril'},
+}
+
+# Чек-ин вопросы для каждого блока (раз в 3 дня)
+ROADMAP_CHECKIN_QUESTIONS = {
+    'sleep':     "Как со сном на этой неделе?",
+    'stress':    "Как ощущается уровень стресса?",
+    'bgs_recovery': "Как энергия — есть улучшение?",
+    'detox':     "Как переносишь детокс?",
+    'vo2max_walking': "Как идут прогулки?",
+    'vo2max_moderate': "Как идут тренировки?",
+    'vo2max_hiit': "Как идут тренировки?",
+    'cognitive_training': "Замечаешь изменения в фокусе?",
+    'genetic_supplements': "Как переносишь добавки?",
+}
+
+# Сезонные корректировки
+SEASONAL_ADJUSTMENTS = {
+    11: {"risk": "sleep", "add": "Свет 10000 люкс 30мин утром"},
+    12: {"risk": "sleep+stress", "add": "Свет + витамин D 2000 IU"},
+    1:  {"risk": "sleep+stress", "add": "Свет + витамин D"},
+    2:  {"risk": "sleep", "add": "Свет утром"},
+    6:  {"bonus": "vo2max", "note": "Лето — идеально для кардио на улице"},
+    7:  {"bonus": "vo2max", "note": "Пик активности"},
+}
+
+# Предупреждения о взаимодействии добавок с лекарствами (блокер 3)
+SUPPLEMENT_MEDICATION_WARNINGS = {
+    "ashwagandha": {
+        "medication_keywords": [
+            "тироксин", "эутирокс", "левотироксин", "l-тироксин",
+            "мерказолил", "тирозол",
+            "золофт", "сертралин", "ципралекс", "эсциталопрам",
+            "амитриптилин", "миртазапин",
+            "феназепам", "клоназепам", "алпразолам", "диазепам",
+            "инсулин", "метформин", "глибенкламид",
+        ],
+        "condition_keywords": ["гипертирео", "тиреотоксико", "аутоиммунн"],
+        "warning": (
+            "⚠️ *Ашваганда + {matched_med}*\n\n"
+            "Ашваганда влияет на щитовидную железу "
+            "и может усиливать действие седативных.\n\n"
+            "Перед приёмом — уточни у врача.\n"
+            "Если врач одобрит — начни с половины дозы."
+        ),
+        "action": "warn_not_block",
+    },
+    "magnesium": {
+        "medication_keywords": [
+            "ципрофлоксацин", "левофлоксацин", "амоксицилл",
+            "бонвива", "алендронат", "золедронов",
+            "дигоксин",
+        ],
+        "condition_keywords": [],
+        "warning": (
+            "⚠️ *Магний + {matched_med}*\n\n"
+            "Магний снижает всасывание этого препарата.\n"
+            "Принимай их с интервалом минимум 2 часа.\n\n"
+            "Утром — лекарство. Вечером — магний."
+        ),
+        "action": "warn_with_timing",
+    },
+    "nac": {
+        "medication_keywords": [
+            "нитроглицерин", "нитросорбид", "изосорбид",
+            "варфарин", "ксарелто", "прадакса", "эликвис",
+        ],
+        "condition_keywords": [],
+        "warning": (
+            "⚠️ *NAC + {matched_med}*\n\n"
+            "NAC усиливает действие нитратов и "
+            "может влиять на свёртываемость.\n\n"
+            "❌ Этот препарат и NAC — несовместимы.\n"
+            "Обсуди с врачом замену NAC на глутатион."
+        ),
+        "action": "block",
+    },
+    "methylfolate": {
+        "medication_keywords": [
+            "метотрексат",
+            "карбамазепин", "вальпроат", "депакин",
+            "фенитоин", "финлепсин",
+        ],
+        "condition_keywords": [],
+        "warning": (
+            "⚠️ *Метилфолат + {matched_med}*\n\n"
+            "Метилфолат может снижать эффективность "
+            "этого препарата.\n\n"
+            "❌ Не принимай без согласования с врачом."
+        ),
+        "action": "block",
+    },
+    "omega3": {
+        "medication_keywords": [
+            "варфарин", "ксарелто", "прадакса", "эликвис",
+            "аспирин", "клопидогрел", "тромбо асс",
+        ],
+        "condition_keywords": [],
+        "warning": (
+            "⚠️ *Омега-3 + {matched_med}*\n\n"
+            "Омега-3 разжижает кровь. В сочетании с "
+            "антикоагулянтами — риск кровотечения.\n\n"
+            "Уточни у врача допустимую дозу (обычно до 1г/день)."
+        ),
+        "action": "warn_reduce_dose",
+    },
+    "l_theanine": {
+        "medication_keywords": [
+            "феназепам", "клоназепам", "алпразолам", "диазепам",
+            "золпидем", "зопиклон",
+        ],
+        "condition_keywords": [],
+        "warning": (
+            "⚠️ *L-теанин + {matched_med}*\n\n"
+            "L-теанин усиливает седативный эффект.\n"
+            "Начни с 100мг (не 200мг) и следи за сонливостью."
+        ),
+        "action": "warn_reduce_dose",
+    },
+    "berberine": {
+        "medication_keywords": [
+            "метформин", "глибенкламид",
+            "циклоспорин",
+        ],
+        "condition_keywords": ["диабет", "сахарн"],
+        "warning": (
+            "⚠️ *Берберин + {matched_med}*\n\n"
+            "Берберин снижает сахар крови — как метформин.\n"
+            "Вместе — риск гипогликемии.\n\n"
+            "❌ Не совмещай без контроля врача."
+        ),
+        "action": "block",
+    },
+}
+
+
+def check_supplement_medication_safety(
+    supplement_key: str,
+    user_medications: str,
+    user_conditions: str,
+) -> dict:
+    """
+    Проверяет совместимость добавки с лекарствами пользователя.
+    Returns: {'safe': bool, 'action': str, 'warning_text': str|None, 'matched_medication': str|None}
+    """
+    rule = SUPPLEMENT_MEDICATION_WARNINGS.get(supplement_key)
+    if not rule:
+        return {'safe': True, 'action': 'ok', 'warning_text': None, 'matched_medication': None}
+
+    meds_lower = (user_medications or '').lower()
+    conds_lower = (user_conditions or '').lower()
+
+    # Проверяем лекарства
+    for keyword in rule['medication_keywords']:
+        if keyword.lower() in meds_lower:
+            return {
+                'safe': rule['action'] != 'block',
+                'action': rule['action'],
+                'warning_text': rule['warning'].format(matched_med=keyword),
+                'matched_medication': keyword,
+            }
+
+    # Проверяем хронические заболевания
+    for keyword in rule.get('condition_keywords', []):
+        if keyword.lower() in conds_lower:
+            return {
+                'safe': rule['action'] != 'block',
+                'action': rule['action'],
+                'warning_text': rule['warning'].format(matched_med=keyword),
+                'matched_medication': keyword,
+            }
+
+    return {'safe': True, 'action': 'ok', 'warning_text': None, 'matched_medication': None}
+
+
+async def validate_roadmap_supplements(telegram_id: int, supplements: list) -> dict:
+    """Проверяет ВСЕ добавки блока на совместимость с лекарствами юзера."""
+    user = await get_user(telegram_id)
+    medications = (user or {}).get('medications', '')
+    conditions = (user or {}).get('chronic_conditions', '')
+
+    if not medications and not conditions:
+        return {'supplements': supplements, 'warnings': [], 'blocked': []}
+
+    warnings = []
+    blocked = []
+    safe_supplements = []
+
+    for supp in supplements:
+        check = check_supplement_medication_safety(
+            supp.get('key', ''), medications, conditions
+        )
+        if check['action'] == 'block':
+            blocked.append(supp)
+            warnings.append(check['warning_text'])
+        elif check['action'] != 'ok':
+            warnings.append(check['warning_text'])
+            safe_supplements.append(supp)
+        else:
+            safe_supplements.append(supp)
+
+    return {'supplements': safe_supplements, 'warnings': warnings, 'blocked': blocked}
+
+
+# ── GAP-КАЛЬКУЛЯТОР ──
+
+async def calculate_roadmap_gaps(telegram_id: int) -> dict:
+    """
+    Считает GAP по каждой подсистеме для маршрутной карты.
+    Использует СУЩЕСТВУЮЩИЕ данные — ничего нового не считает.
+
+    Вызывается:
+    - При генерации маршрута (1 раз)
+    - При ежемесячном пересмотре
+    - При запросе "📋 Мой маршрут"
+    """
+    user = await get_user(telegram_id)
+    if not user:
+        return None
+
+    passport_age = user.get("exact_age") or _age_from_group(user.get("age_group", "40-49"))
+
+    # --- L1: Штрафы из тестов (через существующую calculate_summary_bio_age) ---
+    data = await collect_summary_data(telegram_id)
+    summary = calculate_summary_bio_age(passport_age, data)
+    penalties = summary.get("penalties", {})
+
+    gaps = {
+        "sleep": round(penalties.get("sleep", 0), 1),
+        "stress": round(penalties.get("stress", 0), 1),
+        "hpa": round(penalties.get("hpa", 0), 1),
+        "genetics": round(penalties.get("genetics", 0), 1),
+    }
+
+    # --- L2: Кардио (VO2max) ---
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute(
+                "SELECT bio_age_cardio FROM vo2max_records WHERE telegram_id = ? ORDER BY date DESC LIMIT 1",
+                (telegram_id,)
+            )).fetchone()
+        if row and row['bio_age_cardio']:
+            gaps["vo2max"] = round(max(0, row['bio_age_cardio'] - passport_age), 1)
+        else:
+            gaps["vo2max"] = None
+    except Exception:
+        gaps["vo2max"] = None
+
+    # --- L3: Автономка (HRV) — используем v2 с коррекциями ---
+    try:
+        hrv_smart = await get_hrv_bio_age_smart(telegram_id)
+        if hrv_smart and hrv_smart.get('bio_age_hrv') is not None:
+            gaps["hrv"] = round(max(0, hrv_smart['bio_age_hrv'] - passport_age), 1)
+        else:
+            gaps["hrv"] = None
+    except Exception:
+        gaps["hrv"] = None
+
+    # --- Метаданные ---
+    known_gaps = {k: v for k, v in gaps.items() if v is not None}
+    gaps["total"] = round(sum(known_gaps.values()), 1) if known_gaps else 0
+    gaps["main_blocker"] = max(known_gaps, key=known_gaps.get) if known_gaps else "sleep"
+    gaps["data_completeness"] = round(len(known_gaps) / 6, 2)
+
+    return gaps
+
+
+def _age_from_group(age_group: str) -> int:
+    """Конвертирует возрастную группу в примерный возраст."""
+    mapping = {
+        "18-29": 25, "30-39": 35, "40-49": 45,
+        "50-59": 55, "60-69": 65, "70+": 75,
+    }
+    return mapping.get(age_group, 45)
+
+
+async def get_bgs_stage(telegram_id: int) -> int:
+    """Получает текущую стадию БГС пользователя (0-3)."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute(
+                "SELECT ahs_total, ahs_stage FROM ahs_records WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 1",
+                (telegram_id,)
+            )).fetchone()
+        if not row:
+            return 0
+        r = dict(row)
+        # Если есть прямой ahs_stage — используем его
+        if r.get('ahs_stage') is not None:
+            return int(r['ahs_stage'])
+        # Иначе считаем по ahs_total
+        ahs = r.get('ahs_total')
+        if ahs is None:
+            return 0
+        if ahs >= 37:
+            return 3
+        elif ahs >= 25:
+            return 2
+        elif ahs >= 13:
+            return 1
+        return 0
+    except Exception:
+        return 0
+
+
+async def get_cognitive_index(telegram_id: int) -> float:
+    """Получает когнитивный индекс (из последнего замера)."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute(
+                "SELECT cognitive_index FROM cognitive_assessments WHERE telegram_id = ? AND cognitive_index IS NOT NULL ORDER BY date DESC LIMIT 1",
+                (telegram_id,)
+            )).fetchone()
+        return row['cognitive_index'] if row else None
+    except Exception:
+        return None
+
+
+# ── ФУНКЦИИ РАБОТЫ С roadmap_state ──
+
+async def get_roadmap_state(telegram_id: int) -> dict:
+    """Получает текущее состояние маршрута пользователя."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute(
+                "SELECT * FROM roadmap_state WHERE telegram_id = ?",
+                (telegram_id,)
+            )).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+async def save_roadmap(telegram_id: int, roadmap: dict, gaps: dict, bio_age_start: float = None, bgs_stage: int = 0):
+    """Сохраняет сгенерированный маршрут."""
+    import json as _json
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    roadmap_json = _json.dumps(roadmap, ensure_ascii=False)
+    gaps_json = _json.dumps(gaps, ensure_ascii=False)
+
+    # Определяем первый блок
+    first_block = None
+    first_intensity = None
+    first_weeks = 0
+    for q in ["q1", "q2", "q3", "q4"]:
+        blocks = roadmap.get(q, [])
+        if blocks:
+            first_block = blocks[0].get("protocol")
+            first_intensity = blocks[0].get("intensity")
+            first_weeks = blocks[0].get("weeks", 4)
+            break
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute('''
+                INSERT INTO roadmap_state (
+                    telegram_id, roadmap_json, roadmap_generated_at,
+                    status, current_quarter, current_block, current_intensity,
+                    block_started_at, block_week,
+                    last_gaps_json, gaps_updated_at,
+                    start_bio_age, start_gaps_json, bgs_at_start,
+                    month_number, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(telegram_id) DO UPDATE SET
+                    roadmap_json = excluded.roadmap_json,
+                    roadmap_generated_at = excluded.roadmap_generated_at,
+                    status = excluded.status,
+                    current_quarter = excluded.current_quarter,
+                    current_block = excluded.current_block,
+                    current_intensity = excluded.current_intensity,
+                    block_started_at = excluded.block_started_at,
+                    block_week = excluded.block_week,
+                    last_gaps_json = excluded.last_gaps_json,
+                    gaps_updated_at = excluded.gaps_updated_at,
+                    start_bio_age = excluded.start_bio_age,
+                    start_gaps_json = excluded.start_gaps_json,
+                    bgs_at_start = excluded.bgs_at_start,
+                    month_number = excluded.month_number,
+                    updated_at = excluded.updated_at
+            ''', (
+                telegram_id, roadmap_json, now_str,
+                'active', 1, first_block, first_intensity,
+                now_str, 1,
+                gaps_json, now_str,
+                bio_age_start, gaps_json, bgs_stage,
+                1, now_str, now_str,
+            ))
+            await db.commit()
+    except Exception as e:
+        print(f"❌ save_roadmap error: {e}")
+
+
+async def update_roadmap_state(telegram_id: int, **kwargs):
+    """Обновляет поля roadmap_state."""
+    if not kwargs:
+        return
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    kwargs['updated_at'] = now_str
+    set_clause = ", ".join(f"{k} = ?" for k in kwargs)
+    values = list(kwargs.values()) + [telegram_id]
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                f"UPDATE roadmap_state SET {set_clause} WHERE telegram_id = ?",
+                values
+            )
+            await db.commit()
+    except Exception as e:
+        print(f"❌ update_roadmap_state error: {e}")
+
+
+async def save_roadmap_review(telegram_id: int, gaps: dict, changes: dict,
+                               action: str, old_block: str, new_block: str):
+    """Сохраняет запись в roadmap_history."""
+    import json as _json
+    state = await get_roadmap_state(telegram_id)
+    month = state.get('month_number', 0) if state else 0
+    start_bio = state.get('start_bio_age', 0) if state else 0
+
+    # Текущий биовозраст
+    user = await get_user(telegram_id)
+    passport_age = (user or {}).get("exact_age") or 45
+    data = await collect_summary_data(telegram_id)
+    summary = calculate_summary_bio_age(passport_age, data)
+    current_bio = summary.get("bio_age", passport_age)
+    delta = round(current_bio - start_bio, 1) if start_bio else 0
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute('''
+                INSERT INTO roadmap_history (
+                    telegram_id, month_number, gaps_json, changes_json,
+                    action, old_block, new_block,
+                    bio_age_at_review, bio_age_delta_from_start
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                telegram_id, month,
+                _json.dumps(gaps, ensure_ascii=False),
+                _json.dumps(changes, ensure_ascii=False),
+                action, old_block, new_block,
+                current_bio, delta,
+            ))
+            await db.commit()
+    except Exception as e:
+        print(f"❌ save_roadmap_review error: {e}")
+
+
+async def get_roadmap_history(telegram_id: int) -> list:
+    """Получает историю пересмотров маршрута."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (await db.execute(
+                "SELECT * FROM roadmap_history WHERE telegram_id = ? ORDER BY review_date ASC",
+                (telegram_id,)
+            )).fetchall()
+        return [dict(r) for r in rows] if rows else []
+    except Exception:
+        return []
+
+
+async def get_active_roadmap_context(telegram_id: int) -> dict:
+    """
+    Вызывается ЛЮБЫМ scheduler job перед отправкой.
+    Возвращает текущий контекст маршрута или None.
+    """
+    state = await get_roadmap_state(telegram_id)
+    if not state or state.get('status') != 'active':
+        return None
+
+    block = state.get('current_block')
+    week = state.get('block_week', 1)
+    intensity = state.get('current_intensity')
+
+    # Маппинг маршрутного блока → practice block
+    block_key = f"{block}_{intensity}" if intensity else block
+    mapping = ROADMAP_TO_PRACTICE.get(block_key, ROADMAP_TO_PRACTICE.get(block))
+
+    return {
+        'block': block,
+        'week': week,
+        'intensity': intensity,
+        'practice_block': mapping['practice_block'] if mapping else None,
+        'breathing': mapping['breathing'] if mapping else None,
+        'week_message_key': f"{block}_week_{week}",
+        'status': state.get('status'),
+        'month': state.get('month_number', 1),
+        'quarter': state.get('current_quarter', 1),
+    }
+
+
+# ── GAP-БАРЫ (визуализация) ──
+
+def format_gap_bar(label: str, emoji: str, gap, old_gap=None, max_gap: float = 5.0) -> str:
+    """Генерирует текстовую полоску GAP."""
+    if gap is None:
+        return f"{emoji} {label}: нет данных"
+
+    filled = int(min(gap / max_gap * 7, 7))
+    empty = 7 - filled
+    bar = "█" * filled + "░" * empty
+
+    delta_text = ""
+    if old_gap is not None and old_gap > 0:
+        change = old_gap - gap
+        if abs(change) > 0.2:
+            pct = int(change / old_gap * 100)
+            direction = "↓" if change > 0 else "↑"
+            delta_text = f" (было {old_gap:.1f} {direction}{abs(pct)}%)"
+
+    return f"{emoji} {label}: {bar} {gap:.1f}{delta_text}"
+
+
+def format_gap_bars(gaps: dict, old_gaps: dict = None) -> str:
+    """Формирует полный блок GAP-баров."""
+    lines = []
+    config = [
+        ("Сон", "😴", "sleep"),
+        ("Стресс", "🧘", "stress"),
+        ("HPA", "⚡", "hpa"),
+        ("VO2max", "🏃", "vo2max"),
+        ("HRV", "💓", "hrv"),
+        ("Генетика", "🧬", "genetics"),
+    ]
+    for label, emoji, key in config:
+        gap_val = gaps.get(key)
+        old_val = old_gaps.get(key) if old_gaps else None
+        lines.append(format_gap_bar(label, emoji, gap_val, old_val))
+    return "\n".join(lines)
+
+
+# ── SAFETY OVERRIDE (конфликт маршрута с текущим состоянием) ──
+
+async def resolve_practice_conflict(telegram_id: int) -> str:
+    """
+    Определяет practice_block. Приоритет:
+    1. Safety override (критическое состояние → перебивает маршрут)
+    2. Маршрут (если активен)
+    3. Текущее состояние (если маршрута нет)
+    """
+    roadmap_ctx = await get_active_roadmap_context(telegram_id)
+
+    # Проверяем сегодняшний чек-ин
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            row = await (await db.execute(
+                "SELECT sleep_quality, energy, stress FROM daily_checkins WHERE telegram_id = ? AND date = ? ORDER BY id DESC LIMIT 1",
+                (telegram_id, today_str)
+            )).fetchone()
+    except Exception:
+        row = None
+
+    if row:
+        sleep_q = row['sleep_quality'] or 5
+        energy = row['energy'] or 5
+        stress = row['stress'] or 5
+
+        # Критически плохой сон + маршрут назначил кардио → override
+        if sleep_q <= 2 and roadmap_ctx and roadmap_ctx['block'] and roadmap_ctx['block'].startswith('vo2max'):
+            return 'sleep'
+
+        # Критический стресс → дыхание важнее
+        if stress >= 9:
+            return 'antistress'
+
+        # Критическая усталость → не тренировка
+        if energy <= 2 and roadmap_ctx and roadmap_ctx['block'] and roadmap_ctx['block'].startswith('vo2max'):
+            return 'sleep'
+
+    # Маршрут активен → его блок
+    if roadmap_ctx and roadmap_ctx.get('practice_block'):
+        return roadmap_ctx['practice_block']
+
+    # Нет маршрута → None (вызывающая функция использует старую логику)
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# ШАГ 3: ГЕНЕРАТОР МАРШРУТА generate_roadmap()
+# ═══════════════════════════════════════════════════════════════
+
+
+def _detox_eligible(user: dict, gaps: dict, bgs_stage: int) -> bool:
+    """Проверяет, можно ли включить детокс в маршрут."""
+    if bgs_stage >= 3:
+        return False
+    if gaps.get("sleep", 0) > 3.0:
+        return False
+    return True
+
+
+def _select_protocol_for_gap(gap_name: str, gap_value: float, bgs_stage: int, has_genetics: bool) -> dict:
+    """Подбирает протокол для конкретного GAP."""
+    if gap_name == "vo2max":
+        if bgs_stage >= 3:
+            return None
+        elif bgs_stage >= 2:
+            return {"protocol": "vo2max_walking", "intensity": "standard",
+                    "weeks": 6, "reason": f"VO2max +{gap_value:.0f} лет (мягко, БГС {bgs_stage})"}
+        elif gap_value > 3:
+            return {"protocol": "vo2max_moderate", "intensity": "standard",
+                    "weeks": 8, "reason": f"VO2max +{gap_value:.0f} лет — главный рычаг"}
+        else:
+            return {"protocol": "vo2max_walking", "intensity": "standard",
+                    "weeks": 6, "reason": f"VO2max +{gap_value:.0f} лет"}
+    elif gap_name == "hrv":
+        return {"protocol": "stress", "intensity": "heavy",
+                "weeks": 8, "reason": f"HRV-возраст +{gap_value:.0f} лет → coherence + вагус"}
+    elif gap_name == "sleep":
+        intensity = "medium" if gap_value < 2.5 else "heavy"
+        return {"protocol": "sleep", "intensity": intensity,
+                "weeks": ROADMAP_PROTOCOLS["sleep"]["duration_weeks"].get(intensity, 6),
+                "reason": f"Сон +{gap_value:.1f} лет"}
+    elif gap_name == "stress":
+        intensity = "medium" if gap_value < 2.0 else "heavy"
+        return {"protocol": "stress", "intensity": intensity,
+                "weeks": ROADMAP_PROTOCOLS["stress"]["duration_weeks"].get(intensity, 5),
+                "reason": f"Стресс +{gap_value:.1f} лет"}
+    elif gap_name == "hpa":
+        stage_key = f"stage_{bgs_stage}" if bgs_stage >= 1 else "stage_1"
+        return {"protocol": "bgs_recovery", "intensity": stage_key,
+                "weeks": ROADMAP_PROTOCOLS["bgs_recovery"]["duration_weeks"].get(stage_key, 8),
+                "reason": f"HPA +{gap_value:.1f} лет"}
+    return None
+
+
+async def generate_roadmap(telegram_id: int) -> dict:
+    """
+    ШАГ 3: Генерирует 12-месячный маршрут омоложения.
+    Вызывается по кнопке "🗺️ Построить маршрут" (не авто).
+    """
+    user = await get_user(telegram_id)
+    if not user:
+        return None
+
+    gaps = await calculate_roadmap_gaps(telegram_id)
+    if not gaps:
+        return None
+
+    bgs_stage = await get_bgs_stage(telegram_id)
+    has_genetics = bool(user.get("has_genetics") or user.get("genetic_data"))
+
+    roadmap = {"q1": [], "q2": [], "q3": [], "q4": []}
+
+    # ─── Q1: ФУНДАМЕНТ (всегда) ───
+
+    # Сон (если GAP > 0.5)
+    sleep_gap = gaps.get("sleep", 0) or 0
+    if sleep_gap > 0.5:
+        intensity = "light" if sleep_gap < 1.5 else ("medium" if sleep_gap < 2.5 else "heavy")
+        roadmap["q1"].append({
+            "protocol": "sleep", "intensity": intensity,
+            "weeks": ROADMAP_PROTOCOLS["sleep"]["duration_weeks"][intensity],
+            "reason": f"Сон добавляет +{sleep_gap:.1f} года",
+        })
+
+    # БГС (если стадия >= 1)
+    if bgs_stage >= 1:
+        stage_key = f"stage_{bgs_stage}"
+        weeks = ROADMAP_PROTOCOLS["bgs_recovery"]["duration_weeks"].get(stage_key, 8)
+        roadmap["q1"].append({
+            "protocol": "bgs_recovery", "intensity": stage_key,
+            "weeks": weeks,
+            "reason": f"БГС стадия {bgs_stage}",
+            "blocker": bgs_stage >= 2,
+        })
+
+    # Стресс (если GAP > 1.0)
+    stress_gap = gaps.get("stress", 0) or 0
+    if stress_gap > 1.0:
+        intensity = "light" if stress_gap < 1.5 else ("medium" if stress_gap < 2.0 else "heavy")
+        roadmap["q1"].append({
+            "protocol": "stress", "intensity": intensity,
+            "weeks": ROADMAP_PROTOCOLS["stress"]["duration_weeks"][intensity],
+            "reason": f"Стресс добавляет +{stress_gap:.1f} года",
+        })
+
+    # Детокс (условно)
+    if _detox_eligible(user, gaps, bgs_stage):
+        roadmap["q1"].append({
+            "protocol": "detox", "intensity": "standard", "weeks": 3,
+            "reason": "Энергия низкая, фундамент стабилизирован",
+            "conditional": True,
+        })
+
+    # ─── Q2: РЫЧАГИ (top-2 GAP) ───
+    actionable_gaps = {k: v for k, v in gaps.items()
+                       if v is not None and isinstance(v, (int, float))
+                       and k not in ("total", "main_blocker", "data_completeness", "genetics")}
+    sorted_gaps = sorted(actionable_gaps.items(), key=lambda x: x[1], reverse=True)
+    q1_protocols = [b["protocol"] for b in roadmap["q1"]]
+
+    for gap_name, gap_value in sorted_gaps[:2]:
+        if gap_value < 0.5:
+            continue
+        protocol = _select_protocol_for_gap(gap_name, gap_value, bgs_stage, has_genetics)
+        if protocol and protocol["protocol"] not in q1_protocols:
+            roadmap["q2"].append(protocol)
+
+    # ─── Q3: ПЕРСОНАЛИЗАЦИЯ ───
+    if has_genetics:
+        roadmap["q3"].append({
+            "protocol": "genetic_supplements", "intensity": "standard",
+            "weeks": 12, "reason": "Персонализация по генотипу",
+        })
+    else:
+        roadmap["q3"].append({
+            "protocol": "stress", "intensity": "heavy", "weeks": 8,
+            "reason": "Оптимизация без генетики → стресс-фокус",
+            "note": "Предложить сдать генетику",
+        })
+
+    cog_index = await get_cognitive_index(telegram_id)
+    if cog_index is not None and cog_index < 7:
+        roadmap["q3"].append({
+            "protocol": "cognitive_training", "intensity": "standard", "weeks": 8,
+        })
+
+    # ─── Q4: ЗАКРЕПЛЕНИЕ ───
+    roadmap["q4"].append({
+        "protocol": "maintenance", "weeks": 12,
+        "content": "Топ-3 практики по эффективности + финальный замер",
+    })
+
+    # Определяем первый блок
+    first_block = None
+    first_intensity = None
+    for q in ["q1", "q2", "q3", "q4"]:
+        if roadmap[q]:
+            first_block = roadmap[q][0].get("protocol")
+            first_intensity = roadmap[q][0].get("intensity")
+            break
+
+    # Считаем целевое снижение
+    known_gaps = {k: v for k, v in gaps.items()
+                  if v is not None and isinstance(v, (int, float))
+                  and k not in ("total", "main_blocker", "data_completeness")}
+    target_years = round(min(sum(known_gaps.values()) * 0.5, 5), 1)  # ~50% от суммы GAP, макс 5
+
+    # Получаем текущий биовозраст
+    passport_age = user.get("exact_age") or _age_from_group(user.get("age_group", "40-49"))
+    data = await collect_summary_data(telegram_id)
+    summary = calculate_summary_bio_age(passport_age, data)
+    bio_age_start = summary.get("bio_age", passport_age)
+
+    # ═══ ЛЕКАРСТВА: Проверяем совместимость добавок ═══
+    medication_warnings = []
+    blocked_supplements = []
+    try:
+        medications = user.get("medications", "") or ""
+        conditions = user.get("chronic_conditions", "") or ""
+        if medications or conditions:
+            # Собираем все добавки из всех блоков маршрута
+            all_supps = []
+            supp_keys_by_block = {
+                "sleep": ["magnesium", "l_theanine"],
+                "stress": ["ashwagandha", "l_theanine"],
+                "bgs_recovery": ["ashwagandha", "magnesium"],
+                "detox": ["nac", "methylfolate"],
+                "genetic_supplements": ["ashwagandha", "magnesium", "nac", "methylfolate", "omega3", "berberine"],
+            }
+            for q in ["q1", "q2", "q3", "q4"]:
+                for block_item in roadmap.get(q, []):
+                    proto = block_item.get("protocol", "")
+                    for sk in supp_keys_by_block.get(proto, []):
+                        if sk not in all_supps:
+                            all_supps.append(sk)
+
+            for sk in all_supps:
+                check = check_supplement_medication_safety(sk, medications, conditions)
+                if check.get("action") == "block":
+                    blocked_supplements.append(sk)
+                    medication_warnings.append(check)
+                elif check.get("action") == "warn" and check.get("warning_text"):
+                    medication_warnings.append(check)
+
+            # Убираем заблокированные добавки из roadmap metadata
+            if blocked_supplements:
+                for q in ["q1", "q2", "q3", "q4"]:
+                    for block_item in roadmap.get(q, []):
+                        proto = block_item.get("protocol", "")
+                        proto_supps = supp_keys_by_block.get(proto, [])
+                        removed = [s for s in proto_supps if s in blocked_supplements]
+                        if removed:
+                            block_item["blocked_supplements"] = removed
+                            block_item["supplement_note"] = (
+                                "⚠️ Добавки исключены из-за лекарств: "
+                                + ", ".join(removed)
+                            )
+    except Exception as e:
+        print(f"⚠️ medication check error: {e}")
+    # ═══ END ЛЕКАРСТВА ═══
+
+    # Сохраняем
+    await save_roadmap(telegram_id, roadmap, gaps, bio_age_start=bio_age_start, bgs_stage=bgs_stage)
+
+    # Обновляем статус на active + первый блок
+    await update_roadmap_state(telegram_id,
+                               status='active',
+                               current_block=first_block or 'sleep',
+                               current_intensity=first_intensity or 'light',
+                               block_week=1,
+                               current_quarter=1,
+                               month_number=1,
+                               block_started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    return {
+        "roadmap": roadmap,
+        "gaps": gaps,
+        "bio_age_start": bio_age_start,
+        "target_years": target_years,
+        "first_block": first_block,
+        "medication_warnings": medication_warnings,
+        "blocked_supplements": blocked_supplements,
+    }
+
+
+# ─── Форматирование маршрута для экрана ───
+
+def _get_protocol_name(key: str) -> str:
+    """Возвращает имя протокола по ключу."""
+    p = ROADMAP_PROTOCOLS.get(key)
+    if p:
+        return p["name"]
+    if key == "maintenance":
+        return "Закрепление"
+    return key
+
+
+def _get_protocol_emoji(key: str) -> str:
+    """Возвращает эмодзи протокола по ключу."""
+    p = ROADMAP_PROTOCOLS.get(key)
+    if p:
+        return p.get("emoji", "📋")
+    if key == "maintenance":
+        return "🔄"
+    return "📋"
+
+
+def _format_quarter_summary(blocks: list, q_num: int) -> str:
+    """Форматирует краткое описание квартала."""
+    if not blocks:
+        return "—"
+    parts = []
+    for b in blocks[:3]:
+        proto = b.get("protocol", "")
+        emoji = _get_protocol_emoji(proto)
+        name = _get_protocol_name(proto)
+        parts.append(f"{emoji} {name}")
+    return " + ".join(parts)
+
+
+def _format_top_gaps(gaps: dict) -> str:
+    """Топ-3 GAP для приветственного сообщения."""
+    items = []
+    config = [
+        ("sleep", "😴 Сон"), ("stress", "🧘 Стресс"), ("hpa", "⚡ HPA"),
+        ("vo2max", "🏃 VO2max"), ("hrv", "💓 HRV"), ("genetics", "🧬 Генетика"),
+    ]
+    for key, label in config:
+        val = gaps.get(key)
+        if val is not None and isinstance(val, (int, float)) and val > 0.3:
+            items.append((label, val))
+    items.sort(key=lambda x: x[1], reverse=True)
+    lines = []
+    for label, val in items[:3]:
+        marker = " ← главный тормоз" if items and items[0][0] == label else ""
+        lines.append(f"{label}: +{val:.1f} года{marker}")
+    return "\n".join(lines) if lines else "Данных мало — маршрут обновится с новыми тестами"
+
+
+# ═══════════════════════════════════════════════════════════════
+# ШАГ 5: ТЕКСТЫ ПРОТОКОЛОВ
+# ═══════════════════════════════════════════════════════════════
+
+ROADMAP_WELCOME_TEXT = """🗺️ *{name}, твой маршрут готов!*
+
+На основе твоих тестов я вижу,
+что больше всего лет добавляют:
+
+{top_gaps}
+
+📅 *План на 12 месяцев:*
+
+Q1 (мес. 1-3): {q1_summary}
+Q2 (мес. 4-6): {q2_summary}
+Q3 (мес. 7-9): {q3_summary}
+Q4 (мес. 10-12): {q4_summary}
+
+🎯 Реалистичная цель: *−{target_years}* года
+от биологического возраста.
+
+Не за счёт волшебных таблеток —
+за счёт работы с тем, что тянет вниз.
+
+Каждый месяц буду пересматривать план
+и корректировать под твои результаты.
+"""
+
+ROADMAP_DASHBOARD_TEXT = """🗺️ *МАРШРУТ* — месяц {month} из 12
+
+🎂 Био-возраст: {bio_age_start:.0f} → *{bio_age_current:.0f}* ({delta_text})
+
+━━━━━━━━━━━━━━━━━━
+
+{current_block_emoji} *Сейчас: {current_block_name}*
+Неделя {week} из {total_weeks}
+{current_block_short_status}
+
+━━━━━━━━━━━━━━━━━━
+
+📉 *Где теряешь годы:*
+
+{gap_bars}
+
+━━━━━━━━━━━━━━━━━━
+
+📅 Q1 {q1_icon}: {q1_text}
+📅 Q2 {q2_icon}: {q2_text}
+📅 Q3 {q3_icon}: {q3_text}
+📅 Q4 {q4_icon}: {q4_text}
+
+{next_checkpoint_text}
+"""
+
+ROADMAP_GAP_DETAIL_TEXT = """📊 *GAP-АНАЛИЗ* — что крадёт годы
+
+Каждая строка — сколько лет эта система
+добавляет к биологическому возрасту.
+
+{gap_details}
+
+━━━━━━━━━━━━━━━━━━
+
+📊 Полнота данных: {completeness}%
+{missing_data_note}
+
+💡 *Чем больше GAP — тем больше потенциал.*
+Работаем с самыми «жирными» разрывами.
+"""
+
+ROADMAP_MONTH_PLAN_TEXT = """📅 *МЕСЯЦ {month} — план*
+
+{current_block_emoji} *{current_block_name}*
+Неделя {week} из {total_weeks}
+
+━━━━━━━━━━━━━━━━━━
+
+*На этой неделе:*
+
+{weekly_tasks}
+
+*Практика:*
+{weekly_practice}
+
+━━━━━━━━━━━━━━━━━━
+
+{checkpoint_note}
+"""
+
+ROADMAP_NOT_GENERATED_TEXT = """🗺️ Маршрут ещё не построен.
+
+Для маршрута нужны результаты тестов.
+Пройди диагностику — и я составлю
+персональный план на 12 месяцев.
+"""
+
+ROADMAP_NEED_TESTS_TEXT = """🗺️ Для маршрута нужны минимум 3 из 4 тестов:
+• 😴 Качество сна (SQS)
+• 🔥 Стресс (PSS)
+• ⚡ Надпочечники (БГС)
+• 🌅 Циркадка
+
+{missing_line}
+
+Пройди оставшиеся — и построим маршрут!
+"""
+
+# ── Тексты понедельных сообщений протоколов ──
+
+SLEEP_PROTOCOL_TEXTS = {
+    "start": """😴 *Запускаем сон-протокол*
+
+Сон добавляет тебе +{gap:.1f} года.
+
+📅 План на {weeks} недель.
+Начинаем с базового — гигиена сна.
+""",
+    "light_week_1": """😴 *Сон — неделя 1*
+Фокус: гигиена сна
+
+📱 Экраны off за 60 мин до сна
+🌑 Спальня: темнота + прохлада (18-20°C)
+☕ Кофеин — стоп после 14:00
+
+Вечерняя практика: дыхание 4-7-8 (3 мин)
+Вдох 4с → задержка 7с → выдох 8с
+""",
+    "light_week_2": """😴 *Сон — неделя 2*
+Фокус: циркадная синхронизация
+
+☀️ Утром — свет 10-15 мин в первый час
+🍽️ Ужин за 3ч до сна
+⏰ Режим: ±30 мин каждый день
+
+Вечерняя практика: body scan 10 мин
+""",
+    "light_week_3": """😴 *Сон — неделя 3*
+Фокус: закрепление
+
+📌 Контрольная точка через 4 дня.
+Пересдашь тест сна (SQS) — сравним.
+
+Если GAP снизился — двигаемся дальше.
+""",
+    "medium_week_3": """😴 *Сон — неделя 3*
+Фокус: контроль стимулов (CBT-I)
+
+🛏️ Кровать = ТОЛЬКО сон
+⏱️ Не заснул за 20 мин? Встань, уйди
+🔁 Вернись когда станет сонно
+
+Странно и неудобно первые 3-5 дней.
+Потом мозг переучивается.
+""",
+    "medium_week_4": """😴 *Сон — неделя 4*
+Фокус: мягкое ограничение сна
+
+📏 Время в кровати = время сна + 30 мин
+⏰ Просыпайся в одно время ВСЕГДА
+😴 Сонливость днём — хороший знак
+""",
+    "medium_week_5": """😴 *Сон — неделя 5*
+Фокус: добавки
+
+💊 Магний глицинат 300мг за 1ч до сна
+
+Добавки — не замена режиму.
+Работают только ПОВЕРХ привычек.
+""",
+    "medium_week_6": """😴 *Сон — неделя 6*
+
+📌 Контрольная точка!
+Пересдай тест сна (SQS) — сравним с 6 недель назад.
+""",
+    "heavy_week_7": """😴 *Сон — неделя 7*
+Фокус: продвинутые техники
+
+🧠 Парадоксальное намерение:
+«Я НЕ буду спать» → убирает давление → засыпаешь
+
+🛁 Вечерний ритуал (30 мин):
+Тёплый душ → книга → дыхание 4-7-8
+""",
+    "heavy_week_8": """😴 *Сон — неделя 8*
+
+📌 Финальная контрольная точка!
+Пересдай SQS и циркадный тест.
+
+GAP < 1.5 → двигаемся дальше 🎉
+GAP > 1.5 → поддерживающий + следующий блок
+""",
+}
+
+STRESS_PROTOCOL_TEXTS = {
+    "start": """🧘 *Запускаем стресс-протокол*
+
+Стресс добавляет +{gap:.1f} года.
+
+📅 План на {weeks} недель.
+Начнём с дыхания — 5 мин в день.
+""",
+    "light_week_1": """🧘 *Стресс — неделя 1*
+Фокус: coherence-дыхание
+
+🫁 5.5 вдохов/мин: вдох 5с → выдох 5с
+По 5 мин, 2 раза в день:
+☀️ Утром + 🌙 Вечером
+
+Просто дыши по счёту. Тело сделает остальное.
+""",
+    "light_week_2": """🧘 *Стресс — неделя 2*
+Фокус: микро-паузы
+
+Дыхание утром-вечером + 3 микро-паузы:
+11:00 — 15:00 — 19:00 (1 мин, 6 вдохов)
+
+🌙 Вечером: body scan 10 мин
+""",
+    "light_week_3": """🧘 *Стресс — неделя 3*
+
+📌 Контрольная точка!
+Пересдай PSS (тест стресса).
+
+Дыхание + микро-паузы — оставляем как привычку.
+""",
+    "medium_week_4": """🧘 *Стресс — неделя 4*
+Фокус: HRV-тренинг
+
+🫁 Coherence-дыхание по таймеру (5.5/мин)
+Утром замеряй HRV → фиксируй в боте
+
+🎯 Цель: LF/HF ratio → 1.0-1.5
+""",
+    "medium_week_5": """🧘 *Стресс — неделя 5*
+Фокус: адаптогены
+
+💊 Ашваганда KSM-66 300мг ВЕЧЕРОМ
+
+⚠️ Адаптогены — не «витаминки».
+4-8 недель, потом перерыв.
+""",
+    "heavy_week_6": """🧘 *Стресс — неделя 6*
+Фокус: стимуляция блуждающего нерва
+
+🗣️ Гарглинг 30с × 3р/день
+🧊 Холодная вода на лицо 30с утром
+🎵 Пение/хамминг 5 мин
+
+Выбери 2 из 3 — делай каждый день.
+""",
+    "heavy_week_7": """🧘 *Стресс — неделя 7*
+Фокус: паттерны стресса
+
+Превентивная стратегия:
+За 30 мин до «опасного» времени —
+coherence-дыхание 5 мин.
+
+Не жди стресс — опережай его.
+""",
+    "heavy_week_8": """🧘 *Стресс — неделя 8*
+
+📌 Финальная контрольная точка!
+Пересдай PSS + замерь утренний HRV.
+""",
+}
+
+BGS_PROTOCOL_TEXTS = {
+    "start_stage1": """⚡ *Восстановление надпочечников*
+
+БГС стадия 1 (тревога). Кортизол повышен.
+📅 4 недели — мягкая перезагрузка.
+""",
+    "start_stage2": """⚡ *Восстановление надпочечников*
+
+БГС стадия 2 (сопротивление). Ресурсы истощаются.
+📅 8 недель.
+
+⚠️ Заблокировано: HIIT, голодание >14ч
+""",
+    "start_stage3": """⚡ *Восстановление надпочечников*
+
+БГС стадия 3 (истощение). Серьёзно.
+📅 12 недель. Медленно.
+
+🔒 Заблокировано: любые интенсивные протоколы
+""",
+    "stage1_week_1": """⚡ *БГС — неделя 1*
+
+🍳 Завтрак с белком в первый час
+☕ Кофеин — стоп после 14:00
+🌙 Ложись до 23:00
+🧂 Соль не ограничивай (гималайская/морская)
+""",
+    "stage1_week_3": """⚡ *БГС — неделя 3*
+
+💊 Витамин C 500мг утром
+💊 B5 (пантотеновая) 500мг
+🫁 Дыхание 4-7-8: утром и вечером
+
+📌 Через неделю — пересдача БГС-теста.
+""",
+    "stage2_week_5": """⚡ *БГС — неделя 5*
+
+💊 Ашваганда 300мг × 2р/день (утро + вечер)
+💊 Магний 400мг вечером
+
+🚫 Запрет: HIIT, бег, голодание >14ч
+🚶 Ходьба и йога — можно.
+""",
+    "stage2_week_7": """⚡ *БГС — неделя 7*
+
+🚶 Ходьба 20-30 мин × 5р/нед
+🧘 Йога/растяжка 15 мин
+
+📌 Пересдай БГС на этой неделе!
+Стадия 2→1: 🔓 разблокирую кардио!
+""",
+    "stage3_week_1": """⚡ *БГС стадия 3 — неделя 1*
+Режим покоя
+
+🛏️ Сон ≥ 8ч
+🍳 Завтрак с белком И жиром
+☕ Без кофеина ПОЛНОСТЬЮ
+🚶 Прогулки только для удовольствия
+""",
+    "stage3_week_5": """⚡ *БГС стадия 3 — неделя 5*
+
+💊 Витамин C 1000мг (500 утром + 500 обед)
+💊 B5 500мг + B-комплекс
+💊 Ашваганда 300мг вечером
+💊 Магний 400мг вечером
+""",
+    "stage3_week_9": """⚡ *БГС стадия 3 — неделя 9*
+Осторожное возвращение
+
+🚶 Ходьба 20 мин × 3р/нед (лёгкая)
+🫁 Дыхание 2р/день
+
+📌 Пересдай БГС на неделе 12.
+""",
+}
+
+VO2MAX_PROTOCOL_TEXTS = {
+    "start_walking": """🚶 *Запускаем кардио: ходьба*
+
+VO2max добавляет +{gap:.0f} лет.
+📅 6 недель. Без героизма.
+""",
+    "start_moderate": """🏃 *Кардио: умеренный*
+
+Фундамент стабилен — добавляем интенсивность.
+📅 8 недель.
+""",
+    "start_hiit": """💥 *Запускаем HIIT*
+
+Готовность: ✅ БГС ≤ 1, ✅ сон OK, ✅ база кардио.
+📅 8 недель.
+""",
+    "walking_week_1": """🚶 *Кардио — неделя 1*
+
+📏 20 мин × 5 дней/нед
+Темп: «могу разговаривать»
+""",
+    "walking_week_3": """🚶 *Кардио — неделя 3*
+
+📏 30 мин × 5 дней
++ горка или лестница 2р/нед
+""",
+    "walking_week_5": """🚶 *Кардио — неделя 5*
+
+📏 30 мин × 5 дней, 10 мин — быстро
+
+📌 Через неделю — контрольная точка.
+""",
+    "moderate_week_1": """🏃 *Кардио умеренный — неделя 1*
+
+30 мин: 3 мин быстро → 2 мин медленно × 6
+3р/нед + ходьба 2р/нед
+""",
+    "moderate_week_5": """🏃 *Кардио умеренный — неделя 5*
+
+Бег/плавание/вело: 20 мин × 2р/нед
++ ходьба 30 мин × 3р/нед
+
+Пульс: 130-150 (или «могу говорить, но не хочу»)
+""",
+    "hiit_week_1": """💥 *HIIT — неделя 1*
+
+30с максимум → 90с отдых × 8 раундов
+2р/нед + кардио 30 мин × 2р/нед
+⚠️ Разминка 5 мин обязательна!
+""",
+    "hiit_week_7": """💥 *HIIT — неделя 7*
+Пиковая нагрузка — 4×4:
+
+4 мин на 85-95% макс. ЧСС → 3 мин отдых × 4
+3р/нед
+
+📌 Повтор VO2max теста на следующей неделе!
+""",
+}
+
+DETOX_PROTOCOL_TEXTS = {
+    "suggest": """💡 *Рекомендация: лёгкий детокс*
+
+📅 21 день. Мягко, без голодания.
+Сорбенты + вода + клетчатка + ванны.
+""",
+    "week_1": """🧹 *Детокс — неделя 1*
+
+💧 Вода 2-2.5л/день
+💊 Энтеросгель 1 ч.л. × 2р/день (за 1ч до еды)
+🥗 Льняное семя + зелёные овощи
+
+⚠️ Лекарства — за 2ч до/после сорбентов!
+""",
+    "week_2": """🧹 *Детокс — неделя 2*
+
+Всё из прошлой + добавляем:
+🪥 Сухая щётка утром 5 мин (лимфодренаж)
+💊 B-комплекс утром
+""",
+    "week_3": """🧹 *Детокс — неделя 3*
+Мягкий выход
+
+Сорбенты — через день
+Остальное продолжаем
+
+📌 Через 4 дня — оценка.
+""",
+    "finish": """🧹 *Детокс завершён!* 💚
+
+21 день — молодец!
+""",
+}
+
+# Словарь всех текстов протоколов
+ALL_PROTOCOL_TEXTS = {
+    "sleep": SLEEP_PROTOCOL_TEXTS,
+    "stress": STRESS_PROTOCOL_TEXTS,
+    "bgs_recovery": BGS_PROTOCOL_TEXTS,
+    "vo2max_walking": VO2MAX_PROTOCOL_TEXTS,
+    "vo2max_moderate": VO2MAX_PROTOCOL_TEXTS,
+    "vo2max_hiit": VO2MAX_PROTOCOL_TEXTS,
+    "detox": DETOX_PROTOCOL_TEXTS,
+}
+
+ROADMAP_MOTIVATION_TIPS = [
+    "💡 Результаты по сну обычно заметны через 3-4 недели.",
+    "💡 Даже 5 мин дыхания в день снижают кортизол на 15%.",
+    "💡 Каждая единица VO2max ≈ 6 месяцев жизни.",
+    "💡 HRV растёт на 10-15% за 8 недель coherence-дыхания.",
+    "💡 80% результата — от 20% действий.",
+    "💡 Перерыв — не провал. Организм не обнуляется за неделю.",
+    "💡 Ходьба 30 мин/день снижает смертность на 20%.",
+]
+
+ROADMAP_CHECKIN_QUESTIONS = {
+    'sleep': "Как со сном на этой неделе?",
+    'stress': "Как ощущается уровень стресса?",
+    'bgs_recovery': "Как энергия — есть улучшение?",
+    'detox': "Как переносишь детокс?",
+    'vo2max_walking': "Как идут тренировки?",
+    'vo2max_moderate': "Как идут тренировки?",
+    'vo2max_hiit': "Как идут тренировки?",
+    'cognitive_training': "Замечаешь изменения в фокусе?",
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# ШАГ 4: ЭКРАН "МОЙ МАРШРУТ" + ХЭНДЛЕРЫ
+# ═══════════════════════════════════════════════════════════════
+
+
+def get_roadmap_dashboard_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура дашборда маршрута."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 GAP-анализ", callback_data="roadmap_gap")],
+        [InlineKeyboardButton(text="📅 План на этот месяц", callback_data="roadmap_month")],
+        [InlineKeyboardButton(text="📈 Динамика", callback_data="roadmap_dynamics")],
+        [InlineKeyboardButton(text="⏸️ Пауза", callback_data="roadmap_pause"),
+         InlineKeyboardButton(text="🔄 Пересмотр", callback_data="roadmap_regenerate")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_progress")],
+    ])
+
+
+@router.callback_query(F.data == "roadmap_menu")
+async def roadmap_menu_handler(callback: CallbackQuery):
+    """Экран '🗺️ Мой маршрут' — главный дашборд."""
+    await callback.answer()
+
+    telegram_id = callback.from_user.id
+    state = await get_roadmap_state(telegram_id)
+
+    # Маршрут не построен
+    if not state or state.get("status") in (None, "not_started"):
+        # Проверяем есть ли минимум тестов
+        data = await collect_summary_data(telegram_id)
+        all_done = data.get("all_tests_done", False)
+
+        if all_done:
+            await callback.message.answer(
+                ROADMAP_NOT_GENERATED_TEXT + "\nНо тесты пройдены — можем построить!",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🗺️ Построить маршрут", callback_data="roadmap_generate")],
+                    [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_progress")],
+                ])
+            )
+        else:
+            tests_done = data.get("tests_completed", 0)
+            tests_total = data.get("tests_total", 4)
+            await callback.message.answer(
+                f"🗺️ Маршрут ещё не построен.\n\n"
+                f"Пройдено тестов: {tests_done} из {tests_total}\n"
+                f"Пройди диагностику — и построим план на 12 месяцев.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📋 Продолжить диагностику", callback_data="summary_report")],
+                    [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_progress")],
+                ])
+            )
+        return
+
+    # Маршрут есть — показываем дашборд
+    user = await get_user(telegram_id)
+    name = user.get("name", "друг") if user else "друг"
+    passport_age = user.get("exact_age", 45) if user else 45
+
+    roadmap_json = state.get("roadmap_json", "{}")
+    try:
+        roadmap = json.loads(roadmap_json) if isinstance(roadmap_json, str) else roadmap_json
+    except Exception:
+        roadmap = {}
+
+    current_block = state.get("current_block", "sleep")
+    current_intensity = state.get("current_intensity", "light")
+    block_week = state.get("block_week", 1)
+    month_number = state.get("month_number", 1)
+    bio_age_start = state.get("start_bio_age") or passport_age
+    current_quarter = state.get("current_quarter", 1)
+
+    # Текущий биовозраст
+    data = await collect_summary_data(telegram_id)
+    summary = calculate_summary_bio_age(passport_age, data)
+    bio_age_current = summary.get("bio_age", passport_age)
+
+    delta = bio_age_start - bio_age_current
+    delta_text = f"−{delta:.1f}" if delta > 0 else (f"+{abs(delta):.1f}" if delta < 0 else "без изменений")
+
+    # Протокол
+    proto = ROADMAP_PROTOCOLS.get(current_block, {})
+    total_weeks = proto.get("duration_weeks", {}).get(current_intensity, 6)
+    if isinstance(total_weeks, dict):
+        total_weeks = list(total_weeks.values())[0] if total_weeks else 6
+
+    # GAP бары
+    gaps = await calculate_roadmap_gaps(telegram_id)
+    old_gaps_json = state.get("start_gaps_json", "{}")
+    try:
+        old_gaps = json.loads(old_gaps_json) if isinstance(old_gaps_json, str) else {}
+    except Exception:
+        old_gaps = {}
+    gap_bars = format_gap_bars(gaps, old_gaps) if gaps else "Нет данных"
+
+    # Квартальные статусы
+    def q_icon(q_num):
+        if q_num < current_quarter:
+            return "✅"
+        elif q_num == current_quarter:
+            return "🔄"
+        return "⏳"
+
+    text = ROADMAP_DASHBOARD_TEXT.format(
+        month=month_number,
+        bio_age_start=bio_age_start,
+        bio_age_current=bio_age_current,
+        delta_text=delta_text,
+        current_block_emoji=_get_protocol_emoji(current_block),
+        current_block_name=_get_protocol_name(current_block),
+        week=block_week,
+        total_weeks=total_weeks,
+        current_block_short_status=state.get("status", "active"),
+        gap_bars=gap_bars,
+        q1_icon=q_icon(1), q1_text=_format_quarter_summary(roadmap.get("q1", []), 1),
+        q2_icon=q_icon(2), q2_text=_format_quarter_summary(roadmap.get("q2", []), 2),
+        q3_icon=q_icon(3), q3_text=_format_quarter_summary(roadmap.get("q3", []), 3),
+        q4_icon=q_icon(4), q4_text=_format_quarter_summary(roadmap.get("q4", []), 4),
+        next_checkpoint_text=f"📌 Следующий пересмотр через ~{30 - (month_number % 1) * 30:.0f} дней" if month_number else "",
+    )
+
+    await callback.message.answer(
+        text, parse_mode="Markdown",
+        reply_markup=get_roadmap_dashboard_keyboard()
+    )
+
+
+@router.callback_query(F.data == "roadmap_generate")
+async def roadmap_generate_handler(callback: CallbackQuery):
+    """Генерация маршрута по кнопке '🗺️ Построить маршрут'."""
+    await callback.answer("🗺️ Строю маршрут...")
+
+    telegram_id = callback.from_user.id
+    user = await get_user(telegram_id)
+    name = user.get("name", "друг") if user else "друг"
+
+    # ═══ Проверяем: заполнены ли лекарства? (спрашиваем один раз) ═══
+    medications = user.get("medications") if user else None
+    meds_asked = user.get("medications_asked") if user else None
+    if medications is None and not meds_asked:
+        # Ещё не спрашивали — спрашиваем
+        await save_user(telegram_id, {"medications_asked": "1"})
+        await callback.message.answer(
+            "💊 *Перед построением маршрута — один вопрос:*\n\n"
+            "Принимаешь ли лекарства на постоянной основе?\n"
+            "Это нужно для проверки совместимости с добавками.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💊 Да, принимаю", callback_data="meds_before_roadmap_yes")],
+                [InlineKeyboardButton(text="✅ Не принимаю", callback_data="meds_before_roadmap_no")],
+            ])
+        )
+        return
+    # ═══ END проверка лекарств ═══
+
+    result = await generate_roadmap(telegram_id)
+
+    if not result:
+        await callback.message.answer(
+            "⚠️ Не удалось построить маршрут. Проверь, пройдены ли все тесты.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Диагностика", callback_data="summary_report")],
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")],
+            ])
+        )
+        return
+
+    roadmap = result["roadmap"]
+    gaps = result["gaps"]
+
+    text = ROADMAP_WELCOME_TEXT.format(
+        name=name,
+        top_gaps=_format_top_gaps(gaps),
+        q1_summary=_format_quarter_summary(roadmap.get("q1", []), 1),
+        q2_summary=_format_quarter_summary(roadmap.get("q2", []), 2),
+        q3_summary=_format_quarter_summary(roadmap.get("q3", []), 3),
+        q4_summary=_format_quarter_summary(roadmap.get("q4", []), 4),
+        target_years=result.get("target_years", 2.0),
+    )
+
+    await callback.message.answer(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Подробный план", callback_data="roadmap_month")],
+            [InlineKeyboardButton(text="📊 Мой GAP-анализ", callback_data="roadmap_gap")],
+            [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")],
+        ])
+    )
+
+    # ═══ ЛЕКАРСТВА: Показываем предупреждения если есть ═══
+    med_warnings = result.get("medication_warnings", [])
+    if med_warnings:
+        warn_text = "⚠️ *Важно: совместимость с лекарствами*\n\n"
+        for w in med_warnings[:5]:
+            warn_text += f"{w.get('warning_text', '')}\n\n"
+        warn_text += "💊 Добавки подобраны по протоколу.\nЭто НЕ медицинское назначение.\nПеред приёмом — уточни у врача."
+        await callback.message.answer(warn_text, parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "roadmap_gap")
+async def roadmap_gap_handler(callback: CallbackQuery):
+    """Детальный GAP-анализ."""
+    await callback.answer()
+
+    telegram_id = callback.from_user.id
+    gaps = await calculate_roadmap_gaps(telegram_id)
+
+    if not gaps:
+        await callback.message.answer("⚠️ Нет данных для GAP-анализа. Пройди тесты.")
+        return
+
+    state = await get_roadmap_state(telegram_id)
+    old_gaps = {}
+    if state:
+        try:
+            old_gaps = json.loads(state.get("start_gaps_json", "{}"))
+        except Exception:
+            pass
+
+    # Детальные строки
+    gap_config = [
+        ("sleep", "😴", "Сон и циркадка"),
+        ("stress", "🧘", "Стресс"),
+        ("hpa", "⚡", "Надпочечники"),
+        ("vo2max", "🏃", "Кардио (VO2max)"),
+        ("hrv", "💓", "Автономка (HRV)"),
+        ("genetics", "🧬", "Генетика"),
+    ]
+    detail_lines = []
+    for key, emoji, label in gap_config:
+        val = gaps.get(key)
+        if val is None:
+            detail_lines.append(f"{emoji} *{label}: нет данных*")
+        else:
+            old_val = old_gaps.get(key)
+            delta_str = ""
+            if old_val is not None and isinstance(old_val, (int, float)):
+                change = old_val - val
+                if abs(change) > 0.2:
+                    delta_str = f"\n   Было: +{old_val:.1f} → Стало: +{val:.1f} {'✅' if change > 0 else '⚠️'} {'+' if change < 0 else '−'}{abs(change):.1f}"
+            detail_lines.append(f"{emoji} *{label}: +{val:.1f} года*{delta_str}")
+
+    completeness = int(gaps.get("data_completeness", 0) * 100)
+    missing_note = ""
+    if gaps.get("vo2max") is None:
+        missing_note += "\n🏃 VO2max не замерен — замерь для точности"
+    if gaps.get("hrv") is None:
+        missing_note += "\n💓 HRV не замерен"
+
+    text = ROADMAP_GAP_DETAIL_TEXT.format(
+        gap_details="\n\n".join(detail_lines),
+        completeness=completeness,
+        missing_data_note=missing_note,
+    )
+
+    await callback.message.answer(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗺️ К маршруту", callback_data="roadmap_menu")],
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "roadmap_month")
+async def roadmap_month_handler(callback: CallbackQuery):
+    """План на текущий месяц."""
+    await callback.answer()
+
+    telegram_id = callback.from_user.id
+    state = await get_roadmap_state(telegram_id)
+
+    if not state or state.get("status") in (None, "not_started"):
+        await callback.message.answer(
+            "🗺️ Сначала построй маршрут.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗺️ Построить маршрут", callback_data="roadmap_generate")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="roadmap_menu")],
+            ])
+        )
+        return
+
+    current_block = state.get("current_block", "sleep")
+    current_intensity = state.get("current_intensity", "light")
+    block_week = state.get("block_week", 1)
+    month_number = state.get("month_number", 1)
+
+    proto = ROADMAP_PROTOCOLS.get(current_block, {})
+    total_weeks_map = proto.get("duration_weeks", {})
+    total_weeks = total_weeks_map.get(current_intensity, 6)
+    if isinstance(total_weeks, dict):
+        total_weeks = list(total_weeks.values())[0] if total_weeks else 6
+
+    # Получаем текст протокола для текущей недели
+    texts = ALL_PROTOCOL_TEXTS.get(current_block, {})
+    week_key = f"{current_intensity}_week_{block_week}"
+    week_text = texts.get(week_key)
+    if not week_text:
+        # Попробуем без intensity
+        week_key_simple = f"week_{block_week}"
+        week_text = texts.get(week_key_simple)
+    if not week_text:
+        # Попробуем start текст
+        if block_week == 1:
+            start_key = f"start_{current_intensity}" if current_block == "bgs_recovery" else "start"
+            week_text = texts.get(start_key, "")
+            gaps = await calculate_roadmap_gaps(telegram_id)
+            gap_val = gaps.get(proto.get("gap_key", ""), 0) if gaps else 0
+            week_text = week_text.format(gap=gap_val, weeks=total_weeks) if week_text else ""
+
+    # Формируем текст
+    import random
+    tip = random.choice(ROADMAP_MOTIVATION_TIPS)
+
+    checkpoint_note = ""
+    if block_week >= total_weeks - 1:
+        checkpoint_note = "📌 Контрольная точка близко — скоро пересдача тестов."
+
+    # ═══ ЛЕКАРСТВА: предупреждения по заблокированным добавкам ═══
+    try:
+        roadmap_json = state.get("roadmap_json", "{}")
+        roadmap_data = json.loads(roadmap_json) if isinstance(roadmap_json, str) else (roadmap_json or {})
+        current_q = f"q{state.get('current_quarter', 1)}"
+        supp_display_map = {
+            "ashwagandha": "Ашваганда", "magnesium": "Магний",
+            "nac": "NAC", "methylfolate": "Метилфолат",
+            "omega3": "Омега-3", "berberine": "Берберин",
+            "l_theanine": "L-теанин",
+        }
+        for block_item in roadmap_data.get(current_q, []):
+            if block_item.get("protocol") == current_block:
+                blocked = block_item.get("blocked_supplements", [])
+                if blocked and week_text:
+                    for supp_key in blocked:
+                        supp_name = supp_display_map.get(supp_key, supp_key)
+                        if supp_name.lower() in week_text.lower():
+                            week_text += f"\n\n⚠️ {supp_name} исключён из-за лекарств."
+                break
+    except Exception:
+        pass
+    # ═══ END ЛЕКАРСТВА ═══
+
+    text = f"""📅 *МЕСЯЦ {month_number} — план*
+
+{_get_protocol_emoji(current_block)} *{_get_protocol_name(current_block)}*
+Неделя {block_week} из {total_weeks}
+
+━━━━━━━━━━━━━━━━━━
+
+{week_text if week_text else f'Продолжай текущий протокол.'}
+
+━━━━━━━━━━━━━━━━━━
+
+{checkpoint_note}
+
+{tip}
+"""
+
+    await callback.message.answer(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗺️ К маршруту", callback_data="roadmap_menu")],
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "roadmap_dynamics")
+async def roadmap_dynamics_handler(callback: CallbackQuery):
+    """Динамика маршрута — текстовый отчёт (графики — в будущем)."""
+    await callback.answer()
+
+    telegram_id = callback.from_user.id
+    state = await get_roadmap_state(telegram_id)
+
+    if not state:
+        await callback.message.answer("🗺️ Маршрут не активен.")
+        return
+
+    history = await get_roadmap_history(telegram_id)
+
+    if not history or len(history) < 1:
+        await callback.message.answer(
+            "📈 Пока мало данных для динамики.\n"
+            "Будет после первого пересмотра (через ~30 дней).",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ К маршруту", callback_data="roadmap_menu")],
+            ])
+        )
+        return
+
+    # Формируем текстовый отчёт
+    lines = ["📈 *Динамика маршрута*\n"]
+    for rec in history[-5:]:
+        rec_dict = dict(rec) if not isinstance(rec, dict) else rec
+        month = rec_dict.get("month_number", "?")
+        action = rec_dict.get("action", "")
+        old_block = rec_dict.get("old_block", "")
+        new_block = rec_dict.get("new_block", "")
+        bio_delta = rec_dict.get("bio_age_delta_from_start")
+
+        action_text = {
+            "continue": "✅ Продолжение",
+            "switch_block": f"🔄 Переход: {_get_protocol_name(old_block)} → {_get_protocol_name(new_block)}",
+            "unlock": "🔓 Разблокировка",
+            "block": "🔒 Блокировка",
+            "suggest_detox": "💡 Предложен детокс",
+        }.get(action, action)
+
+        delta_str = f" (Δ: {bio_delta:+.1f})" if bio_delta is not None else ""
+        lines.append(f"Месяц {month}: {action_text}{delta_str}")
+
+    await callback.message.answer(
+        "\n".join(lines), parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ К маршруту", callback_data="roadmap_menu")],
+        ])
+    )
+
+
+@router.callback_query(F.data.startswith("rm_checkin_"))
+async def roadmap_checkin_response_handler(callback: CallbackQuery):
+    """Обработка ответа на чек-ин маршрута (👍/😐/😩)."""
+    await callback.answer("Принято!")
+
+    response = callback.data.replace("rm_checkin_", "")
+    telegram_id = callback.from_user.id
+
+    # Сохраняем ответ
+    await update_roadmap_state(telegram_id,
+                               last_roadmap_checkin=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    if response == "hard":
+        tip = random.choice(ROADMAP_MOTIVATION_TIPS)
+        await callback.message.answer(
+            f"Понимаю, бывает трудно. Это нормальная часть процесса.\n\n{tip}\n\n"
+            "Если совсем тяжело — можно скорректировать темп.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
+                [InlineKeyboardButton(text="🆘 SOS", callback_data="sos_menu")],
+            ])
+        )
+    elif response == "good":
+        await callback.message.answer(
+            "Отлично! Продолжай в том же духе 💪",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
+            ])
+        )
+    else:  # ok
+        await callback.message.answer(
+            "Принято. Стабильность — тоже результат. Продолжаем 🙂",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
+            ])
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+# ЕЖЕМЕСЯЧНЫЙ ПЕРЕСМОТР МАРШРУТА
+# ═══════════════════════════════════════════════════════════════
+
+async def scheduled_monthly_review(telegram_id: int):
+    """
+    Ежемесячный пересмотр маршрута. Вызывается из scheduler.
+    Пересчитывает GAP, решает continue/switch/unlock/block.
+    """
+    state = await get_roadmap_state(telegram_id)
+    if not state or state.get('status') != 'active':
+        return
+
+    # Пересчитываем GAP
+    new_gaps = await calculate_roadmap_gaps(telegram_id)
+    if not new_gaps:
+        return
+
+    old_gaps_json = state.get("last_gaps_json", "{}")
+    try:
+        old_gaps = json.loads(old_gaps_json) if isinstance(old_gaps_json, str) else {}
+    except Exception:
+        old_gaps = {}
+
+    # Дельта
+    changes = {}
+    for key in ["sleep", "stress", "hpa", "vo2max", "hrv"]:
+        old_v = old_gaps.get(key)
+        new_v = new_gaps.get(key)
+        if old_v is not None and new_v is not None:
+            changes[key] = round(old_v - new_v, 1)
+
+    improved = {k: v for k, v in changes.items() if v > 0.3}
+    worsened = {k: v for k, v in changes.items() if v < -0.3}
+
+    current_block = state.get("current_block", "sleep")
+    current_gap = new_gaps.get(current_block, 0) or 0
+    month_number = (state.get("month_number") or 0) + 1
+    action = "continue"
+    new_block = None
+
+    # Текущий блок достиг цели?
+    if current_gap < 0.5 and current_block != "maintenance":
+        # Ищем следующий блок по GAP
+        actionable = {k: v for k, v in new_gaps.items()
+                      if v is not None and isinstance(v, (int, float)) and v >= 0.5
+                      and k not in ("total", "main_blocker", "data_completeness", "genetics")}
+        if actionable:
+            next_key = max(actionable, key=actionable.get)
+            bgs = await get_bgs_stage(telegram_id)
+            user = await get_user(telegram_id)
+            has_gen = bool(user.get("has_genetics")) if user else False
+            proto = _select_protocol_for_gap(next_key, actionable[next_key], bgs, has_gen)
+            if proto:
+                new_block = proto.get("protocol")
+                action = "switch_block"
+        else:
+            action = "continue"  # Все GAP низкие — поддержание
+
+    # БГС изменилась?
+    new_bgs = await get_bgs_stage(telegram_id)
+    old_bgs = state.get("bgs_at_start", 0) or 0
+    if new_bgs < old_bgs and new_bgs < old_bgs:
+        action = "unlock"
+    elif new_bgs > old_bgs:
+        # Проверяем блокируется ли текущий блок
+        proto_def = ROADMAP_PROTOCOLS.get(current_block, {})
+        bgs_max = proto_def.get("unlock", {}).get("bgs_max")
+        if bgs_max is not None and new_bgs > bgs_max:
+            action = "block"
+
+    # Инкрементируем block_week (+4 за месяц)
+    new_week = (state.get("block_week") or 1) + 4
+    proto_def = ROADMAP_PROTOCOLS.get(current_block, {})
+    total_weeks_map = proto_def.get("duration_weeks", {})
+    intensity = state.get("current_intensity", "standard")
+    total_weeks = total_weeks_map.get(intensity, 8)
+    if isinstance(total_weeks, dict):
+        total_weeks = list(total_weeks.values())[0] if total_weeks else 8
+
+    # Формируем сообщение
+    user = await get_user(telegram_id)
+    name = user.get("name", "друг") if user else "друг"
+
+    if action == "switch_block" and new_block:
+        msg = (
+            f"📊 *МАРШРУТ — пересмотр (месяц {month_number})*\n\n"
+            f"🎯 *{_get_protocol_name(current_block)}: цель достигнута!*\n"
+            f"GAP: {old_gaps.get(current_block, '?'):.1f} → {current_gap:.1f} ✅\n\n"
+            f"Переключаемся:\n"
+            f"{_get_protocol_emoji(new_block)} *{_get_protocol_name(new_block)}*"
+        )
+        await update_roadmap_state(telegram_id,
+                                   current_block=new_block,
+                                   block_week=1,
+                                   block_started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                   month_number=month_number,
+                                   current_quarter=min(4, (month_number - 1) // 3 + 1),
+                                   last_checkpoint_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    elif action == "unlock":
+        msg = (
+            f"📊 *МАРШРУТ — пересмотр (месяц {month_number})*\n\n"
+            f"🔓 *РАЗБЛОКИРОВКА!*\n"
+            f"БГС: стадия {old_bgs} → *{new_bgs}* 🎉\n\n"
+            f"Новые протоколы теперь доступны!"
+        )
+        await update_roadmap_state(telegram_id,
+                                   month_number=month_number,
+                                   block_week=min(new_week, total_weeks),
+                                   last_checkpoint_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    elif action == "block":
+        msg = (
+            f"📊 *МАРШРУТ — пересмотр (месяц {month_number})*\n\n"
+            f"🔒 *Пауза на интенсивных протоколах*\n"
+            f"БГС: стадия {old_bgs} → *{new_bgs}*\n\n"
+            f"Переключаемся на восстановление."
+        )
+        await update_roadmap_state(telegram_id,
+                                   current_block="bgs_recovery",
+                                   current_intensity=f"stage_{new_bgs}",
+                                   block_week=1,
+                                   status="blocked_bgs",
+                                   month_number=month_number,
+                                   last_checkpoint_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    else:
+        # continue
+        improved_lines = ""
+        for k, v in improved.items():
+            gap_name = {"sleep": "😴 Сон", "stress": "🧘 Стресс", "hpa": "⚡ HPA",
+                        "vo2max": "🏃 VO2max", "hrv": "💓 HRV"}.get(k, k)
+            improved_lines += f"✅ {gap_name}: −{v:.1f}\n"
+        worsened_lines = ""
+        for k, v in worsened.items():
+            gap_name = {"sleep": "😴 Сон", "stress": "🧘 Стресс", "hpa": "⚡ HPA",
+                        "vo2max": "🏃 VO2max", "hrv": "💓 HRV"}.get(k, k)
+            worsened_lines += f"⚠️ {gap_name}: +{abs(v):.1f}\n"
+        progress = improved_lines or "📊 Показатели стабильны.\n"
+        tip = random.choice(ROADMAP_MOTIVATION_TIPS)
+        msg = (
+            f"📊 *МАРШРУТ — пересмотр (месяц {month_number})*\n\n"
+            f"{progress}{worsened_lines}\n"
+            f"{_get_protocol_emoji(current_block)} Продолжаем: *{_get_protocol_name(current_block)}*\n\n"
+            f"{tip}\n\n"
+            f"📅 Следующий пересмотр через 30 дней."
+        )
+        await update_roadmap_state(telegram_id,
+                                   month_number=month_number,
+                                   block_week=min(new_week, total_weeks),
+                                   last_checkpoint_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    # Обновляем GAP снимок
+    await update_roadmap_state(telegram_id,
+                               last_gaps_json=json.dumps(new_gaps, ensure_ascii=False),
+                               gaps_updated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    # Сохраняем в историю
+    await save_roadmap_review(telegram_id, new_gaps, changes, action, current_block, new_block)
+
+    # Отправляем
+    try:
+        await bot.send_message(
+            chat_id=telegram_id, text=msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
+                [InlineKeyboardButton(text="📊 GAP-анализ", callback_data="roadmap_gap")],
+            ])
+        )
+    except Exception as e:
+        print(f"❌ monthly review send error {telegram_id}: {e}")
+
+
+async def send_monthly_roadmap_reviews():
+    """
+    Scheduler job: проверяет у кого пора делать ежемесячный пересмотр.
+    Запускается раз в час, отправляет в 10:00 local.
+    """
+    now_utc = datetime.utcnow()
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT rs.telegram_id, rs.last_checkpoint_at, rs.roadmap_generated_at,
+                       rs.status, u.timezone_offset
+                FROM roadmap_state rs
+                JOIN users u ON rs.telegram_id = u.telegram_id
+                WHERE rs.status = 'active'
+            """)
+            users = await cursor.fetchall()
+
+        for user in users:
+            try:
+                tid = user['telegram_id']
+                offset = user['timezone_offset'] or 3
+                user_now = now_utc + timedelta(hours=offset)
+
+                # Только в 10:00 local
+                if user_now.hour != 10 or user_now.minute != 0:
+                    continue
+
+                # Прошло ли 30 дней с последнего пересмотра?
+                last_cp = user['last_checkpoint_at'] or user['roadmap_generated_at']
+                if last_cp:
+                    try:
+                        last_dt = datetime.fromisoformat(str(last_cp).replace("Z", "").split("+")[0])
+                        days = (datetime.now() - last_dt).days
+                        if days < 28:
+                            continue
+                    except Exception:
+                        continue
+                else:
+                    continue
+
+                await scheduled_monthly_review(tid)
+                print(f"✅ Monthly review: {tid}")
+            except Exception as e:
+                print(f"❌ Monthly review error {user.get('telegram_id')}: {e}")
+    except Exception as e:
+        print(f"❌ send_monthly_roadmap_reviews error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# MEDICATION INPUT — Ввод лекарств пользователем
+# ═══════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "meds_before_roadmap_no")
+async def meds_before_roadmap_no_handler(callback: CallbackQuery):
+    """Не принимает лекарств — сразу генерируем маршрут."""
+    await callback.answer()
+    await save_user(callback.from_user.id, {"medications": "", "chronic_conditions": ""})
+    # Перенаправляем на генерацию
+    await roadmap_generate_handler(callback)
+
+
+@router.callback_query(F.data == "meds_before_roadmap_yes")
+async def meds_before_roadmap_yes_handler(callback: CallbackQuery, state: FSMContext):
+    """Принимает лекарства — запрашиваем, потом генерируем."""
+    await callback.answer()
+    await state.set_state("waiting_medications_text")
+    await state.update_data(after_meds="roadmap_generate")
+    await callback.message.answer(
+        "📝 Напиши названия лекарств, которые принимаешь.\n\n"
+        "Например: _Л-тироксин, Эналаприл, Сертралин_",
+        parse_mode="Markdown",
+    )
+
+
+@router.callback_query(F.data == "medications_input")
+async def medications_input_handler(callback: CallbackQuery, state: FSMContext):
+    """Начало ввода лекарств."""
+    await callback.answer()
+    await callback.message.answer(
+        "💊 *Принимаешь ли ты лекарства на постоянной основе?*\n\n"
+        "Это нужно, чтобы проверить совместимость с добавками в маршруте.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💊 Да, принимаю", callback_data="medications_yes")],
+            [InlineKeyboardButton(text="✅ Не принимаю", callback_data="medications_no")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="settings")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "medications_no")
+async def medications_no_handler(callback: CallbackQuery):
+    """Пользователь не принимает лекарств."""
+    await callback.answer()
+    await save_user(callback.from_user.id, {"medications": "", "chronic_conditions": ""})
+    await callback.message.answer(
+        "✅ Отлично, учту. Все добавки доступны без ограничений.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "medications_yes")
+async def medications_yes_handler(callback: CallbackQuery, state: FSMContext):
+    """Пользователь принимает лекарства — запрашиваем список."""
+    await callback.answer()
+    await state.set_state("waiting_medications_text")
+    await callback.message.answer(
+        "📝 Напиши названия лекарств, которые принимаешь.\n\n"
+        "Например: _Л-тироксин, Эналаприл, Сертралин_\n\n"
+        "Это нужно для проверки совместимости с добавками.",
+        parse_mode="Markdown",
+    )
+
+
+@router.message(F.text, StateFilter("waiting_medications_text"))
+async def medications_text_receiver(message, state: FSMContext):
+    """Ловит текст лекарств в правильном состоянии FSM."""
+    meds = message.text.strip()
+    await save_user(message.from_user.id, {"medications": meds})
+    await state.set_state("waiting_conditions_text")
+
+    # Проверяем: нужно ли после лекарств генерировать маршрут?
+    data = await state.get_data()
+    after_meds = data.get("after_meds")
+
+    await message.answer(
+        f"💊 Записала: _{meds}_\n\n"
+        "Есть ли хронические заболевания?\n"
+        "(гипотиреоз, диабет, гипертония и т.д.)",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Нет", callback_data="conditions_no")],
+        ])
+    )
+
+
+@router.message(F.text, StateFilter("waiting_conditions_text"))
+async def conditions_text_receiver(message, state: FSMContext):
+    """Ловит текст хронических заболеваний."""
+    conds = message.text.strip()
+    tid = message.from_user.id
+    await save_user(tid, {"chronic_conditions": conds})
+
+    data = await state.get_data()
+    after_meds = data.get("after_meds")
+    await state.clear()
+
+    if after_meds == "roadmap_generate":
+        await message.answer(
+            f"✅ Записала: _{conds}_\n\n🗺️ Строю маршрут с учётом лекарств...",
+            parse_mode="Markdown",
+        )
+        # Генерируем маршрут
+        result = await generate_roadmap(tid)
+        if result:
+            user = await get_user(tid)
+            name = user.get("name", "друг") if user else "друг"
+            roadmap = result["roadmap"]
+            gaps = result["gaps"]
+            text = ROADMAP_WELCOME_TEXT.format(
+                name=name,
+                top_gaps=_format_top_gaps(gaps),
+                q1_summary=_format_quarter_summary(roadmap.get("q1", []), 1),
+                q2_summary=_format_quarter_summary(roadmap.get("q2", []), 2),
+                q3_summary=_format_quarter_summary(roadmap.get("q3", []), 3),
+                q4_summary=_format_quarter_summary(roadmap.get("q4", []), 4),
+                target_years=result.get("target_years", 2.0),
+            )
+            await message.answer(
+                text, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📋 Подробный план", callback_data="roadmap_month")],
+                    [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
+                ])
+            )
+            med_warnings = result.get("medication_warnings", [])
+            if med_warnings:
+                warn_text = "⚠️ *Важно: совместимость с лекарствами*\n\n"
+                for w in med_warnings[:5]:
+                    warn_text += f"{w.get('warning_text', '')}\n\n"
+                warn_text += "💊 Это НЕ медицинское назначение. Уточни у врача."
+                await message.answer(warn_text, parse_mode="Markdown")
+        else:
+            await message.answer("⚠️ Не удалось построить маршрут.")
+    else:
+        await message.answer(
+            f"✅ Записала: _{conds}_\n\n"
+            "При построении маршрута проверю совместимость добавок с твоими лекарствами.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")],
+            ])
+        )
+
+
+@router.callback_query(F.data == "conditions_no")
+async def conditions_no_handler(callback: CallbackQuery, state: FSMContext):
+    """Нет хронических заболеваний."""
+    await callback.answer()
+    tid = callback.from_user.id
+    await save_user(tid, {"chronic_conditions": ""})
+
+    data = await state.get_data()
+    after_meds = data.get("after_meds")
+    await state.clear()
+
+    if after_meds == "roadmap_generate":
+        await callback.message.answer("🗺️ Строю маршрут с учётом лекарств...")
+        result = await generate_roadmap(tid)
+        if result:
+            user = await get_user(tid)
+            name = user.get("name", "друг") if user else "друг"
+            roadmap = result["roadmap"]
+            gaps = result["gaps"]
+            text = ROADMAP_WELCOME_TEXT.format(
+                name=name,
+                top_gaps=_format_top_gaps(gaps),
+                q1_summary=_format_quarter_summary(roadmap.get("q1", []), 1),
+                q2_summary=_format_quarter_summary(roadmap.get("q2", []), 2),
+                q3_summary=_format_quarter_summary(roadmap.get("q3", []), 3),
+                q4_summary=_format_quarter_summary(roadmap.get("q4", []), 4),
+                target_years=result.get("target_years", 2.0),
+            )
+            await callback.message.answer(
+                text, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📋 Подробный план", callback_data="roadmap_month")],
+                    [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
+                ])
+            )
+            med_warnings = result.get("medication_warnings", [])
+            if med_warnings:
+                warn_text = "⚠️ *Совместимость с лекарствами:*\n\n"
+                for w in med_warnings[:5]:
+                    warn_text += f"{w.get('warning_text', '')}\n\n"
+                await callback.message.answer(warn_text, parse_mode="Markdown")
+        else:
+            await callback.message.answer("⚠️ Не удалось построить маршрут.")
+    else:
+        await callback.message.answer(
+            "✅ Учтено. Проверю совместимость лекарств с добавками при построении маршрута.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")],
+            ])
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+# EDGE CASES: ПАУЗА, ВОЗОБНОВЛЕНИЕ, АВТОПАУЗА
+# ═══════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "roadmap_pause")
+async def roadmap_pause_handler(callback: CallbackQuery):
+    """Пользователь ставит маршрут на паузу."""
+    await callback.answer()
+    await update_roadmap_state(
+        callback.from_user.id,
+        status="paused_user",
+        paused_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        pause_reason="user_request"
+    )
+    await callback.message.answer(
+        "⏸️ Маршрут на паузе.\n\n"
+        "Прогресс сохранён. Когда будешь готов(а) — возобнови.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Возобновить", callback_data="roadmap_resume")],
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "roadmap_resume")
+async def roadmap_resume_handler(callback: CallbackQuery):
+    """Возобновление маршрута с паузы."""
+    await callback.answer()
+    state = await get_roadmap_state(callback.from_user.id)
+    if not state:
+        await callback.message.answer("🗺️ Маршрут не найден.")
+        return
+
+    old_status = state.get("status", "")
+
+    # Если пауза была долгой (>14 дней) — мини-пересмотр
+    paused_at = state.get("paused_at")
+    long_pause = False
+    if paused_at:
+        try:
+            pause_dt = datetime.fromisoformat(str(paused_at).replace("Z", "").split("+")[0])
+            days_paused = (datetime.now() - pause_dt).days
+            long_pause = days_paused > 14
+        except Exception:
+            pass
+
+    await update_roadmap_state(
+        callback.from_user.id,
+        status="active",
+        resumed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        last_interaction_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+    block = state.get("current_block", "sleep")
+    week = state.get("block_week", 1)
+
+    if long_pause:
+        await callback.message.answer(
+            f"▶️ *Маршрут возобновлён!*\n\n"
+            f"Тебя не было больше 2 недель.\n"
+            f"Продолжаем: {_get_protocol_emoji(block)} *{_get_protocol_name(block)}* — неделя {week}\n\n"
+            f"Рекомендую пересдать тесты для актуальных данных.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
+                [InlineKeyboardButton(text="🧪 Пересдать тесты", callback_data="menu_diagnosis")],
+            ])
+        )
+    else:
+        await callback.message.answer(
+            f"▶️ *Маршрут возобновлён!*\n\n"
+            f"{_get_protocol_emoji(block)} *{_get_protocol_name(block)}* — неделя {week}\n"
+            f"Продолжаем с того же места.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
+            ])
+        )
+
+
+@router.callback_query(F.data == "roadmap_regenerate")
+async def roadmap_regenerate_handler(callback: CallbackQuery):
+    """Пересгенерировать маршрут."""
+    await callback.answer()
+    await callback.message.answer(
+        "🔄 *Пересгенерировать маршрут?*\n\n"
+        "Текущий маршрут уйдёт в архив.\nПрогресс и история сохранятся.\n"
+        "Новый маршрут построится по актуальным данным.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, новый маршрут", callback_data="roadmap_confirm_regen")],
+            [InlineKeyboardButton(text="❌ Оставить текущий", callback_data="roadmap_menu")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "roadmap_confirm_regen")
+async def roadmap_confirm_regen_handler(callback: CallbackQuery):
+    """Подтверждение пересгенерации."""
+    await callback.answer("🔄 Генерирую новый маршрут...")
+    tid = callback.from_user.id
+
+    # Архивируем старый
+    await update_roadmap_state(tid, status="archived")
+
+    # Генерируем новый
+    result = await generate_roadmap(tid)
+    if result:
+        user = await get_user(tid)
+        name = user.get("name", "друг") if user else "друг"
+        await callback.message.answer(
+            f"✅ *{name}, новый маршрут готов!*\n\n"
+            f"Старый — в архиве. Прогресс сохранён.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
+            ])
+        )
+    else:
+        await callback.message.answer("⚠️ Не удалось — проверь, пройдены ли тесты.")
+
+
+async def check_roadmap_auto_pause():
+    """
+    Edge case: автопауза при неактивности 7-14 дней.
+    Вызывается из scheduler (раз в час).
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT rs.telegram_id, rs.status, u.name
+                FROM roadmap_state rs
+                JOIN users u ON rs.telegram_id = u.telegram_id
+                WHERE rs.status = 'active'
+            """)
+            users = await cursor.fetchall()
+
+        for user in users:
+            try:
+                tid = user['telegram_id']
+                # Проверяем последнее взаимодействие
+                async with aiosqlite.connect(DB_PATH) as db:
+                    db.row_factory = aiosqlite.Row
+                    row = await (await db.execute(
+                        "SELECT MAX(date) as last FROM daily_checkins WHERE telegram_id = ?",
+                        (tid,)
+                    )).fetchone()
+
+                last_date = row['last'] if row and row['last'] else None
+                if not last_date:
+                    continue
+
+                try:
+                    days_since = (date.today() - date.fromisoformat(str(last_date)[:10])).days
+                except Exception:
+                    continue
+
+                if 7 <= days_since <= 14:
+                    # Автопауза
+                    await update_roadmap_state(tid,
+                                               status="paused_auto",
+                                               paused_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                               pause_reason="inactivity")
+                    name = user['name'] or 'друг'
+                    try:
+                        state = await get_roadmap_state(tid)
+                        block = state.get("current_block", "sleep") if state else "sleep"
+                        week = state.get("block_week", 1) if state else 1
+                        await bot.send_message(
+                            chat_id=tid,
+                            text=(
+                                f"⏸️ *{name}, маршрут на паузе.*\n\n"
+                                f"Тебя не было {days_since} дней — ничего страшного.\n"
+                                f"Ты на {_get_protocol_emoji(block)} {_get_protocol_name(block)}, неделя {week}.\n\n"
+                                f"Когда будешь готов(а) — нажми «Продолжить»."
+                            ),
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="▶️ Продолжить", callback_data="roadmap_resume")],
+                                [InlineKeyboardButton(text="🔄 Пересмотреть маршрут", callback_data="roadmap_regenerate")],
+                                [InlineKeyboardButton(text="⏸️ Оставить на паузе", callback_data="roadmap_keep_paused")],
+                            ])
+                        )
+                    except Exception:
+                        pass
+                    print(f"⏸️ Auto-pause roadmap: {tid} ({days_since} days)")
+
+                elif days_since > 30:
+                    # Архивация
+                    await update_roadmap_state(tid, status="archived",
+                                               pause_reason="abandoned_30d")
+                    print(f"📦 Archived roadmap: {tid} ({days_since} days)")
+
+            except Exception as e:
+                print(f"❌ auto_pause error {user.get('telegram_id')}: {e}")
+    except Exception as e:
+        print(f"❌ check_roadmap_auto_pause error: {e}")
+
+
+@router.callback_query(F.data == "roadmap_keep_paused")
+async def roadmap_keep_paused_handler(callback: CallbackQuery):
+    """Оставить маршрут на паузе."""
+    await callback.answer("⏸️ Хорошо, маршрут ждёт.")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+
+# ═══════════════════════════════════════════════════════════════
 # ПОПРАВКИ #96-102: НОВЫЕ БЛОКИ ДЛЯ КАРТЫ СОСТОЯНИЯ
 # ═══════════════════════════════════════════════════════════════
 
@@ -62154,6 +69023,12 @@ async def sleep_test_start(callback: CallbackQuery, state: FSMContext):
     """Начало теста качества сна"""
     await callback.answer()
     
+    # Проверка доступа PRO
+    access = await check_pro_test_access(callback.from_user.id, "sleep_test_start")
+    if not access['allowed']:
+        await show_test_locked(callback, access)
+        return
+    
     user = await get_user(callback.from_user.id)
     name = user.get("name", "друг") if user else "друг"
     
@@ -63384,6 +70259,13 @@ async def ahs_test_menu(callback: CallbackQuery, state: FSMContext):
 async def ahs_test_start(callback: CallbackQuery, state: FSMContext):
     """Начало теста БГС"""
     await callback.answer()
+    
+    # Проверка доступа PRO
+    access = await check_pro_test_access(callback.from_user.id, "ahs_test_start")
+    if not access['allowed']:
+        await show_test_locked(callback, access)
+        return
+    
     await state.clear()
     
     text = AHS_QUESTIONS[1]['text']
@@ -63500,7 +70382,7 @@ _Стадия {hpa_stage}: {hpa_stage_name}_
     
     # ПОПРАВКА #126: Переименован в "Тест Состояний"
     buttons = [
-        [InlineKeyboardButton(text="➡️ Тест Состояний (6 вопросов)", callback_data="syndrome_questions_start")]
+        [InlineKeyboardButton(text="➡️ Тест Состояний (4 вопроса)", callback_data="syndrome_questions_start")]
     ]
     
     await callback.message.edit_text(
@@ -64692,6 +71574,11 @@ async def show_analysis_chart(callback: CallbackQuery):
 async def supplements_menu(callback: CallbackQuery):
     """Главное меню добавок"""
     await callback.answer()
+    
+    # ═══ PRO-ГЕЙТ: Добавки ═══
+    if not await require_pro(callback, "vitamins_basic"):
+        return
+    # ═══ END PRO-ГЕЙТ ═══
     
     user = await get_user(callback.from_user.id)
     name = user.get("name", "друг") if user else "друг"
@@ -67226,8 +74113,20 @@ def generate_bio_age_dynamics_text(history: list, current: dict, name: str) -> s
                 emoji = "🎉"
                 status = "Омоложение!"
             elif change > 1:
-                emoji = "⚠️"
-                status = "Ускорение старения"
+                # GAP-контекст вместо паники
+                last_passport = last.get('passport_age', 40)
+                last_bio = last['bio_age_combined']
+                last_gap = last_bio - last_passport
+                
+                if last_gap < 0:
+                    emoji = "📊"
+                    status = f"Колебание (всё ещё –{abs(last_gap):.1f} от паспорта)"
+                elif first.get('bio_age_combined') and last_bio <= first['bio_age_combined']:
+                    emoji = "📊"
+                    status = "Небольшой откат, но лучше старта"
+                else:
+                    emoji = "⚠️"
+                    status = "Требует внимания"
             else:
                 emoji = "➖"
                 status = "Стабильно"
@@ -67240,6 +74139,554 @@ def generate_bio_age_dynamics_text(history: list, current: dict, name: str) -> s
             text += f"   Период: {first_date} → {last_date}\n"
     
     return text
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# ФАЗА 4: МОТИВАЦИЯ ПРИ ОТКАТАХ БИОВОЗРАСТА (GAP-метрика)
+# ═══════════════════════════════════════════════════════════════
+
+def _get_bio_age_val(record: dict):
+    """Извлекает биовозраст из записи"""
+    return record.get('bio_age_combined') or record.get('bio_age_calculated')
+
+
+def _get_gap(record: dict):
+    """Вычисляет GAP = bio_age – passport_age"""
+    bio = _get_bio_age_val(record)
+    passport = record.get('passport_age')
+    if bio is not None and passport:
+        return round(bio - passport, 1)
+    return None
+
+
+def _build_anchors(history: list, curr_gap: float, passport: int, curr_age: float) -> dict:
+    """Собирает якоря с временными окнами"""
+    now = datetime.now()
+    six_months_ago = (now - timedelta(days=180)).isoformat()
+    three_months_ago = (now - timedelta(days=90)).isoformat()
+    
+    first_gap = _get_gap(history[0])
+    
+    recent_gaps = []
+    for h in history:
+        rec_date = h.get('recorded_at', '')
+        if rec_date >= six_months_ago:
+            g = _get_gap(h)
+            if g is not None:
+                recent_gaps.append(g)
+    best_gap_6m = min(recent_gaps) if recent_gaps else None
+    
+    quarter_gap = None
+    for h in history:
+        rec_date = h.get('recorded_at', '')
+        if rec_date <= three_months_ago:
+            g = _get_gap(h)
+            if g is not None:
+                quarter_gap = g
+    
+    return {
+        'curr_gap': curr_gap, 'curr_age': curr_age, 'passport': passport,
+        'first_gap': first_gap, 'best_gap_6m': best_gap_6m, 'quarter_gap': quarter_gap,
+    }
+
+
+def _classify_rollback(a: dict) -> str:
+    """Определяет сценарий отката по GAP"""
+    curr_gap = a['curr_gap']
+    first_gap = a['first_gap']
+    best_gap_6m = a['best_gap_6m']
+    
+    if curr_gap < 0:
+        return "still_younger"
+    had_progress = best_gap_6m is not None and best_gap_6m < curr_gap - 0.5
+    if not had_progress:
+        return "never_improved"
+    if first_gap is not None and curr_gap <= first_gap:
+        return "above_start"
+    return "below_start"
+
+
+def _count_stagnation(history: list) -> int:
+    """Считает последние записи с одинаковым GAP (±0.3)"""
+    if len(history) < 2:
+        return 0
+    latest_gap = _get_gap(history[-1])
+    if latest_gap is None:
+        return 0
+    count = 0
+    for rec in reversed(history[:-1]):
+        g = _get_gap(rec)
+        if g is not None and abs(g - latest_gap) <= 0.3:
+            count += 1
+        else:
+            break
+    return count
+
+
+async def check_bio_age_trend(telegram_id: int) -> dict | None:
+    """Определяет сценарий изменения биовозраста по GAP"""
+    history = await get_bio_age_history(telegram_id, limit=100)
+    if len(history) < 2:
+        return None
+    
+    user = await get_user(telegram_id)
+    name = user.get("name", "друг") if user else "друг"
+    
+    current = history[-1]
+    previous = history[-2]
+    
+    curr_gap = _get_gap(current)
+    prev_gap = _get_gap(previous)
+    curr_age = _get_bio_age_val(current)
+    passport = current.get('passport_age', 40)
+    
+    if curr_gap is None or prev_gap is None:
+        return None
+    
+    gap_change = round(curr_gap - prev_gap, 1)
+    
+    anchors = _build_anchors(history, curr_gap, passport, curr_age)
+    anchors['gap_change'] = gap_change
+    anchors['name'] = name
+    
+    if gap_change <= -0.5:
+        return _build_improvement(anchors)
+    
+    if gap_change >= 0.5:
+        diagnosis = await diagnose_rollback(telegram_id)
+        scenario = _classify_rollback(anchors)
+        return _build_rollback(anchors, scenario, diagnosis)
+    
+    stagnant = _count_stagnation(history)
+    if stagnant >= 4:
+        return await _build_plateau(anchors, stagnant, telegram_id)
+    
+    return None
+
+
+def _build_improvement(a: dict) -> dict:
+    """Сообщение при улучшении GAP"""
+    name = a['name']
+    gap_change = a['gap_change']
+    curr_gap = a['curr_gap']
+    curr_age = a['curr_age']
+    passport = a['passport']
+    first_gap = a['first_gap']
+    best_gap_6m = a['best_gap_6m']
+    quarter_gap = a['quarter_gap']
+    
+    ac = abs(gap_change)
+    if ac >= 2:
+        h = f"🎉 *{name}, WOW!*\n\nРазрыв с паспортом: *–{ac:.1f} лет!*"
+    elif ac >= 1:
+        h = f"🥳 *{name}, отличная динамика!*\n\nGAP: *–{ac:.1f}*"
+    else:
+        h = f"💚 *{name}, есть сдвиг!*\n\nGAP: *–{ac:.1f}*"
+    
+    lines = [f"Биовозраст: *{curr_age:.1f}*, паспортный: *{passport}*"]
+    if curr_gap < 0:
+        lines.append(f"🟢 Ты на *{abs(curr_gap):.1f} лет моложе* паспортного!")
+    elif curr_gap == 0:
+        lines.append("🟡 Ты ровно на паспортном — цель: уйти в минус")
+    
+    if first_gap is not None and curr_gap < first_gap - 0.5:
+        total_gain = round(first_gap - curr_gap, 1)
+        lines.append(f"📈 С начала программы: разрыв улучшился на *{total_gain}*")
+    if quarter_gap is not None and curr_gap < quarter_gap - 0.3:
+        q_gain = round(quarter_gap - curr_gap, 1)
+        lines.append(f"📅 За квартал: *–{q_gain}*")
+    if best_gap_6m is not None and abs(curr_gap - best_gap_6m) < 0.3:
+        lines.append("⭐ Это *лучший результат за полгода!*")
+    
+    text = (
+        f"{h}\n\n" + "\n".join(lines) +
+        "\n\n🔒 *Закрепи результат:*\n"
+        "Продолжай текущий режим — организм\n"
+        "в фазе активного восстановления."
+    )
+    return {
+        "text": text,
+        "reply_markup": InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Динамика", callback_data="bio_age_dynamics")],
+            [InlineKeyboardButton(text="💚 Супер!", callback_data="back_to_menu")],
+        ])
+    }
+
+
+def _build_rollback(a: dict, scenario: str, diagnosis: dict) -> dict:
+    """Формирует сообщение при откате — тон зависит от сценария"""
+    name = a['name']
+    gap_change = a['gap_change']
+    curr_gap = a['curr_gap']
+    curr_age = a['curr_age']
+    passport = a['passport']
+    first_gap = a['first_gap']
+    best_gap_6m = a['best_gap_6m']
+    quarter_gap = a['quarter_gap']
+    causes = diagnosis.get('causes', [])
+    temporary = diagnosis.get('temporary', False)
+    
+    extra = ""
+    if scenario == "still_younger":
+        younger = abs(curr_gap)
+        header = (
+            f"📊 *{name}, небольшое колебание*\n\n"
+            f"GAP чуть сократился (+{gap_change:.1f}),\n"
+            f"но ты всё ещё на *{younger:.1f} лет моложе* паспортного!\n\n"
+            "Это нормальный зигзаг."
+        )
+        if best_gap_6m is not None and curr_gap > best_gap_6m + 1:
+            best_younger = abs(best_gap_6m)
+            extra = f"\n\n⭐ За полгода лучший разрыв был *–{best_younger:.1f}*. Дорога туда знакома."
+    
+    elif scenario == "above_start":
+        total_gain = round(first_gap - curr_gap, 1)
+        header = (
+            f"📊 *{name}, GAP вырос на {gap_change:.1f}*\n\n"
+            f"Но с начала программы ты всё ещё в плюсе:\n"
+            f"было *{first_gap:+.1f}* → сейчас *{curr_gap:+.1f}*\n"
+            f"Разница: *{total_gain:.1f} лет прогресса* сохранено."
+        )
+        if best_gap_6m is not None:
+            extra = (
+                f"\n\n⭐ Лучший результат за полгода: *{best_gap_6m:+.1f}*\n"
+                "Ты уже знаешь, как туда дойти."
+            )
+    
+    elif scenario == "below_start":
+        header = (
+            f"📊 *{name}, биовозраст сейчас {curr_age:.1f}*\n\n"
+            "Знаю, это расстраивает."
+        )
+        if best_gap_6m is not None:
+            best_abs = round(passport + best_gap_6m, 1)
+            extra = (
+                f"\n\nНо за последние полгода твоё тело\n"
+                f"показывало *{best_abs:.1f} лет* (GAP *{best_gap_6m:+.1f}*).\n\n"
+                "Это не случайность — это твой потенциал.\n"
+                "Сейчас что-то мешает, и мы разберёмся."
+            )
+        else:
+            extra = "\n\nДавай разберёмся, что изменилось,\nи найдём путь обратно."
+    
+    elif scenario == "never_improved":
+        header = (
+            f"📊 *{name}, биовозраст пока не снижается*\n\n"
+            "Это не значит, что ничего не работает.\n"
+            "Мы ещё не нашли *твой* главный рычаг."
+        )
+        extra = (
+            "\n\nУ каждого он свой:\n"
+            "У кого-то сон, у кого-то стресс,\n"
+            "у кого-то движение.\n"
+            "Посмотрим на данные и найдём."
+        )
+    else:
+        header = f"📊 *{name}, GAP изменился на {gap_change:+.1f}*"
+    
+    normalize = ""
+    if scenario != "still_younger":
+        normalize = "\n\n💡 Биовозраст — не прямая линия.\nНормально: зигзаг, но тренд вниз за квартал."
+    
+    quarter_note = ""
+    if quarter_gap is not None and scenario != "still_younger":
+        q_diff = round(curr_gap - quarter_gap, 1)
+        if q_diff <= 0:
+            quarter_note = f"\n\n📅 За квартал GAP: *{q_diff:+.1f}* — общий тренд хороший!"
+        elif q_diff <= 1:
+            quarter_note = f"\n\n📅 За квартал GAP: *+{q_diff:.1f}* — небольшой сдвиг, корректируемо."
+    
+    causes_text = ""
+    if causes and scenario != "still_younger":
+        causes_text = "\n\n🔍 *Что вижу в данных:*\n"
+        for c in causes[:3]:
+            temp_mark = " _(временно)_" if c.get('temporary') else ""
+            causes_text += f"\n{c['emoji']} *{c['title']}*{temp_mark}\n   {c['detail']}\n"
+    
+    temp_note = ""
+    if temporary:
+        temp_note = "\n\n💡 Скорее всего *временное* — вернётся за 1-2 недели."
+    
+    text = f"{header}{extra}{normalize}{quarter_note}{causes_text}{temp_note}"
+    
+    if scenario == "still_younger":
+        buttons = [
+            [InlineKeyboardButton(text="📊 Динамика", callback_data="bio_age_dynamics")],
+            [InlineKeyboardButton(text="💚 Понятно", callback_data="back_to_menu")],
+        ]
+    elif scenario == "never_improved":
+        buttons = [
+            [InlineKeyboardButton(text="🔍 Найти мой рычаг", callback_data="rollback_plan")],
+            [InlineKeyboardButton(text="📊 Динамика", callback_data="bio_age_dynamics")],
+            [InlineKeyboardButton(text="💚 Понятно", callback_data="rollback_ack")],
+        ]
+    else:
+        buttons = [
+            [InlineKeyboardButton(text="📋 План на 2 недели", callback_data="rollback_plan")],
+            [InlineKeyboardButton(text="📊 Подробный анализ", callback_data="bio_age_dynamics")],
+            [InlineKeyboardButton(text="💚 Понятно, работаю", callback_data="rollback_ack")],
+        ]
+    
+    return {"text": text, "reply_markup": InlineKeyboardMarkup(inline_keyboard=buttons)}
+
+
+async def _build_plateau(a: dict, weeks: int, telegram_id: int) -> dict:
+    """Сообщение при стагнации"""
+    name = a['name']
+    curr_gap = a['curr_gap']
+    first_gap = a['first_gap']
+    quarter_gap = a['quarter_gap']
+    
+    if curr_gap < 0:
+        pos = f"При этом ты на *{abs(curr_gap):.1f} лет моложе* паспортного — отличная база."
+    elif first_gap is not None and curr_gap < first_gap:
+        gain = round(first_gap - curr_gap, 1)
+        pos = f"При этом с начала программы: *–{gain:.1f}* — прогресс есть."
+    else:
+        pos = "Организм на стартовых позициях — ищем рычаг."
+    
+    q_note = ""
+    if quarter_gap is not None:
+        q_diff = round(curr_gap - quarter_gap, 1)
+        if q_diff <= -0.5:
+            q_note = f"\n\n📅 Но за квартал GAP улучшился на *{abs(q_diff):.1f}* — тренд хороший!"
+    
+    if weeks <= 6:
+        header = (
+            f"📊 *{name}, биовозраст стабилен*\n\n"
+            f"Не меняется ~{weeks} замеров.\n\n{pos}\n\n"
+            "Это *нормально* — плато = закрепление."
+        )
+    else:
+        header = (
+            f"📊 *{name}, затянувшееся плато*\n\n"
+            f"GAP стабилен ~{weeks} замеров.\n\n{pos}\n\n"
+            "Тело привыкло к нагрузке —\n"
+            "пора мягко изменить один параметр."
+        )
+    
+    tip = await _get_plateau_tip(telegram_id)
+    text = f"{header}{q_note}\n\n{tip}"
+    
+    return {
+        "text": text,
+        "reply_markup": InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💡 Что попробовать?", callback_data="rollback_plan")],
+            [InlineKeyboardButton(text="📊 Динамика", callback_data="bio_age_dynamics")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")],
+        ])
+    }
+
+
+async def _get_plateau_tip(telegram_id: int) -> str:
+    """Совет для прорыва плато"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("""
+                SELECT AVG(sleep_quality), AVG(stress), AVG(morning_energy)
+                FROM daily_checkins 
+                WHERE telegram_id = ? AND date >= date('now', '-14 days')
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+        if not row or not row[0]:
+            return "💡 Заполняй чекины — тогда смогу подсказать точнее."
+        avg_sleep, avg_stress, avg_energy = row[0] or 3, row[1] or 3, row[2] or 3
+        if avg_sleep <= 3:
+            return "💡 *Сон — слабое звено.* +30 мин к сну на 2 недели может сдвинуть плато."
+        elif avg_stress >= 3.5:
+            return "💡 *Стресс тормозит.* Дыхание 4-7-8 перед сном (5 мин) снижает кортизол на ~20%."
+        elif avg_energy <= 2.5:
+            return "💡 *Энергия низкая.* Добавь 1 быструю прогулку в неделю (пульс 120+)."
+        else:
+            return "💡 *Нужна новизна.* Новый тип нагрузки или контрастный душ утром."
+    except Exception:
+        return "💡 Заполняй чекины — тогда смогу подсказать точнее."
+
+
+async def diagnose_rollback(telegram_id: int) -> dict:
+    """Анализирует ПОЧЕМУ GAP ухудшился"""
+    user = await get_user(telegram_id)
+    causes = []
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("""
+                SELECT date, sleep_quality, morning_energy, wake_feeling
+                FROM daily_checkins WHERE telegram_id = ? AND checkin_type = 'morning'
+                AND date >= date('now', '-14 days') ORDER BY date DESC
+            """, (telegram_id,))
+            mornings = await cursor.fetchall()
+            
+            cursor = await db.execute("""
+                SELECT date, stress, energy, mood
+                FROM daily_checkins WHERE telegram_id = ? AND checkin_type = 'evening'
+                AND date >= date('now', '-14 days') ORDER BY date DESC
+            """, (telegram_id,))
+            evenings = await cursor.fetchall()
+    except Exception:
+        mornings, evenings = [], []
+    
+    # 1. Сон
+    if mornings:
+        sleep_vals = [m[1] for m in mornings if m[1]]
+        if sleep_vals and sum(sleep_vals)/len(sleep_vals) <= 2.5:
+            causes.append({
+                'factor': 'sleep', 'emoji': '😴', 'title': 'Сон ухудшился',
+                'detail': f'Среднее качество: {sum(sleep_vals)/len(sleep_vals):.1f}/5',
+                'fix': 'Ложиться до 23:00, убрать экраны за час, магний 400мг',
+                'weight': 0.35,
+            })
+    
+    # 2. Стресс
+    if evenings:
+        stress_vals = [e[1] for e in evenings if e[1]]
+        if stress_vals and sum(stress_vals)/len(stress_vals) >= 3.5:
+            causes.append({
+                'factor': 'stress', 'emoji': '😰', 'title': 'Высокий стресс',
+                'detail': f'Средний: {sum(stress_vals)/len(stress_vals):.1f}/5',
+                'fix': 'Дыхание 4-7-8 утром и вечером (5 мин) + прогулка',
+                'weight': 0.30,
+            })
+    
+    # 3. HRV
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("""
+                SELECT rmssd FROM hrv_records WHERE telegram_id = ?
+                AND date >= date('now', '-14 days') AND rmssd IS NOT NULL
+                ORDER BY date DESC LIMIT 5
+            """, (telegram_id,))
+            hrv_recent = await cursor.fetchall()
+        baseline_rmssd = user.get('hrv_baseline_rmssd') if user else None
+        if hrv_recent and baseline_rmssd:
+            rmssd_vals = [h[0] for h in hrv_recent if h[0]]
+            if rmssd_vals:
+                avg_r = sum(rmssd_vals) / len(rmssd_vals)
+                if avg_r < baseline_rmssd * 0.85:
+                    drop = round((1 - avg_r/baseline_rmssd) * 100)
+                    causes.append({
+                        'factor': 'hrv', 'emoji': '❤️', 'title': 'HRV снижается',
+                        'detail': f'RMSSD: {baseline_rmssd:.0f} → {avg_r:.0f} мс (–{drop}%)',
+                        'fix': 'Вагальные техники: холодная вода на лицо, гудение',
+                        'weight': 0.25,
+                    })
+    except Exception:
+        pass
+    
+    # 4. Цикл
+    gender = user.get('gender', 'female') if user else 'female'
+    if gender == 'female' and user and user.get('tracking_cycle'):
+        try:
+            cd = user.get('cycle_day')
+            cl = int(str(user.get('cycle_length', '28')).split('-')[0])
+            if cd and int(cd) > cl - 5:
+                causes.append({
+                    'factor': 'cycle', 'emoji': '🌙', 'title': 'Лютеиновая фаза',
+                    'detail': 'Прогестерон ↓ — показатели временно хуже',
+                    'fix': 'Не паниковать. Магний 400мг, больше сна.',
+                    'weight': 0.0, 'temporary': True,
+                })
+        except Exception:
+            pass
+    
+    # 5. Мало данных
+    if len(mornings) < 7:
+        causes.append({
+            'factor': 'data', 'emoji': '📵', 'title': 'Мало данных',
+            'detail': f'Чекинов: {len(mornings)} из 14',
+            'fix': 'Утренний чекин — 1 минута, но даёт полную картину',
+            'weight': 0.10,
+        })
+    
+    causes.sort(key=lambda x: x['weight'], reverse=True)
+    return {'causes': causes, 'temporary': any(c.get('temporary') for c in causes)}
+
+
+@router.callback_query(F.data == "rollback_plan")
+async def rollback_plan_handler(callback: CallbackQuery):
+    """Персональный план на 2 недели"""
+    await callback.answer()
+    tid = callback.from_user.id
+    diagnosis = await diagnose_rollback(tid)
+    user = await get_user(tid)
+    name = user.get("name", "друг") if user else "друг"
+    
+    actions = []
+    for c in diagnosis.get('causes', [])[:2]:
+        if c.get('temporary'):
+            continue
+        if c['factor'] == 'sleep':
+            actions.append("😴 *Сон:*\n• До 23:00\n• Без телефона в спальне\n• Магний 400мг")
+        elif c['factor'] == 'stress':
+            actions.append("😌 *Стресс:*\n• Дыхание 4-7-8 (2×/день по 5 мин)\n• 1 прогулка/нед 30+ мин")
+        elif c['factor'] == 'hrv':
+            actions.append("❤️ *Восстановление:*\n• Холодная вода на лицо\n• Гудение 5 мин\n• Длинный выдох")
+        elif c['factor'] == 'data':
+            actions.append("📱 *Регулярность:*\n• Чекин каждый день\n• HRV 3×/неделю")
+    
+    if not actions:
+        actions.append("💡 *Базовый план:*\n• +30 мин к сну\n• Дыхание 4-7-8 перед сном\n• 1 прогулка/нед")
+    
+    plan = f"🎯 *{name}, план на 2 недели:*\n\n" + "\n\n".join(actions)
+    plan += "\n\n━━━━━━━━━━━━━━━━━━━━━\n📅 Через 14 дней — контрольный пересчёт."
+    
+    await save_user(tid, {
+        "rollback_plan_active": 1,
+        "rollback_plan_date": date.today().isoformat(),
+        "rollback_check_date": (date.today() + timedelta(days=14)).isoformat(),
+    })
+    
+    await callback.message.edit_text(plan, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Принять", callback_data="rollback_plan_accept")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")],
+        ]))
+
+
+@router.callback_query(F.data == "rollback_plan_accept")
+async def rollback_plan_accept(callback: CallbackQuery):
+    """Принять план"""
+    await callback.answer("План принят 💚")
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    await callback.message.edit_text(
+        f"💪 *{name}, план активирован!*\n\nЧерез 14 дней — контрольный замер 💚",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")]]))
+
+
+@router.callback_query(F.data == "rollback_ack")
+async def rollback_ack(callback: CallbackQuery):
+    """Подтвердить откат"""
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    await callback.message.edit_text(
+        f"💪 {name}, ты справишься.\n\nОткат = сигнал тела, не приговор.\n"
+        "Увидимся на утреннем чекине 💚",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")]]))
+
+
+async def check_rollback_plan_result(telegram_id: int) -> dict | None:
+    """После 14 дней — напомнить пересчитать"""
+    user = await get_user(telegram_id)
+    if not user or not user.get('rollback_plan_active'):
+        return None
+    check_date = user.get('rollback_check_date')
+    if not check_date or check_date > date.today().isoformat():
+        return None
+    await save_user(telegram_id, {"rollback_plan_active": 0})
+    name = user.get("name", "друг")
+    return {
+        "text": f"📊 *{name}, прошло 2 недели с плана!*\n\nПересчитаем биовозраст?",
+        "reply_markup": InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎂 Пересчитать", callback_data="recalc_bio_age")],
+            [InlineKeyboardButton(text="⏰ Позже", callback_data="back_to_menu")],
+        ]),
+    }
 
 
 async def generate_bio_age_chart(telegram_id: int) -> bytes:
@@ -68327,6 +75774,12 @@ async def capillary_test_menu_handler(callback: CallbackQuery, state: FSMContext
 async def capillary_menu_handler(callback: CallbackQuery, state: FSMContext):
     """Главное меню капиллярной терапии — ПОПРАВКА #56"""
     await callback.answer()
+    
+    # ═══ PRO-ГЕЙТ: Капилляротерапия ═══
+    if not await require_pro(callback, "capillary_therapy"):
+        return
+    # ═══ END PRO-ГЕЙТ ═══
+    
     await state.clear()
     
     hydro_profile = await get_hydro_profile(callback.from_user.id)
@@ -69635,7 +77088,7 @@ async def syndrome_questions_start(callback: CallbackQuery, state: FSMContext):
     
     # Сразу показываем первый вопрос без вводного экрана
     q = SYNDROME_QUESTIONS['energy']
-    text = f"""📊 *ТЕСТ СОСТОЯНИЙ (1/6)*
+    text = f"""📊 *ТЕСТ СОСТОЯНИЙ (1/4)*
 
 {q['emoji']} {q['title']}
 
@@ -69656,7 +77109,7 @@ async def syndrome_q_energy(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     
     q = SYNDROME_QUESTIONS['energy']
-    text = f"""📊 *ТЕСТ СОСТОЯНИЙ (1/6)*
+    text = f"""📊 *ТЕСТ СОСТОЯНИЙ (1/4)*
 
 {q['emoji']} {q['title']}
 
@@ -69696,83 +77149,14 @@ async def syndrome_energy_handler(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(SyndromeStates.waiting_apathy, F.data.startswith("syndrome_apathy_"))
 async def syndrome_apathy_handler(callback: CallbackQuery, state: FSMContext):
-    """Обработка ответа про апатию"""
+    """Обработка ответа про апатию → боли (когнитивные — в когнитивном трекере)"""
     await callback.answer()
     
     score = int(callback.data.split("_")[-1])
     await state.update_data(apathy_level=score)
     
-    # Следующий вопрос — мозговой туман
-    q = SYNDROME_QUESTIONS['brain_fog']
-    text = f"""{q['emoji']} {q['title']}
-
-{q['text']}"""
-    
-    await state.set_state(SyndromeStates.waiting_brain_fog)
-    
-    await callback.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=get_syndrome_question_keyboard('brain_fog')
-    )
-
-
-@router.callback_query(SyndromeStates.waiting_brain_fog, F.data.startswith("syndrome_brain_fog_"))
-async def syndrome_brain_fog_handler(callback: CallbackQuery, state: FSMContext):
-    """Обработка ответа про мозговой туман"""
-    await callback.answer()
-    
-    score = int(callback.data.split("_")[-1])
-    await state.update_data(brain_fog_level=score)
-    
-    # Следующий вопрос — забывчивость
-    q = SYNDROME_QUESTIONS['forgetfulness']
-    text = f"""{q['emoji']} {q['title']}
-
-{q['text']}"""
-    
-    await state.set_state(SyndromeStates.waiting_forgetfulness)
-    
-    await callback.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=get_syndrome_question_keyboard('forgetfulness')
-    )
-
-
-@router.callback_query(SyndromeStates.waiting_forgetfulness, F.data.startswith("syndrome_forgetfulness_"))
-async def syndrome_forgetfulness_handler(callback: CallbackQuery, state: FSMContext):
-    """Обработка ответа про забывчивость"""
-    await callback.answer()
-    
-    score = int(callback.data.split("_")[-1])
-    await state.update_data(forgetfulness_level=score)
-    
-    # ПОПРАВКА #127: Следующий вопрос — концентрация (для СНД)
-    q = SYNDROME_QUESTIONS['concentration']
-    text = f"""{q['emoji']} {q['title']}
-
-{q['text']}"""
-    
-    await state.set_state(SyndromeStates.waiting_concentration)
-    
-    await callback.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=get_syndrome_question_keyboard('concentration')
-    )
-
-
-# ПОПРАВКА #127: Хэндлер для вопроса про концентрацию
-@router.callback_query(SyndromeStates.waiting_concentration, F.data.startswith("syndrome_concentration_"))
-async def syndrome_concentration_handler(callback: CallbackQuery, state: FSMContext):
-    """Обработка ответа про концентрацию"""
-    await callback.answer()
-    
-    score = int(callback.data.split("_")[-1])
-    await state.update_data(concentration_level=score)
-    
-    # Следующий вопрос — боли
+    # Пропускаем brain_fog, forgetfulness, concentration → когнитивный трекер
+    # Следующий вопрос — боли в теле
     q = SYNDROME_QUESTIONS['pain']
     text = f"""{q['emoji']} {q['title']}
 
@@ -69782,6 +77166,55 @@ async def syndrome_concentration_handler(callback: CallbackQuery, state: FSMCont
     
     await callback.message.edit_text(
         text,
+        parse_mode="Markdown",
+        reply_markup=get_syndrome_question_keyboard('pain')
+    )
+
+
+# Legacy хендлеры для пользователей застрявших на старых состояниях
+@router.callback_query(SyndromeStates.waiting_brain_fog, F.data.startswith("syndrome_brain_fog_"))
+async def syndrome_brain_fog_handler(callback: CallbackQuery, state: FSMContext):
+    """Legacy: если кто-то застрял на вопросе про туман"""
+    await callback.answer()
+    score = int(callback.data.split("_")[-1])
+    await state.update_data(brain_fog_level=score)
+    
+    q = SYNDROME_QUESTIONS['pain']
+    await state.set_state(SyndromeStates.waiting_pain)
+    await callback.message.edit_text(
+        f"""{q['emoji']} {q['title']}\n\n{q['text']}""",
+        parse_mode="Markdown",
+        reply_markup=get_syndrome_question_keyboard('pain')
+    )
+
+
+@router.callback_query(SyndromeStates.waiting_forgetfulness, F.data.startswith("syndrome_forgetfulness_"))
+async def syndrome_forgetfulness_handler(callback: CallbackQuery, state: FSMContext):
+    """Legacy: если кто-то застрял на вопросе про забывчивость"""
+    await callback.answer()
+    score = int(callback.data.split("_")[-1])
+    await state.update_data(forgetfulness_level=score)
+    
+    q = SYNDROME_QUESTIONS['pain']
+    await state.set_state(SyndromeStates.waiting_pain)
+    await callback.message.edit_text(
+        f"""{q['emoji']} {q['title']}\n\n{q['text']}""",
+        parse_mode="Markdown",
+        reply_markup=get_syndrome_question_keyboard('pain')
+    )
+
+
+@router.callback_query(SyndromeStates.waiting_concentration, F.data.startswith("syndrome_concentration_"))
+async def syndrome_concentration_handler(callback: CallbackQuery, state: FSMContext):
+    """Legacy: если кто-то застрял на вопросе про концентрацию"""
+    await callback.answer()
+    score = int(callback.data.split("_")[-1])
+    await state.update_data(concentration_level=score)
+    
+    q = SYNDROME_QUESTIONS['pain']
+    await state.set_state(SyndromeStates.waiting_pain)
+    await callback.message.edit_text(
+        f"""{q['emoji']} {q['title']}\n\n{q['text']}""",
         parse_mode="Markdown",
         reply_markup=get_syndrome_question_keyboard('pain')
     )
@@ -71595,6 +79028,21 @@ async def rejuv_history_handler(callback: CallbackQuery):
 async def cognitive_menu_handler(callback: CallbackQuery, state: FSMContext):
     """Главное меню когнитивного трекера — ПОПРАВКА #59"""
     await callback.answer()
+    
+    # ═══ ЗАЩИТА: Если из онбординга — не ломаем flow ═══
+    data = await state.get_data()
+    if data.get("from_onboarding"):
+        # Вернуть к когнитивному тесту, а не очищать state
+        await callback.message.edit_text(
+            "⚠️ Тест нужно завершить для продолжения.\n"
+            "Осталось совсем немного!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➡️ Продолжить тест", callback_data="onb_cog_start")],
+            ])
+        )
+        return
+    # ═══ END ЗАЩИТА ═══
+    
     await state.clear()
     
     user = await get_user(callback.from_user.id)
@@ -71632,12 +79080,52 @@ async def cognitive_menu_handler(callback: CallbackQuery, state: FSMContext):
 
 9 вопросов, \\~3 минуты."""
         
-        buttons = [
-            [InlineKeyboardButton(text="✅ Оценить", callback_data="cognitive_start_baseline")],
-            [InlineKeyboardButton(text="❓ Подробнее", callback_data="cognitive_about")],
-            [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
-        ]
+        onboarding_done = user.get("onboarding_completed", 0) if user else 0
+        if not onboarding_done:
+            # Онбординг — одна кнопка, никуда не уходим
+            buttons = [
+                [InlineKeyboardButton(text="✅ Оценить", callback_data="cognitive_start_baseline")],
+            ]
+        else:
+            # Из меню — полный набор
+            buttons = [
+                [InlineKeyboardButton(text="✅ Оценить", callback_data="cognitive_start_baseline")],
+                [InlineKeyboardButton(text="❓ Подробнее", callback_data="cognitive_about")],
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+            ]
     else:
+        # ═══ FALLBACK: Проверяем, застрял ли пользователь в онбординге ═══
+        onboarding_done = user.get("onboarding_completed", 0) if user else 0
+        if not onboarding_done:
+            # Baseline есть, но онбординг не завершён → завершаем!
+            await save_user(callback.from_user.id, {
+                "onboarding_completed": 1,
+                "onboarding_phase": 4,
+            })
+            
+            index = baseline.get("cognitive_index", 0)
+            interp = get_cognitive_interpretation(index)
+            
+            text = (
+                f"🧠 *Когнитивный трекер*\n\n"
+                f"📸 Базовая линия зафиксирована!\n"
+                f"📊 Стартовый индекс: {index:.1f}/100\n"
+                f"{interp['emoji']} {interp['text']}\n\n"
+                f"💚 _Диагностика завершена!_"
+            )
+            
+            buttons = [
+                [InlineKeyboardButton(text="📋 Сводный отчёт", callback_data="integrated_assessment")],
+                [InlineKeyboardButton(text="💚 Что дальше?", callback_data="free_period_intro")],
+            ]
+            
+            await callback.message.edit_text(
+                text, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+            )
+            return
+        # ═══ END FALLBACK ═══
+        
         index = baseline.get("cognitive_index", 0)
         baseline_date = baseline.get("baseline_date", "")
         interp = get_cognitive_interpretation(index)
@@ -71789,6 +79277,7 @@ async def show_cognitive_question(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     questions = data.get("questions", [])
     index = data.get("current_question_index", 0)
+    hide_cancel = data.get("hide_cancel", False)
     
     if index >= len(questions):
         # Все вопросы заданы — сохраняем
@@ -71809,15 +79298,15 @@ async def show_cognitive_question(callback: CallbackQuery, state: FSMContext):
     # Определяем клавиатуру
     scale_type = question_info.get("scale_type")
     if scale_type == "days":
-        keyboard = get_brain_fog_days_keyboard()
+        keyboard = get_brain_fog_days_keyboard(hide_cancel=hide_cancel)
     elif scale_type == "dreams":
-        keyboard = get_dreams_recall_keyboard()
+        keyboard = get_dreams_recall_keyboard(hide_cancel=hide_cancel)
     else:
         # Стандартная шкала 0-10
         low_label = question_info.get("scale_low", "Плохо")
         high_label = question_info.get("scale_high", "Отлично")
         text += f"\n\n0️⃣ = {low_label}\n🔟 = {high_label}"
-        keyboard = get_cognitive_scale_keyboard(param)
+        keyboard = get_cognitive_scale_keyboard(param, hide_cancel=hide_cancel)
     
     # Устанавливаем состояние FSM
     state_mapping = {

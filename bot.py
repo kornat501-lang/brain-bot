@@ -30133,7 +30133,7 @@ async def show_diagnosis_menu(callback: CallbackQuery):
 Выберите тест для прохождения.
 
 💡 _Рекомендуем начать с 
-"Карты состояния" — она покажет 
+"Теста Состояний" — он покажет 
 общую картину._
 
 ━━━━━━━━━━━━━━━━━━━━━"""
@@ -30526,8 +30526,9 @@ async def start_circadian_test_direct(callback: CallbackQuery, state: FSMContext
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-Этот тест оценит синхронизацию 
-твоих биологических ритмов.
+Этот тест покажет режим выработки
+мелатонина — и я подберу
+рекомендации по свету, экранам и режиму дня.
 
 📋 *7-12 вопросов*
 ⏱ *2-4 минуты*
@@ -31873,8 +31874,8 @@ MINI_TEST_QUESTIONS = {
     # БЛОК 1: PSS-4 (СТРЕСС) — 4 вопроса
     1: {
         "block": "PSS-4",
-        "block_title": "📊 БЛОК 1: СТРЕСС (PSS-4)",
-        "text": "❓ *Вопрос 1/18*\n\nЗа последние 2 недели:\nкак часто вы чувствовали, что *НЕ МОЖЕТЕ КОНТРОЛИРОВАТЬ* важные вещи в жизни?",
+        "block_title": "📊 *БЛОК 1: СТРЕСС (PSS-4)*\n\n💡 _Чтобы понять, как вы реагируете\nна стресс и как с ним справляетесь._",
+        "text": "❓ *Вопрос 1/18*\n\n*За последние 2 недели:*\nкак часто вы чувствовали, что *НЕ МОЖЕТЕ КОНТРОЛИРОВАТЬ* важные вещи в жизни?",
         "options": [
             ("0️⃣ Никогда", "mq1_0", 0),
             ("1️⃣ Почти никогда", "mq1_1", 1),
@@ -31886,7 +31887,7 @@ MINI_TEST_QUESTIONS = {
     },
     2: {
         "block": "PSS-4",
-        "text": "❓ *Вопрос 2/18*\n\nЗа последние 2 недели:\nкак часто вы чувствовали *УВЕРЕННОСТЬ* в своей способности справляться с проблемами?",
+        "text": "❓ *Вопрос 2/18*\n\n*За последние 2 недели:*\nкак часто вы чувствовали *УВЕРЕННОСТЬ* в своей способности справляться с проблемами?",
         "options": [
             ("0️⃣ Никогда", "mq2_0", 4),
             ("1️⃣ Почти никогда", "mq2_1", 3),
@@ -31899,7 +31900,7 @@ MINI_TEST_QUESTIONS = {
     },
     3: {
         "block": "PSS-4",
-        "text": "❓ *Вопрос 3/18*\n\nЗа последние 2 недели:\nкак часто вы чувствовали, что *ВСЁ ИДЁТ ТАК*, как вы хотите?",
+        "text": "❓ *Вопрос 3/18*\n\n*За последние 2 недели:*\nкак часто вы чувствовали, что *ВСЁ ИДЁТ ТАК*, как вы хотите?",
         "options": [
             ("0️⃣ Никогда", "mq3_0", 4),
             ("1️⃣ Почти никогда", "mq3_1", 3),
@@ -31912,7 +31913,7 @@ MINI_TEST_QUESTIONS = {
     },
     4: {
         "block": "PSS-4",
-        "text": "❓ *Вопрос 4/18*\n\nЗа последние 2 недели:\nкак часто вы чувствовали, что *ТРУДНОСТИ НАКАПЛИВАЮТСЯ* так, что вы не можете с ними справиться?",
+        "text": "❓ *Вопрос 4/18*\n\n*За последние 2 недели:*\nкак часто вы чувствовали, что *ТРУДНОСТИ НАКАПЛИВАЮТСЯ* так, что вы не можете с ними справиться?",
         "options": [
             ("0️⃣ Никогда", "mq4_0", 0),
             ("1️⃣ Почти никогда", "mq4_1", 1),
@@ -31926,7 +31927,7 @@ MINI_TEST_QUESTIONS = {
     5: {
         "block": "GAD-2",
         "block_title": "📊 БЛОК 2: ТРЕВОЖНОСТЬ (GAD-2)",
-        "text": "❓ *Вопрос 5/18*\n\nЗа последние 2 недели:\nкак часто вас беспокоило ощущение *НЕРВОЗНОСТИ, ТРЕВОГИ* или напряжения?",
+        "text": "❓ *Вопрос 5/18*\n\n*За последние 2 недели:*\nкак часто вас беспокоило ощущение *НЕРВОЗНОСТИ, ТРЕВОГИ* или напряжения?",
         "options": [
             ("Совсем нет", "mq5_0", 0),
             ("Несколько дней", "mq5_1", 1),
@@ -31937,7 +31938,7 @@ MINI_TEST_QUESTIONS = {
     },
     6: {
         "block": "GAD-2",
-        "text": "❓ *Вопрос 6/18*\n\nЗа последние 2 недели:\nкак часто вы *НЕ МОГЛИ ПЕРЕСТАТЬ ВОЛНОВАТЬСЯ* или контролировать беспокойство?",
+        "text": "❓ *Вопрос 6/18*\n\n*За последние 2 недели:*\nкак часто вы *НЕ МОГЛИ ПЕРЕСТАТЬ ВОЛНОВАТЬСЯ* или контролировать беспокойство?",
         "options": [
             ("Совсем нет", "mq6_0", 0),
             ("Несколько дней", "mq6_1", 1),
@@ -32001,8 +32002,8 @@ MINI_TEST_QUESTIONS = {
         "text": "❓ *Вопрос 11/18*\n\n*ХРАП* или остановки дыхания во сне?\n_(по словам партнёра или своим ощущениям)_",
         "options": [
             ("🔴 Да, сильный храп / были остановки", "mq11_0", 0),
-            ("🟠 Иногда храплю", "mq11_1", 1),
-            ("🟡 Редко", "mq11_2", 2),
+            ("🟠 Несколько раз в неделю", "mq11_1", 1),
+            ("🟡 Пару раз в месяц", "mq11_2", 2),
             ("🟢 Нет", "mq11_3", 3),
             ("❓ Не знаю / сплю один", "mq11_4", 2),
         ],
@@ -32027,9 +32028,9 @@ MINI_TEST_QUESTIONS = {
         "text": "❓ *Вопрос 13/18*\n\nБывает ли у вас *ВТОРОЕ ДЫХАНИЕ* поздно вечером (после 22:00)?",
         "options": [
             ("🦉 Да, каждый вечер", "mq13_0", 4),
-            ("🌙 Часто", "mq13_1", 3),
-            ("🌓 Иногда", "mq13_2", 2),
-            ("🌑 Редко", "mq13_3", 1),
+            ("🌙 3–4 раза в неделю", "mq13_1", 3),
+            ("🌓 1–2 раза в неделю", "mq13_2", 2),
+            ("🌑 Пару раз в месяц", "mq13_3", 1),
             ("😴 Нет, к вечеру устаю", "mq13_4", 0),
         ],
         "field": "ahs_m2"
@@ -32038,10 +32039,10 @@ MINI_TEST_QUESTIONS = {
         "block": "AHS-mini",
         "text": "❓ *Вопрос 14/18*\n\n*ТЯГА К СЛАДКОМУ ИЛИ КОФЕ* в течение дня?",
         "options": [
-            ("🍫 Постоянная, не могу без этого", "mq14_0", 4),
-            ("☕ Часто хочется", "mq14_1", 3),
-            ("🍪 Иногда тянет", "mq14_2", 2),
-            ("🙂 Редко", "mq14_3", 1),
+            ("🍫 Постоянно, не могу без этого", "mq14_0", 4),
+            ("☕ Каждый день", "mq14_1", 3),
+            ("🍪 Несколько раз в неделю", "mq14_2", 2),
+            ("🙂 Пару раз в месяц", "mq14_3", 1),
             ("💪 Практически нет", "mq14_4", 0),
         ],
         "field": "ahs_m3"
@@ -32062,7 +32063,7 @@ MINI_TEST_QUESTIONS = {
     16: {
         "block": "Circadian-mini",
         "block_title": "📊 БЛОК 5: ЦИРКАДНЫЕ РИТМЫ",
-        "text": "❓ *Вопрос 16/18*\n\nВидите ли вы *ЯРКИЙ СВЕТ* в первые 30 минут после пробуждения?",
+        "text": "❓ *Вопрос 16/18*\n\nПолучаете ли вы *УТРЕННИЙ* яркий свет\nв первые 30 минут после пробуждения?",
         "options": [
             ("🌑 Нет, в комнате темно", "mq16_0", 0),
             ("💡 Только искусственный свет", "mq16_1", 1),
@@ -32120,6 +32121,23 @@ async def mini_test_start(callback: CallbackQuery, state: FSMContext):
     user = await get_user(callback.from_user.id)
     name = user.get("name", "друг") if user else "друг"
     
+    # Баг #39: Проверяем — уже проходили?
+    cached = await get_cached_test_answers(callback.from_user.id, "composite")
+    if cached:
+        await callback.message.edit_text(
+            f"📝 *{name}, мини-тест уже пройден*\n\n"
+            "Результаты ещё актуальны (< 14 дней).\n\n"
+            "Хотите пройти заново? Новые ответы\n"
+            "заменят предыдущие.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Пройти заново", callback_data="mini_test_go")],
+                [InlineKeyboardButton(text="📋 Мои результаты", callback_data="summary_report")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_diagnosis")],
+            ])
+        )
+        return
+    
     text = f"""📝 *{name}, МИНИ-ТЕСТ*
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -32157,7 +32175,7 @@ async def mini_test_go(callback: CallbackQuery, state: FSMContext):
     await state.update_data(mini_test_answers={})
     
     q = MINI_TEST_QUESTIONS[1]
-    text = f"{q['block_title']}\n\n{q['text']}"
+    text = f"{q['block_title']}\n\n{q['text']}" if q.get('block_title') else q['text']
     
     await callback.message.edit_text(
         text,
@@ -35039,12 +35057,14 @@ async def show_age_screen(message, state: FSMContext, edit=False):
     """ОНБОРДИНГ 2.0: Экран Возраст (2/10) — ввод числа"""
     text = (
         "[●●○○○○○○○○] 2/10\n\n"
-        "Сколько тебе полных лет?"
+        "Сколько тебе полных лет?\n\n"
+        "💡 _Точный возраст важен — от него зависят\n"
+        "нормы HRV, биовозраст и рекомендации._"
     )
     if edit:
-        await message.edit_text(text)
+        await message.edit_text(text, parse_mode="Markdown")
     else:
-        await message.answer(text)
+        await message.answer(text, parse_mode="Markdown")
     await state.set_state(OnboardingStates.waiting_exact_age)
 
 
@@ -35107,13 +35127,14 @@ async def show_height_weight_screen(message, state: FSMContext, edit=False):
     text = (
         "[●●●○○○○○○○] 3/10\n\n"
         "Рост (см) и вес (кг)?\n\n"
-        "(Введите через пробел,\n"
-        "например: 165 62)"
+        "(Введите через пробел, например: 165 62)\n\n"
+        "💡 _Точные данные важны — от них зависят\n"
+        "биовозраст, ИМТ и дозировки в маршруте._"
     )
     if edit:
-        await message.edit_text(text)
+        await message.edit_text(text, parse_mode="Markdown")
     else:
-        msg = await message.answer(text)
+        msg = await message.answer(text, parse_mode="Markdown")
         await state.update_data(last_bot_msg_id=msg.message_id)
     await state.set_state(OnboardingStates.waiting_height_weight)
 
@@ -35299,7 +35320,10 @@ async def show_work_screen(message, state: FSMContext):
 
     await message.answer(
         "[●●●●●○○○○○] 5/9\n\n"
-        "Какой у вас график?",
+        "Какой у вас график?\n\n"
+        "💡 _От этого зависит время чекинов,\n"
+        "рекомендации по сну и циркадным ритмам._",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🏢 Стандартный 5/2", callback_data="onb_work_standard")],
             [InlineKeyboardButton(text="🏠 Удалёнка / гибкий", callback_data="onb_work_remote")],
@@ -35510,7 +35534,11 @@ async def onb_process_work(callback: CallbackQuery, state: FSMContext):
     # → Экран ВАННА (7/10)
     await callback.message.edit_text(
         "[●●●●●●●○○○] 7/10\n\n"
-        "Есть ли у вас ванна дома?",
+        "Есть ли у вас ванна дома?\n\n"
+        "💡 _Если ванна есть — подберу для вас\n"
+        "водные процедуры для снижения стресса\n"
+        "и улучшения сна._",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🛁 Да, ванна", callback_data="onb_bath_yes")],
             [InlineKeyboardButton(text="🚿 Нет, только душ", callback_data="onb_bath_shower")],
@@ -35540,7 +35568,8 @@ async def onb_process_bath(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "Сколько времени в день готовы\n"
         "уделять себе?\n\n"
-        "(Честно — чтобы я не перегружала)",
+        "_(Честно — чтобы я не перегружала вас практиками)_",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="😌 20+ минут — без проблем", callback_data="onb_time_20plus")],
             [InlineKeyboardButton(text="🙂 10-15 минут — найду", callback_data="onb_time_10_15")],
@@ -35570,7 +35599,10 @@ async def onb_process_time(callback: CallbackQuery, state: FSMContext):
     
     # → Экран ЖИЛЬЁ
     await callback.message.edit_text(
-        "Живёте:",
+        "С кем вы живёте?\n\n"
+        "💡 _Это влияет на когнитивные функции,\n"
+        "уровень стресса и качество сна._",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🏠 Одна / с партнёром", callback_data="onb_living_alone")],
             [InlineKeyboardButton(text="👨‍👩‍👧 С семьёй (дети)", callback_data="onb_living_family")],
@@ -35606,8 +35638,11 @@ async def onb_process_living(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(
             "✅ Записала!\n\n"
             "Хотите учитывать менструальный цикл?\n\n"
-            "(HRV, энергия и настроение меняются\n"
-            "в течение цикла — я буду это учитывать)",
+            "💡 _Для женщин это важно: HRV, энергия\n"
+            "и настроение значительно меняются в разные\n"
+            "фазы цикла — я буду это учитывать\n"
+            "в рекомендациях и оценках._",
+            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="✅ Да, хочу", callback_data="onb_cycle_yes")],
                 [InlineKeyboardButton(text="❌ Нет, не нужно", callback_data="onb_cycle_no")],
@@ -35972,8 +36007,11 @@ async def process_h6(callback: CallbackQuery, state: FSMContext):
             await state.set_state(OnboardingStates.waiting_cycle)
             await callback.message.edit_text(
                 "Хотите учитывать менструальный цикл?\n\n"
-                "(HRV, энергия и настроение меняются\n"
-                "в течение цикла — я буду это учитывать)",
+                "💡 _Для женщин это важно: HRV, энергия\n"
+                "и настроение значительно меняются в разные\n"
+                "фазы цикла — я буду это учитывать\n"
+                "в рекомендациях и оценках._",
+                parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="✅ Да, хочу", callback_data="onb_cycle_yes")],
                     [InlineKeyboardButton(text="❌ Нет, не нужно", callback_data="onb_cycle_no")],
@@ -36320,7 +36358,11 @@ async def route_after_cycle(callback: CallbackQuery, state: FSMContext):
         # ПОПРАВКА #137: edit_text чтобы предыдущее (цикл) исчезло
         try:
             await callback.message.edit_text(
-                f"👶 {name}, есть ли маленькие дети (до 3 лет)?",
+                f"👶 {name}, есть ли маленькие дети (до 3 лет)?\n\n"
+                "💡 _С малышом — другой режим сна и уровень\n"
+                "стресса. Учту это, чтобы рекомендации\n"
+                "были реалистичными._",
+                parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="👶 Да, до года", callback_data="child_baby_0_6m")],
                     [InlineKeyboardButton(text="🧒 Да, 1-3 года", callback_data="child_toddler_1_3")],
@@ -36329,7 +36371,11 @@ async def route_after_cycle(callback: CallbackQuery, state: FSMContext):
             )
         except Exception:
             await callback.message.answer(
-                f"👶 {name}, есть ли маленькие дети (до 3 лет)?",
+                f"👶 {name}, есть ли маленькие дети (до 3 лет)?\n\n"
+                "💡 _С малышом — другой режим сна и уровень\n"
+                "стресса. Учту это, чтобы рекомендации\n"
+                "были реалистичными._",
+                parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="👶 Да, до года", callback_data="child_baby_0_6m")],
                     [InlineKeyboardButton(text="🧒 Да, 1-3 года", callback_data="child_toddler_1_3")],
@@ -43708,11 +43754,15 @@ async def edit_profile_handler(callback: CallbackQuery):
     await callback.answer()
     user = await get_user(callback.from_user.id)
     name = user.get("name", "—") if user else "—"
-    age = user.get("age_group", "—") if user else "—"
+    # Баг #33: точный возраст вместо диапазона
+    exact_age = user.get("exact_age") if user else None
+    age = str(exact_age) if exact_age else (user.get("age_group", "—") if user else "—")
     gender_map = {"female": "Женский", "male": "Мужской"}
     gender = gender_map.get(user.get("gender", "") if user else "", "—")
     chronotype_map = {"owl": "🦉 Сова", "pigeon": "🕊 Голубь", "lark": "🐦 Жаворонок"}
     chrono = chronotype_map.get(user.get("chronotype", "") if user else "", "—")
+    height = user.get("height_cm", "—") if user else "—"
+    weight = user.get("weight_kg", "—") if user else "—"
     
     text = f"""👤 *Мои данные*
 
@@ -43720,7 +43770,8 @@ async def edit_profile_handler(callback: CallbackQuery):
 
 Имя: *{name}*
 Пол: *{gender}*
-Возраст: *{age}*
+Возраст: *{age}* лет
+Рост/Вес: *{height}* см / *{weight}* кг
 Хронотип: *{chrono}*
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -43732,6 +43783,7 @@ async def edit_profile_handler(callback: CallbackQuery):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Изменить имя", callback_data="edit_name")],
+            [InlineKeyboardButton(text="🔢 Изменить возраст/рост/вес", callback_data="edit_body_params")],
             [InlineKeyboardButton(text="◀️ К настройкам", callback_data="settings")]
         ])
     )
@@ -43760,6 +43812,101 @@ async def save_new_name(message: Message, state: FSMContext):
         f"✅ Имя обновлено: *{new_name}*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ К настройкам", callback_data="settings")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "edit_body_params")
+async def edit_body_params_handler(callback: CallbackQuery, state: FSMContext):
+    """Баг #33: Редактирование возраста, роста, веса"""
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    exact_age = user.get("exact_age", "—") if user else "—"
+    height = user.get("height_cm", "—") if user else "—"
+    weight = user.get("weight_kg", "—") if user else "—"
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    msg = await callback.message.answer(
+        f"🔢 *Текущие данные:*\n"
+        f"Возраст: {exact_age}, Рост: {height} см, Вес: {weight} кг\n\n"
+        "Введи новые данные через пробел:\n"
+        "_возраст рост вес_\n\n"
+        "Например: `38 170 65`",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="edit_profile")]
+        ])
+    )
+    await state.update_data(body_params_msg_id=msg.message_id)
+    await state.set_state("waiting_body_params_edit")
+
+
+@router.message(StateFilter("waiting_body_params_edit"))
+async def save_body_params(message: Message, state: FSMContext):
+    """Сохранить возраст/рост/вес"""
+    text = message.text.strip() if message.text else ""
+    parts = text.split()
+    
+    if len(parts) != 3:
+        await message.answer(
+            "⚠️ Нужно 3 числа через пробел: возраст рост вес\n"
+            "Например: `38 170 65`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        age = int(parts[0])
+        height = int(parts[1])
+        weight = float(parts[2])
+    except ValueError:
+        await message.answer(
+            "⚠️ Не удалось разобрать числа. Попробуй ещё раз:\n"
+            "`возраст рост вес` (например: 38 170 65)",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if not (14 <= age <= 120 and 100 <= height <= 250 and 30 <= weight <= 300):
+        await message.answer("⚠️ Проверь данные — что-то выходит за разумные пределы.")
+        return
+    
+    # Определяем age_group
+    age_groups = [(18,"14-17"),(30,"18-29"),(40,"30-39"),(50,"40-49"),(60,"50-59"),(70,"60-69")]
+    age_group = "70+"
+    for threshold, group in age_groups:
+        if age < threshold:
+            age_group = group
+            break
+    
+    await save_user(message.from_user.id, {
+        "exact_age": age,
+        "age_group": age_group,
+        "height_cm": height,
+        "weight_kg": weight,
+    })
+    
+    data = await state.get_data()
+    prev_id = data.get("body_params_msg_id")
+    if prev_id:
+        try:
+            await message.bot.delete_message(message.chat.id, prev_id)
+        except:
+            pass
+    try:
+        await message.delete()
+    except:
+        pass
+    
+    await state.clear()
+    await message.answer(
+        f"✅ Обновлено: возраст *{age}*, рост *{height}* см, вес *{weight}* кг",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👤 К профилю", callback_data="edit_profile")],
             [InlineKeyboardButton(text="◀️ К настройкам", callback_data="settings")]
         ])
     )
@@ -51629,8 +51776,11 @@ async def life_events_start(callback: CallbackQuery, state: FSMContext):
     
     text = f"""📋 *ЖИЗНЕННЫЕ ОБСТОЯТЕЛЬСТВА*
 
-{name}, несколько важных вопросов о вашей жизни.
-Это поможет мне лучше понять вашу ситуацию.
+{name}, несколько вопросов о вашей жизни.
+
+💡 _Стресс, режим, окружение — всё это напрямую
+влияет на сон, HRV и работу мозга.
+Чем точнее картина — тем точнее рекомендации._
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
@@ -51706,8 +51856,11 @@ async def life_events_select(callback: CallbackQuery, state: FSMContext):
     
     text = f"""📋 *ЖИЗНЕННЫЕ ОБСТОЯТЕЛЬСТВА*
 
-{name}, несколько важных вопросов о вашей жизни.
-Это поможет мне лучше понять вашу ситуацию.
+{name}, несколько вопросов о вашей жизни.
+
+💡 _Стресс, режим, окружение — всё это напрямую
+влияет на сон, HRV и работу мозга.
+Чем точнее картина — тем точнее рекомендации._
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
@@ -52019,13 +52172,13 @@ async def onb_process_stress(callback: CallbackQuery, state: FSMContext):
         "🌫️ Мозговой туман (забывчивость, рассеянность):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="1 Нет", callback_data="onb_fog_1"),
-                InlineKeyboardButton(text="2 Редко", callback_data="onb_fog_2"),
-                InlineKeyboardButton(text="3 Иногда", callback_data="onb_fog_3"),
+                InlineKeyboardButton(text="✅ Нет", callback_data="onb_fog_1"),
+                InlineKeyboardButton(text="1–2 р/мес", callback_data="onb_fog_2"),
+                InlineKeyboardButton(text="1–2 р/нед", callback_data="onb_fog_3"),
             ],
             [
-                InlineKeyboardButton(text="4 Часто", callback_data="onb_fog_4"),
-                InlineKeyboardButton(text="5 Постоянно", callback_data="onb_fog_5"),
+                InlineKeyboardButton(text="Почти каждый день", callback_data="onb_fog_4"),
+                InlineKeyboardButton(text="Постоянно", callback_data="onb_fog_5"),
             ],
         ])
     )
@@ -52149,7 +52302,7 @@ async def mini_test_go_onb(callback: CallbackQuery, state: FSMContext):
     await state.update_data(mini_test_answers={}, is_onboarding=True)
     
     q = MINI_TEST_QUESTIONS[1]
-    text = f"{q['block_title']}\n\n{q['text']}"
+    text = f"{q['block_title']}\n\n{q['text']}" if q.get('block_title') else q['text']
     
     await callback.message.edit_text(
         text,
@@ -54059,7 +54212,7 @@ CIRCADIAN_QUESTIONS = {
         ]
     },
     11: {
-        "text": "Вы используете телефон/планшет лёжа в постели?",
+        "text": "Что вы делаете *уже лёжа в кровати* —\nтелефон, книга или сразу спать?",
         "options": [
             ("Никогда", 0),
             ("Иногда по необходимости (будильник)", 1),
@@ -54069,7 +54222,7 @@ CIRCADIAN_QUESTIONS = {
         ]
     },
     12: {
-        "text": "Сколько времени вы проводите на улице (дневной свет) в среднем за день?",
+        "text": "Сколько *ДНЕВНОГО* света вы получаете\nпосле обеда?\n\n💡 _Утренний свет мы уже учли._",
         "options": [
             ("2+ часа", 0),
             ("1-2 часа", 1),
@@ -54598,7 +54751,8 @@ async def circadian_test_menu(callback: CallbackQuery, state: FSMContext):
     else:
         text = (
             "🌅 *ТЕСТ ЦИРКАДНЫХ РИТМОВ*\n\n"
-            "Этот тест оценит синхронизацию ваших циркадных ритмов.\n\n"
+            "Этот тест покажет режим выработки мелатонина —\n"
+            "и я подберу рекомендации по свету, экранам и режиму дня.\n\n"
             "⏱ Займёт ~3 минуты."
         )
     
@@ -58473,7 +58627,7 @@ _Направления для работы — без конкретных пр
             [InlineKeyboardButton(text="💎 Апгрейд до персонального — 4000₽", callback_data="pay_upgrade_personal")],
             [InlineKeyboardButton(text="🧬 Апгрейд до генетического — 12000₽", callback_data="pay_upgrade_genetic")],
             [InlineKeyboardButton(text="🔑 У меня есть промокод", callback_data="enter_promo")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="summary_detailed")]
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
         ]
     elif tariff['type'] == 'personal':
         text += f"""
@@ -58482,7 +58636,7 @@ _Направления для работы — без конкретных пр
         buttons = [
             [InlineKeyboardButton(text="🧬 Апгрейд до генетического — 8000₽", callback_data="pay_upgrade_genetic")],
             [InlineKeyboardButton(text="🔑 У меня есть промокод", callback_data="enter_promo")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="summary_detailed")]
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
         ]
     elif tariff['type'] == 'genetic':
         text += f"""
@@ -58490,7 +58644,7 @@ _Направления для работы — без конкретных пр
 ✅ Тебе доступно всё!
 """
         buttons = [
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="summary_detailed")]
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
         ]
     else:
         buttons = [
@@ -58498,7 +58652,7 @@ _Направления для работы — без конкретных пр
             [InlineKeyboardButton(text="💎 Персональный — 7000₽", callback_data="pay_personal")],
             [InlineKeyboardButton(text="🧬 Генетический — 15000₽", callback_data="pay_genetic")],
             [InlineKeyboardButton(text="🔑 У меня есть промокод", callback_data="enter_promo")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="summary_detailed")]
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
         ]
     
     await callback.message.edit_text(

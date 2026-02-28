@@ -2943,6 +2943,7 @@ async def init_db():
             ('medications', "TEXT DEFAULT ''"),
             ('chronic_conditions', "TEXT DEFAULT ''"),
             ('medications_asked', "TEXT DEFAULT ''"),
+            ('last_menu_msg_id', "INTEGER DEFAULT 0"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
@@ -9325,8 +9326,6 @@ class EveningStates(StatesGroup):
     waiting_relaxation = State()
     # ПОПРАВКА #75: тяга к допингу + засыпание
     waiting_craving = State()
-    waiting_sweet_amount = State()    # Количество сладкого
-    waiting_coffee_amount = State()   # Количество кофе
     waiting_falling_asleep = State()
     # БАГФИКС: Давление после ванны
     # ФАЗА 3: Вечерний HRV замер
@@ -28358,10 +28357,7 @@ async def onb_legal_accept(callback: CallbackQuery, state: FSMContext):
 @router.message(Command("menu"))
 async def cmd_menu(message: Message):
     """Команда /menu"""
-    user = await get_user(message.from_user.id)
-    mode = user.get("current_mode", "home") if user else "home"
-    phase = user.get("onboarding_phase", 0) if user else 0
-    await message.answer("📋 Главное меню:", reply_markup=get_menu_keyboard(onboarding_phase=phase or 0, current_mode=mode))
+    await show_main_menu(message.bot, message.from_user.id, message.chat.id)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -28805,17 +28801,42 @@ async def show_monthly_report_demo(message: Message, name: str, gender: str):
     )
 
 
+async def show_main_menu(bot, telegram_id: int, chat_id: int, edit_message=None):
+    """Утилита: показать Главное меню, удалив предыдущее (анти-дубль #19)"""
+    user = await get_user(telegram_id)
+    phase = user.get("onboarding_phase", 0) if user else 0
+    mode = user.get("current_mode", "home") if user else "home"
+    keyboard = get_menu_keyboard(onboarding_phase=phase or 0, current_mode=mode)
+    
+    # Если есть сообщение для edit — пробуем edit_text (не создаёт дубль)
+    if edit_message:
+        try:
+            await edit_message.edit_text("📋 Главное меню:", reply_markup=keyboard)
+            # Сохраняем msg_id отредактированного сообщения
+            await save_user(telegram_id, {"last_menu_msg_id": edit_message.message_id})
+            return edit_message
+        except:
+            pass  # Не удалось edit — пойдём через delete+answer
+    
+    # Удаляем предыдущее меню (если было)
+    old_menu_id = user.get("last_menu_msg_id", 0) if user else 0
+    if old_menu_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=old_menu_id)
+        except:
+            pass
+    
+    # Отправляем новое
+    msg = await bot.send_message(chat_id=chat_id, text="📋 Главное меню:", reply_markup=keyboard)
+    await save_user(telegram_id, {"last_menu_msg_id": msg.message_id})
+    return msg
+
+
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery):
     """Вернуться в меню"""
-    user = await get_user(callback.from_user.id)
-    phase = user.get("onboarding_phase", 0) if user else 0
-    mode = user.get("current_mode", "home") if user else "home"
-    await callback.message.edit_text(
-        "📋 Главное меню:", 
-        reply_markup=get_menu_keyboard(onboarding_phase=phase or 0, current_mode=mode)
-    )
     await callback.answer()
+    await show_main_menu(callback.bot, callback.from_user.id, callback.message.chat.id, edit_message=callback.message)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -32029,11 +32050,11 @@ MINI_TEST_QUESTIONS = {
         "block": "AHS-mini",
         "text": "❓ *Вопрос 15/18*\n\nКак быстро вы *ВОССТАНАВЛИВАЕТЕСЬ* после стресса?",
         "options": [
-            ("😵 Очень долго (дни/недели)", "mq15_0", 4),
-            ("😫 Долго (несколько дней)", "mq15_1", 3),
+            ("😵 Очень долго (неделя и больше)", "mq15_0", 4),
+            ("😫 Долго (3–5 дней)", "mq15_1", 3),
             ("😕 Умеренно (день-два)", "mq15_2", 2),
             ("🙂 Быстро (несколько часов)", "mq15_3", 1),
-            ("😊 Очень быстро", "mq15_4", 0),
+            ("😊 Очень быстро (меньше часа)", "mq15_4", 0),
         ],
         "field": "ahs_m4"
     },
@@ -32067,11 +32088,11 @@ MINI_TEST_QUESTIONS = {
         "block": "Circadian-mini",
         "text": "❓ *Вопрос 18/18* (последний!)\n\n*ЭКРАНЫ* (телефон, ТВ, компьютер) перед сном?",
         "options": [
-            ("📱 До самого засыпания", "mq18_0", 0),
-            ("💻 За 15-30 минут выключаю", "mq18_1", 1),
-            ("📺 За 30-60 минут", "mq18_2", 2),
-            ("📖 За 1-2 часа, читаю книгу", "mq18_3", 3),
-            ("🌙 Больше 2 часов без экранов", "mq18_4", 4),
+            ("📱 Экраны до засыпания", "mq18_0", 0),
+            ("💻 Выключаю за 15–30 мин до сна", "mq18_1", 1),
+            ("📺 Выключаю за 30–60 мин до сна", "mq18_2", 2),
+            ("📖 Выключаю за 1–2 часа до сна", "mq18_3", 3),
+            ("🌙 Без экранов 2+ часа до сна", "mq18_4", 4),
         ],
         "field": "circ_m3"
     },
@@ -39428,11 +39449,11 @@ async def evening_last_meal(callback: CallbackQuery, state: FSMContext):
         # Нет курса — пропускаем вопрос про ванну, идём к допингу
         await state.update_data(bath="skipped")
         await callback.message.answer(
-            "🍫 Тянуло сегодня на сладкое/кофе?",
+            "🍫 Тянуло сегодня на сладкое?",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🍫 Сладкое", callback_data="craving_sweet")],
-                [InlineKeyboardButton(text="☕ Кофе/чай", callback_data="craving_coffee")],
-                [InlineKeyboardButton(text="🍫☕ И то, и другое", callback_data="craving_both")],
+                [InlineKeyboardButton(text="🍬 Чуть-чуть", callback_data="craving_sweet_little")],
+                [InlineKeyboardButton(text="🍫 Умеренно", callback_data="craving_sweet_moderate")],
+                [InlineKeyboardButton(text="🍫🍫 Много", callback_data="craving_sweet_much")],
                 [InlineKeyboardButton(text="✅ Нет", callback_data="craving_none")]
             ])
         )
@@ -39481,11 +39502,11 @@ async def _evening_ask_craving(callback, state: FSMContext):
     name = user.get("name", "друг") if user else "друг"
     
     await callback.message.answer(
-        "🍫 Тянуло сегодня на сладкое/кофе?",
+        "🍫 Тянуло сегодня на сладкое?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🍫 Сладкое", callback_data="craving_sweet")],
-            [InlineKeyboardButton(text="☕ Кофе/чай", callback_data="craving_coffee")],
-            [InlineKeyboardButton(text="🍫☕ И то, и другое", callback_data="craving_both")],
+            [InlineKeyboardButton(text="🍬 Чуть-чуть", callback_data="craving_sweet_little")],
+            [InlineKeyboardButton(text="🍫 Умеренно", callback_data="craving_sweet_moderate")],
+            [InlineKeyboardButton(text="🍫🍫 Много", callback_data="craving_sweet_much")],
             [InlineKeyboardButton(text="✅ Нет", callback_data="craving_none")]
         ])
     )
@@ -39620,24 +39641,23 @@ async def evening_bp_diastolic(message: Message, state: FSMContext):
     
     # Переходим к тяге к допингу
     await message.answer(
-        "🍫 Тянуло сегодня на сладкое/кофе?",
+        "🍫 Тянуло сегодня на сладкое?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🍫 Сладкое", callback_data="craving_sweet")],
-            [InlineKeyboardButton(text="☕ Кофе/чай", callback_data="craving_coffee")],
-            [InlineKeyboardButton(text="🍫☕ И то, и другое", callback_data="craving_both")],
+            [InlineKeyboardButton(text="🍬 Чуть-чуть", callback_data="craving_sweet_little")],
+            [InlineKeyboardButton(text="🍫 Умеренно", callback_data="craving_sweet_moderate")],
+            [InlineKeyboardButton(text="🍫🍫 Много", callback_data="craving_sweet_much")],
             [InlineKeyboardButton(text="✅ Нет", callback_data="craving_none")]
         ])
     )
     await state.set_state(EveningStates.waiting_craving)
 
 
-# ПОПРАВКА #75: Тяга к допингу — с уточнением количества
+# ПОПРАВКА #75 + ПОПРАВКА дубль-кофе: Тяга к сладкому (кофе убран — уже в вопросе #5)
 @router.callback_query(EveningStates.waiting_craving, F.data.startswith("craving_"))
 async def evening_craving(callback: CallbackQuery, state: FSMContext):
-    """Тип допинга — переход к количеству"""
+    """Тяга к сладкому — объединён тип + количество в один вопрос"""
     await callback.answer()
     craving = callback.data.replace("craving_", "")
-    await state.update_data(craving_type=craving)
     
     # Удаляем предыдущее сообщение с кнопками
     try:
@@ -39649,119 +39669,23 @@ async def evening_craving(callback: CallbackQuery, state: FSMContext):
     name = user.get("name", "друг") if user else "друг"
     
     if craving == "none":
-        # Без допинга — сразу дальше
-        await state.update_data(sweet_amount="none", coffee_cups=0)
+        # Без тяги — сразу дальше
+        await state.update_data(craving_type="none", sweet_amount="none", coffee_cups=0)
         await evening_show_falling_asleep(callback.message, state, name)
-        
-    elif craving == "sweet":
-        # Только сладкое — спрашиваем количество
-        await callback.message.answer(
-            f"🍫 *СКОЛЬКО СЛАДКОГО?*\n\n"
-            f"{name}, примерно сколько сегодня?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🍬 Чуть-чуть (1-2 шт)", callback_data="sweet_little")],
-                [InlineKeyboardButton(text="🍫 Умеренно (3-5 шт)", callback_data="sweet_moderate")],
-                [InlineKeyboardButton(text="🍫🍫 Много (6+ или не считала)", callback_data="sweet_much")],
-            ])
-        )
-        await state.set_state(EveningStates.waiting_sweet_amount)
-        
-    elif craving == "coffee":
-        # Только кофе — спрашиваем чашки
-        await callback.message.answer(
-            f"☕ *СКОЛЬКО КОФЕ/ЧАЯ?*\n\n"
-            f"{name}, сколько чашек сегодня?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="☕ 1-2 чашки", callback_data="coffee_1-2")],
-                [InlineKeyboardButton(text="☕☕ 3-4 чашки", callback_data="coffee_3-4")],
-                [InlineKeyboardButton(text="☕☕☕ 5+ чашек", callback_data="coffee_5+")],
-            ])
-        )
-        await state.set_state(EveningStates.waiting_coffee_amount)
-        
-    elif craving == "both":
-        # И то, и другое — сначала сладкое
-        await callback.message.answer(
-            f"🍫 *СНАЧАЛА ПРО СЛАДКОЕ*\n\n"
-            f"{name}, примерно сколько сегодня?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🍬 Чуть-чуть (1-2 шт)", callback_data="sweet_little")],
-                [InlineKeyboardButton(text="🍫 Умеренно (3-5 шт)", callback_data="sweet_moderate")],
-                [InlineKeyboardButton(text="🍫🍫 Много (6+ или не считала)", callback_data="sweet_much")],
-            ])
-        )
-        await state.set_state(EveningStates.waiting_sweet_amount)
-
-
-# Обработчик количества сладкого
-@router.callback_query(EveningStates.waiting_sweet_amount, F.data.startswith("sweet_"))
-async def evening_sweet_amount(callback: CallbackQuery, state: FSMContext):
-    """Количество сладкого"""
-    await callback.answer()
-    amount = callback.data.replace("sweet_", "")
-    await state.update_data(sweet_amount=amount)
-    
-    # Удаляем предыдущее сообщение с кнопками
-    try:
-        await callback.message.delete()
-    except:
-        pass
-    
-    data = await state.get_data()
-    user = await get_user(callback.from_user.id)
-    name = user.get("name", "друг") if user else "друг"
-    
-    # Если было "both" — теперь спрашиваем кофе
-    if data.get("craving_type") == "both":
-        await callback.message.answer(
-            f"☕ *ТЕПЕРЬ ПРО КОФЕ/ЧАЙ*\n\n"
-            f"{name}, сколько чашек сегодня?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="☕ 1-2 чашки", callback_data="coffee_1-2")],
-                [InlineKeyboardButton(text="☕☕ 3-4 чашки", callback_data="coffee_3-4")],
-                [InlineKeyboardButton(text="☕☕☕ 5+ чашек", callback_data="coffee_5+")],
-            ])
-        )
-        await state.set_state(EveningStates.waiting_coffee_amount)
+    elif craving == "sweet_little":
+        await state.update_data(craving_type="sweet", sweet_amount="little", coffee_cups=0)
+        await evening_show_falling_asleep(callback.message, state, name)
+    elif craving == "sweet_moderate":
+        await state.update_data(craving_type="sweet", sweet_amount="moderate", coffee_cups=0)
+        await evening_show_falling_asleep(callback.message, state, name)
+    elif craving == "sweet_much":
+        await state.update_data(craving_type="sweet", sweet_amount="much", coffee_cups=0)
+        await evening_show_falling_asleep(callback.message, state, name)
     else:
-        # Только сладкое — идём дальше
-        await state.update_data(coffee_cups=0)
+        # Fallback для старых callback (sweet/coffee/both) — на случай если кто-то нажмёт из кэша
+        await state.update_data(craving_type=craving, sweet_amount="unknown", coffee_cups=0)
         await evening_show_falling_asleep(callback.message, state, name)
 
-
-# Обработчик количества кофе
-@router.callback_query(EveningStates.waiting_coffee_amount, F.data.startswith("coffee_"))
-async def evening_coffee_amount(callback: CallbackQuery, state: FSMContext):
-    """Количество кофе"""
-    await callback.answer()
-    amount = callback.data.replace("coffee_", "")
-    
-    # Удаляем предыдущее сообщение с кнопками
-    try:
-        await callback.message.delete()
-    except:
-        pass
-    
-    # Преобразуем в число
-    cups_map = {"1-2": 2, "3-4": 4, "5+": 6}
-    cups = cups_map.get(amount, 2)
-    
-    await state.update_data(coffee_cups=cups)
-    
-    data = await state.get_data()
-    # Если было только кофе (не both), устанавливаем sweet_amount = none
-    if data.get("craving_type") == "coffee":
-        await state.update_data(sweet_amount="none")
-    
-    user = await get_user(callback.from_user.id)
-    name = user.get("name", "друг") if user else "друг"
-    
-    # Идём к вопросу о засыпании
-    await evening_show_falling_asleep(callback.message, state, name)
 
 
 async def evening_show_falling_asleep(message, state: FSMContext, name: str):
@@ -52413,11 +52337,12 @@ async def onb_step2_tomorrow(callback: CallbackQuery):
     
     await callback.message.edit_text(
         f"👌 Хорошо, {name}!\n\n"
-        "Напомню завтра утром после чекина.\n\n"
-        "А пока можешь изучить базовые\n"
-        "рекомендации и начать с малого 💚",
+        "Для точных рекомендаций нужна полная картина — "
+        "мини-тест показал общие зоны, а полные тесты покажут что именно делать.\n\n"
+        "Если будет время — продолжи из меню «Диагностика».\n"
+        "Если нет — напомню завтра после чекина 💚",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 К результатам", callback_data="summary_report")],
+            [InlineKeyboardButton(text="📋 Продолжить диагностику", callback_data="onb_step2_now")],
             [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")],
         ])
     )
@@ -53811,14 +53736,14 @@ async def stress_test_history(callback: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════
 
 async def get_cached_test_answers(telegram_id: int, test_type: str) -> dict:
-    """Получить кэшированные ответы теста, если пройден <24ч назад"""
+    """Получить кэшированные ответы теста, если пройден <14 дней назад"""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("""
                 SELECT answers_json FROM test_answers_cache
                 WHERE telegram_id = ? AND test_type = ?
-                AND created_at > datetime('now', '-24 hours')
+                AND created_at > datetime('now', '-14 days')
                 ORDER BY created_at DESC LIMIT 1
             """, (telegram_id, test_type))
             row = await cursor.fetchone()
@@ -53871,6 +53796,129 @@ async def get_circadian_inherited(telegram_id: int) -> dict:
     if composite:
         return map_composite_to_circadian(composite)
     return {}
+
+
+# ═══════════════════════════════════════════════════════════════
+# НАСЛЕДОВАНИЕ МИНИ-ТЕСТ → SQS (Тест качества сна)
+# ═══════════════════════════════════════════════════════════════
+
+def map_composite_to_sqs(composite: dict) -> dict:
+    """Маппинг ответов мини-теста → баллы/ответы SQS теста.
+    Возвращает dict {q_num: {field: value, score_field: score}}
+    """
+    inherited = {}
+    
+    # sqs_m1 (mq7: часы сна) → q1
+    hours = composite.get("sqs_m1")
+    if hours is not None:
+        # mini: 0=мало ... 4=много → SQS: less5/5-6/6-7/7-8/8-9
+        mapping = {0: ("less5", 0), 1: ("5-6", 2), 2: ("6-7", 5), 3: ("7-8", 10), 4: ("8-9", 10)}
+        answer, score = mapping.get(hours, ("6-7", 5))
+        inherited[1] = {"q1_hours": answer, "q1_score": score, "q1_from_mini": True}
+    
+    # sqs_m2 (mq8: латентность) → q5
+    latency = composite.get("sqs_m2")
+    if latency is not None:
+        # mini: 0=долго ... 4=быстро → SQS: more60/30-60/20-30/10-20/less10
+        mapping = {0: ("more60", 0), 1: ("30-60", 1), 2: ("20-30", 3), 3: ("10-20", 5), 4: ("less10", 0)}
+        answer, score = mapping.get(latency, ("20-30", 3))
+        inherited[5] = {"q5_latency": answer, "q5_score": score, "q5_from_mini": True}
+    
+    # sqs_m3 (mq9: пробуждения) → q6
+    wakeups = composite.get("sqs_m3")
+    if wakeups is not None:
+        # mini: 0=много ... 4=нет → SQS: 5plus/3-4/1-2_slow/1-2_fast/0
+        mapping = {0: ("5plus", 0), 1: ("3-4", 1), 2: ("1-2_slow", 2), 3: ("1-2_fast", 4), 4: ("0", 5)}
+        answer, score = mapping.get(wakeups, ("1-2_slow", 2))
+        inherited[6] = {"q6_awakenings": answer, "q6_score": score, "q6_from_mini": True}
+    
+    # sqs_m4 (mq10: утреннее самочувствие) → q7
+    morning = composite.get("sqs_m4")
+    if morning is not None:
+        # mini: 0=плохо ... 4=отлично → SQS: exhausted/tired/ok/great
+        mapping = {0: ("exhausted", 0), 1: ("tired", 2), 2: ("ok", 3), 3: ("great", 5), 4: ("great", 5)}
+        answer, score = mapping.get(morning, ("ok", 3))
+        inherited[7] = {"q7_morning": answer, "q7_score": score, "q7_from_mini": True}
+    
+    # circ_m3 (mq18: экраны) → q16
+    screens = composite.get("circ_m3")
+    if screens is not None:
+        # mini: 0=до засыпания ... 4=2+ часа → SQS: yes/filter/no
+        mapping = {0: ("yes", 0), 1: ("yes", 0), 2: ("filter", 1), 3: ("no", 2), 4: ("no", 2)}
+        answer, score = mapping.get(screens, ("filter", 1))
+        inherited[16] = {"q16_screens": answer, "q16_score": score, "q16_from_mini": True}
+    
+    return inherited
+
+
+async def get_sqs_inherited(telegram_id: int) -> dict:
+    """Получить наследованные ответы для SQS теста"""
+    composite = await get_cached_test_answers(telegram_id, "composite")
+    if composite:
+        return map_composite_to_sqs(composite)
+    return {}
+
+
+# ═══════════════════════════════════════════════════════════════
+# НАСЛЕДОВАНИЕ МИНИ-ТЕСТ → AHS (Тест надпочечников)
+# ═══════════════════════════════════════════════════════════════
+
+def map_composite_to_ahs(composite: dict) -> dict:
+    """Маппинг ответов мини-теста → баллы AHS теста.
+    Возвращает dict {q_num: score}
+    """
+    inherited = {}
+    
+    # ahs_m1 (mq12: энергия утром) → ahs1 (утренняя усталость)
+    energy = composite.get("ahs_m1")
+    if energy is not None:
+        # mini: 0=нет энергии(4 балла) ... 4=отлично(0 баллов)
+        # AHS: 0-4 (0=никогда, 4=постоянно уставший)
+        # mini score уже = AHS score (инвертирован при создании мини-теста)
+        inherited[1] = energy
+    
+    # ahs_m2 (mq13: второе дыхание) → ahs4
+    second_wind = composite.get("ahs_m2")
+    if second_wind is not None:
+        inherited[4] = second_wind
+    
+    # ahs_m3 (mq14: тяга к сладкому/кофе) → ahs5 + ahs6 СПЕЦЛОГИКА
+    craving = composite.get("ahs_m3")
+    if craving is not None:
+        if craving <= 1:
+            # Слабая тяга — подставляем в оба
+            inherited[5] = min(craving, 1)  # ahs5 кофе
+            inherited[6] = min(craving, 1)  # ahs6 сладкое
+        # Если craving >= 2 — НЕ подставляем, спрашиваем отдельно (кофе и сладкое различаются)
+    
+    # ahs_m4 (mq15: восстановление после стресса) → ahs8
+    recovery = composite.get("ahs_m4")
+    if recovery is not None:
+        inherited[8] = recovery
+    
+    return inherited
+
+
+async def get_ahs_inherited(telegram_id: int) -> dict:
+    """Получить наследованные ответы для AHS теста"""
+    composite = await get_cached_test_answers(telegram_id, "composite")
+    if composite:
+        return map_composite_to_ahs(composite)
+    return {}
+
+
+async def _notify_skip_once(callback, state):
+    """Показать сообщение о пропуске один раз"""
+    data = await state.get_data()
+    if not data.get("_skip_notified"):
+        await state.update_data(_skip_notified=True)
+        try:
+            await callback.message.answer(
+                "💚 Часть ответов уже есть из мини-теста — "
+                "пропускаю повторы, чтобы не спрашивать дважды."
+            )
+        except:
+            pass
 
 
 def find_next_circadian_q(current_q: int, inherited: dict) -> int:
@@ -65823,18 +65871,27 @@ async def meds_before_roadmap_yes_handler(callback: CallbackQuery, state: FSMCon
     await callback.answer()
     await state.set_state("waiting_medications_text")
     await state.update_data(after_meds="roadmap_generate")
-    await callback.message.answer(
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    msg = await callback.message.answer(
         "📝 Напиши названия лекарств, которые принимаешь.\n\n"
         "Например: _Л-тироксин, Эналаприл, Сертралин_",
         parse_mode="Markdown",
     )
+    await state.update_data(meds_prompt_msg_id=msg.message_id)
 
 
 @router.callback_query(F.data == "medications_input")
 async def medications_input_handler(callback: CallbackQuery, state: FSMContext):
     """Начало ввода лекарств."""
     await callback.answer()
-    await callback.message.answer(
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    msg = await callback.message.answer(
         "💊 *Принимаешь ли ты лекарства на постоянной основе?*\n\n"
         "Это нужно, чтобы проверить совместимость с добавками в маршруте.",
         parse_mode="Markdown",
@@ -65844,6 +65901,7 @@ async def medications_input_handler(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="◀️ Назад", callback_data="settings")],
         ])
     )
+    await state.update_data(meds_prompt_msg_id=msg.message_id)
 
 
 @router.callback_query(F.data == "medications_no")
@@ -65851,6 +65909,10 @@ async def medications_no_handler(callback: CallbackQuery):
     """Пользователь не принимает лекарств."""
     await callback.answer()
     await save_user(callback.from_user.id, {"medications": "", "chronic_conditions": ""})
+    try:
+        await callback.message.delete()
+    except:
+        pass
     await callback.message.answer(
         "✅ Отлично, учту. Все добавки доступны без ограничений.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -65864,12 +65926,17 @@ async def medications_yes_handler(callback: CallbackQuery, state: FSMContext):
     """Пользователь принимает лекарства — запрашиваем список."""
     await callback.answer()
     await state.set_state("waiting_medications_text")
-    await callback.message.answer(
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    msg = await callback.message.answer(
         "📝 Напиши названия лекарств, которые принимаешь.\n\n"
         "Например: _Л-тироксин, Эналаприл, Сертралин_\n\n"
         "Это нужно для проверки совместимости с добавками.",
         parse_mode="Markdown",
     )
+    await state.update_data(meds_prompt_msg_id=msg.message_id)
 
 
 @router.message(F.text, StateFilter("waiting_medications_text"))
@@ -65879,11 +65946,21 @@ async def medications_text_receiver(message, state: FSMContext):
     await save_user(message.from_user.id, {"medications": meds})
     await state.set_state("waiting_conditions_text")
 
-    # Проверяем: нужно ли после лекарств генерировать маршрут?
     data = await state.get_data()
-    after_meds = data.get("after_meds")
 
-    await message.answer(
+    # Удаляем предыдущий промпт и сообщение пользователя
+    prev_msg_id = data.get("meds_prompt_msg_id")
+    if prev_msg_id:
+        try:
+            await message.bot.delete_message(message.chat.id, prev_msg_id)
+        except:
+            pass
+    try:
+        await message.delete()
+    except:
+        pass
+
+    msg = await message.answer(
         f"💊 Записала: _{meds}_\n\n"
         "Есть ли хронические заболевания?\n"
         "(гипотиреоз, диабет, гипертония и т.д.)",
@@ -65892,6 +65969,7 @@ async def medications_text_receiver(message, state: FSMContext):
             [InlineKeyboardButton(text="Нет", callback_data="conditions_no")],
         ])
     )
+    await state.update_data(conditions_msg_id=msg.message_id)
 
 
 @router.message(F.text, StateFilter("waiting_conditions_text"))
@@ -65903,13 +65981,25 @@ async def conditions_text_receiver(message, state: FSMContext):
 
     data = await state.get_data()
     after_meds = data.get("after_meds")
-    await state.clear()
+
+    # Удаляем предыдущее сообщение и ввод пользователя
+    prev_msg_id = data.get("conditions_msg_id")
+    if prev_msg_id:
+        try:
+            await message.bot.delete_message(message.chat.id, prev_msg_id)
+        except:
+            pass
+    try:
+        await message.delete()
+    except:
+        pass
 
     if after_meds == "roadmap_generate":
         await message.answer(
             f"✅ Записала: _{conds}_\n\n🗺️ Строю маршрут с учётом лекарств...",
             parse_mode="Markdown",
         )
+        await state.clear()  # Очищаем ПОСЛЕ ответа
         # Генерируем маршрут
         result = await generate_roadmap(tid)
         if result:
@@ -65943,6 +66033,7 @@ async def conditions_text_receiver(message, state: FSMContext):
         else:
             await message.answer("⚠️ Не удалось построить маршрут.")
     else:
+        await state.clear()  # Очищаем ПОСЛЕ ответа
         await message.answer(
             f"✅ Записала: _{conds}_\n\n"
             "При построении маршрута проверю совместимость добавок с твоими лекарствами.",
@@ -65962,10 +66053,16 @@ async def conditions_no_handler(callback: CallbackQuery, state: FSMContext):
 
     data = await state.get_data()
     after_meds = data.get("after_meds")
-    await state.clear()
+
+    # Удаляем предыдущее сообщение
+    try:
+        await callback.message.delete()
+    except:
+        pass
 
     if after_meds == "roadmap_generate":
         await callback.message.answer("🗺️ Строю маршрут с учётом лекарств...")
+        await state.clear()  # Очищаем ПОСЛЕ ответа
         result = await generate_roadmap(tid)
         if result:
             user = await get_user(tid)
@@ -65997,6 +66094,7 @@ async def conditions_no_handler(callback: CallbackQuery, state: FSMContext):
         else:
             await callback.message.answer("⚠️ Не удалось построить маршрут.")
     else:
+        await state.clear()  # Очищаем ПОСЛЕ ответа
         await callback.message.answer(
             "✅ Учтено. Проверю совместимость лекарств с добавками при построении маршрута.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -69036,13 +69134,51 @@ async def sleep_test_menu(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "sleep_test_start")
 async def sleep_test_start(callback: CallbackQuery, state: FSMContext):
-    """Начало теста качества сна"""
+    """Начало теста качества сна — с пропуском дублей из мини-теста"""
     await callback.answer()
     
     # Проверка доступа PRO
     access = await check_pro_test_access(callback.from_user.id, "sleep_test_start")
     if not access['allowed']:
         await show_test_locked(callback, access)
+        return
+    
+    # Загружаем наследованные ответы из мини-теста
+    inherited = await get_sqs_inherited(callback.from_user.id)
+    await state.update_data(sqs_inherited=inherited)
+    
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    
+    # Проверяем: можно ли пропустить q1?
+    if 1 in inherited:
+        # Пропускаем q1, подставляем ответ
+        await state.update_data(**inherited[1])
+        await _notify_skip_once(callback, state)
+        
+        # Показываем q2 (стабильность отхода ко сну)
+        text = """🛏 *БЛОК 1: КОЛИЧЕСТВО И РЕЖИМ*
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+*Вопрос 2 из 18*
+
+🕐 *Насколько стабильное у вас время отхода ко сну?*
+
+Сравните будни и выходные."""
+
+        buttons = [
+            [InlineKeyboardButton(text="✅ Каждый день ±15 минут", callback_data="sq2_15min")],
+            [InlineKeyboardButton(text="👍 Каждый день ±30 минут", callback_data="sq2_30min")],
+            [InlineKeyboardButton(text="😐 Каждый день ±1 час", callback_data="sq2_1hour")],
+            [InlineKeyboardButton(text="😟 Каждый день по-разному", callback_data="sq2_random")],
+        ]
+        
+        await callback.message.edit_text(
+            text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+        await state.set_state(SleepTestStates.waiting_q2)
         return
     
     user = await get_user(callback.from_user.id)
@@ -69199,7 +69335,88 @@ async def sleep_q4(callback: CallbackQuery, state: FSMContext):
     
     await state.update_data(q4_alarm=answer, q4_score=scores.get(answer, 0))
     
-    # БЛОК 2 начинается
+    # === ПРОПУСК ДУБЛЕЙ: q5→q6→q7 каскад ===
+    inherited = (await state.get_data()).get("sqs_inherited", {})
+    
+    # Проверяем q5 (латентность)
+    if 5 in inherited:
+        await state.update_data(**inherited[5])
+        await _notify_skip_once(callback, state)
+        
+        # Проверяем q6 (пробуждения)
+        if 6 in inherited:
+            await state.update_data(**inherited[6])
+            
+            # Проверяем q7 (утреннее самочувствие)
+            if 7 in inherited:
+                await state.update_data(**inherited[7])
+                # Все три пропущены → показываем q8 (храп)
+                text = """🚨 *БЛОК 3: ПРИЗНАКИ АПНОЭ СНА*
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ *КРИТИЧЕСКИ ВАЖНЫЙ БЛОК!*
+
+Апноэ сна — это остановки дыхания во сне.
+Часто человек не знает, что это есть!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+*Вопрос 8 из 18*
+
+😤 *Храпите ли вы?*
+
+Спросите партнёра/семью, если не знаете."""
+                buttons = [
+                    [InlineKeyboardButton(text="✅ Нет, никогда", callback_data="sq8_never")],
+                    [InlineKeyboardButton(text="🙂 Иногда (при простуде)", callback_data="sq8_sometimes")],
+                    [InlineKeyboardButton(text="😐 Регулярно, но негромко", callback_data="sq8_regular")],
+                    [InlineKeyboardButton(text="🔴 Громко (слышно в соседней комнате)", callback_data="sq8_loud")],
+                ]
+                await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+                await state.set_state(SleepTestStates.waiting_q8)
+                return
+            
+            # q5+q6 пропущены, q7 нет → показываем q7
+            text = """🛏 *БЛОК 2: КАЧЕСТВО СНА*
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+*Вопрос 7 из 18*
+
+🌅 *Как вы чувствуете себя утром?*
+
+Первые 30-60 минут после пробуждения."""
+            buttons = [
+                [InlineKeyboardButton(text="😊 Бодрый, отдохнувший", callback_data="sq7_great")],
+                [InlineKeyboardButton(text="🙂 Нормально", callback_data="sq7_ok")],
+                [InlineKeyboardButton(text="😐 Немного уставший", callback_data="sq7_tired")],
+                [InlineKeyboardButton(text="😰 Разбитый, не выспавшийся", callback_data="sq7_exhausted")],
+            ]
+            await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+            await state.set_state(SleepTestStates.waiting_q7)
+            return
+        
+        # q5 пропущен, q6 нет → показываем q6
+        text = """🛏 *БЛОК 2: КАЧЕСТВО СНА*
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+*Вопрос 6 из 18*
+
+🌙 *Сколько раз вы просыпаетесь за ночь?*"""
+        buttons = [
+            [InlineKeyboardButton(text="✅ 0 раз (сплю до утра)", callback_data="sq6_0")],
+            [InlineKeyboardButton(text="✅ 1-2 раза (быстро засыпаю)", callback_data="sq6_1-2_fast")],
+            [InlineKeyboardButton(text="😐 1-2 раза (долго засыпаю)", callback_data="sq6_1-2_slow")],
+            [InlineKeyboardButton(text="😟 3-4 раза", callback_data="sq6_3-4")],
+            [InlineKeyboardButton(text="😰 5+ раз", callback_data="sq6_5plus")],
+        ]
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        await state.set_state(SleepTestStates.waiting_q6)
+        return
+    
+    # === q5 НЕ пропущен — показываем как обычно ===
     text = """🛏 *БЛОК 2: КАЧЕСТВО СНА*
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -69237,6 +69454,64 @@ async def sleep_q5(callback: CallbackQuery, state: FSMContext):
     
     await state.update_data(q5_latency=answer, q5_score=scores.get(answer, 0))
     
+    # === ПРОПУСК ДУБЛЕЙ: q6→q7 каскад ===
+    inherited = (await state.get_data()).get("sqs_inherited", {})
+    
+    if 6 in inherited:
+        await state.update_data(**inherited[6])
+        await _notify_skip_once(callback, state)
+        
+        if 7 in inherited:
+            await state.update_data(**inherited[7])
+            # q6+q7 пропущены → показываем q8
+            text = """🚨 *БЛОК 3: ПРИЗНАКИ АПНОЭ СНА*
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ *КРИТИЧЕСКИ ВАЖНЫЙ БЛОК!*
+
+Апноэ сна — это остановки дыхания во сне.
+Часто человек не знает, что это есть!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+*Вопрос 8 из 18*
+
+😤 *Храпите ли вы?*
+
+Спросите партнёра/семью, если не знаете."""
+            buttons = [
+                [InlineKeyboardButton(text="✅ Нет, никогда", callback_data="sq8_never")],
+                [InlineKeyboardButton(text="🙂 Иногда (при простуде)", callback_data="sq8_sometimes")],
+                [InlineKeyboardButton(text="😐 Регулярно, но негромко", callback_data="sq8_regular")],
+                [InlineKeyboardButton(text="🔴 Громко (слышно в соседней комнате)", callback_data="sq8_loud")],
+            ]
+            await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+            await state.set_state(SleepTestStates.waiting_q8)
+            return
+        
+        # q6 пропущен, q7 нет → показываем q7
+        text = """🛏 *БЛОК 2: КАЧЕСТВО СНА*
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+*Вопрос 7 из 18*
+
+🌅 *Как вы чувствуете себя утром?*
+
+Первые 30-60 минут после пробуждения."""
+        buttons = [
+            [InlineKeyboardButton(text="😊 Бодрый, отдохнувший", callback_data="sq7_great")],
+            [InlineKeyboardButton(text="🙂 Нормально", callback_data="sq7_ok")],
+            [InlineKeyboardButton(text="😐 Немного уставший", callback_data="sq7_tired")],
+            [InlineKeyboardButton(text="😰 Разбитый, не выспавшийся", callback_data="sq7_exhausted")],
+        ]
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        await state.set_state(SleepTestStates.waiting_q7)
+        return
+    
+    # === q6 НЕ пропущен — показываем как обычно ===
+    
     text = """🛏 *БЛОК 2: КАЧЕСТВО СНА*
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -69270,6 +69545,41 @@ async def sleep_q6(callback: CallbackQuery, state: FSMContext):
     scores = {"0": 5, "1-2_fast": 4, "1-2_slow": 2, "3-4": 1, "5plus": 0}
     
     await state.update_data(q6_awakenings=answer, q6_score=scores.get(answer, 0))
+    
+    # === ПРОПУСК ДУБЛЕЙ: q7 ===
+    inherited = (await state.get_data()).get("sqs_inherited", {})
+    
+    if 7 in inherited:
+        await state.update_data(**inherited[7])
+        await _notify_skip_once(callback, state)
+        # q7 пропущен → показываем q8
+        text = """🚨 *БЛОК 3: ПРИЗНАКИ АПНОЭ СНА*
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ *КРИТИЧЕСКИ ВАЖНЫЙ БЛОК!*
+
+Апноэ сна — это остановки дыхания во сне.
+Часто человек не знает, что это есть!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+*Вопрос 8 из 18*
+
+😤 *Храпите ли вы?*
+
+Спросите партнёра/семью, если не знаете."""
+        buttons = [
+            [InlineKeyboardButton(text="✅ Нет, никогда", callback_data="sq8_never")],
+            [InlineKeyboardButton(text="🙂 Иногда (при простуде)", callback_data="sq8_sometimes")],
+            [InlineKeyboardButton(text="😐 Регулярно, но негромко", callback_data="sq8_regular")],
+            [InlineKeyboardButton(text="🔴 Громко (слышно в соседней комнате)", callback_data="sq8_loud")],
+        ]
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        await state.set_state(SleepTestStates.waiting_q8)
+        return
+    
+    # === q7 НЕ пропущен — показываем как обычно ===
     
     text = """🛏 *БЛОК 2: КАЧЕСТВО СНА*
 
@@ -69576,6 +69886,31 @@ async def sleep_q15(callback: CallbackQuery, state: FSMContext):
     scores = {"great": 1, "ok": 1, "bad": 0}
     
     await state.update_data(q15_mattress=answer, q15_score=scores.get(answer, 0))
+    
+    # === ПРОПУСК ДУБЛЕЙ: q16 (экраны) ===
+    inherited = (await state.get_data()).get("sqs_inherited", {})
+    
+    if 16 in inherited:
+        await state.update_data(**inherited[16])
+        await _notify_skip_once(callback, state)
+        # q16 пропущен → показываем q17
+        text = """🛏 *БЛОК 5: ПРИВЫЧКИ ПЕРЕД СНОМ*
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+*Вопрос 17 из 18*
+
+☕ *Пьёте ли вы кофе или чай (кроме травяного) после 14:00?*"""
+        buttons = [
+            [InlineKeyboardButton(text="✅ Нет, никогда", callback_data="sq17_never")],
+            [InlineKeyboardButton(text="😐 Иногда (1-2 раза/неделя)", callback_data="sq17_sometimes")],
+            [InlineKeyboardButton(text="🔴 Регулярно", callback_data="sq17_regular")],
+        ]
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        await state.set_state(SleepTestStates.waiting_q17)
+        return
+    
+    # === q16 НЕ пропущен — показываем как обычно ===
     
     # БЛОК 5: Привычки перед сном
     text = """🛏 *БЛОК 5: ПРИВЫЧКИ ПЕРЕД СНОМ*
@@ -70194,13 +70529,37 @@ def get_ahs_keyboard(question_num: int) -> InlineKeyboardMarkup:
     """Клавиатура для вопросов AHS"""
     
     # Специальные клавиатуры для некоторых вопросов
-    if question_num == 5:  # Кофе
+    if question_num == 5:  # Кофе — шкала зависимости
         buttons = [
-            [InlineKeyboardButton(text="☕ 0-1 чашка", callback_data="ahs_q5_0")],
-            [InlineKeyboardButton(text="☕☕ 2 чашки", callback_data="ahs_q5_1")],
-            [InlineKeyboardButton(text="☕☕☕ 3-4 чашки", callback_data="ahs_q5_2")],
-            [InlineKeyboardButton(text="☕☕☕☕ 5+ чашек", callback_data="ahs_q5_3")],
-            [InlineKeyboardButton(text="💀 Не могу без кофе", callback_data="ahs_q5_4")]
+            [InlineKeyboardButton(text="✅ Не пью кофе", callback_data="ahs_q5_0")],
+            [InlineKeyboardButton(text="☕ 1 чашка, по желанию", callback_data="ahs_q5_1")],
+            [InlineKeyboardButton(text="☕ 1–2 чашки, обязательно", callback_data="ahs_q5_2")],
+            [InlineKeyboardButton(text="☕☕ 3+ чашки, иначе не работаю", callback_data="ahs_q5_3")],
+            [InlineKeyboardButton(text="💀 Кофе уже не помогает", callback_data="ahs_q5_4")]
+        ]
+    elif question_num == 6:  # Тяга к сладкому — шкала интенсивности
+        buttons = [
+            [InlineKeyboardButton(text="✅ Нет тяги", callback_data="ahs_q6_0")],
+            [InlineKeyboardButton(text="🍪 Иногда хочется, легко отказаться", callback_data="ahs_q6_1")],
+            [InlineKeyboardButton(text="🍫 Регулярно тянет", callback_data="ahs_q6_2")],
+            [InlineKeyboardButton(text="🍫 Каждый день, трудно устоять", callback_data="ahs_q6_3")],
+            [InlineKeyboardButton(text="🍫🍫 Не могу без сладкого/солёного", callback_data="ahs_q6_4")]
+        ]
+    elif question_num == 7:  # Зависимость от стимуляторов — градация
+        buttons = [
+            [InlineKeyboardButton(text="✅ Не использую стимуляторы", callback_data="ahs_q7_0")],
+            [InlineKeyboardButton(text="☕ Пью кофе, но могу без него", callback_data="ahs_q7_1")],
+            [InlineKeyboardButton(text="⚡ Нужен кофе/энергетик каждый день", callback_data="ahs_q7_2")],
+            [InlineKeyboardButton(text="🚬 Несколько стимуляторов ежедневно", callback_data="ahs_q7_3")],
+            [InlineKeyboardButton(text="💀 Без стимуляторов не функционирую", callback_data="ahs_q7_4")]
+        ]
+    elif question_num == 8:  # Восстановление после стресса — диапазоны
+        buttons = [
+            [InlineKeyboardButton(text="😊 Очень быстро (меньше часа)", callback_data="ahs_q8_0")],
+            [InlineKeyboardButton(text="🙂 Быстро (несколько часов)", callback_data="ahs_q8_1")],
+            [InlineKeyboardButton(text="😕 Умеренно (день-два)", callback_data="ahs_q8_2")],
+            [InlineKeyboardButton(text="😫 Долго (3–5 дней)", callback_data="ahs_q8_3")],
+            [InlineKeyboardButton(text="😵 Очень долго (неделя и больше)", callback_data="ahs_q8_4")]
         ]
     elif question_num == 10:  # Панические атаки
         buttons = [
@@ -70270,7 +70629,7 @@ AHS_QUESTIONS = {
     },
     8: {
         'text': '😤 *Вопрос 8/12 — БЛОК: СТРЕСС*\n\n'
-                'Вы долго восстанавливаетесь после стресса?\nКак часто такое бывает?',
+                'Как быстро вы восстанавливаетесь после стресса?',
         'block': 'stress'
     },
     9: {
@@ -70350,7 +70709,7 @@ async def ahs_test_menu(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "ahs_test_start")
 async def ahs_test_start(callback: CallbackQuery, state: FSMContext):
-    """Начало теста БГС"""
+    """Начало теста БГС — с пропуском дублей из мини-теста"""
     await callback.answer()
     
     # Проверка доступа PRO
@@ -70360,6 +70719,19 @@ async def ahs_test_start(callback: CallbackQuery, state: FSMContext):
         return
     
     await state.clear()
+    
+    # Загружаем наследованные ответы из мини-теста
+    inherited = await get_ahs_inherited(callback.from_user.id)
+    await state.update_data(ahs_inherited=inherited)
+    
+    # Проверяем: можно ли пропустить ahs1?
+    if 1 in inherited:
+        await state.update_data(ahs1=inherited[1])
+        await _notify_skip_once(callback, state)
+        # Показываем ahs2
+        await callback.message.edit_text(AHS_QUESTIONS[2]['text'], parse_mode="Markdown", reply_markup=get_ahs_keyboard(2))
+        await state.set_state(AHSTestStates.waiting_ahs2)
+        return
     
     text = AHS_QUESTIONS[1]['text']
     
@@ -70391,6 +70763,15 @@ async def ahs_q2_handler(callback: CallbackQuery, state: FSMContext):
 async def ahs_q3_handler(callback: CallbackQuery, state: FSMContext):
     score = int(callback.data.split("_")[-1])
     await state.update_data(ahs3=score)
+    # === ПРОПУСК ДУБЛЕЙ: ahs4 (второе дыхание) ===
+    inherited = (await state.get_data()).get("ahs_inherited", {})
+    if 4 in inherited:
+        await state.update_data(ahs4=inherited[4])
+        await _notify_skip_once(callback, state)
+        # Показываем ahs5
+        await callback.message.edit_text(AHS_QUESTIONS[5]['text'], parse_mode="Markdown", reply_markup=get_ahs_keyboard(5))
+        await state.set_state(AHSTestStates.waiting_ahs5)
+        return
     await callback.message.edit_text(AHS_QUESTIONS[4]['text'], parse_mode="Markdown", reply_markup=get_ahs_keyboard(4))
     await state.set_state(AHSTestStates.waiting_ahs4)
 
@@ -70398,6 +70779,21 @@ async def ahs_q3_handler(callback: CallbackQuery, state: FSMContext):
 async def ahs_q4_handler(callback: CallbackQuery, state: FSMContext):
     score = int(callback.data.split("_")[-1])
     await state.update_data(ahs4=score)
+    # === ПРОПУСК ДУБЛЕЙ: ahs5+ahs6 (кофе + сладкое) ===
+    inherited = (await state.get_data()).get("ahs_inherited", {})
+    if 5 in inherited:
+        await state.update_data(ahs5=inherited[5])
+        await _notify_skip_once(callback, state)
+        if 6 in inherited:
+            await state.update_data(ahs6=inherited[6])
+            # Оба пропущены → показываем ahs7
+            await callback.message.edit_text(AHS_QUESTIONS[7]['text'], parse_mode="Markdown", reply_markup=get_ahs_keyboard(7))
+            await state.set_state(AHSTestStates.waiting_ahs7)
+            return
+        # ahs5 пропущен, ahs6 нет → показываем ahs6
+        await callback.message.edit_text(AHS_QUESTIONS[6]['text'], parse_mode="Markdown", reply_markup=get_ahs_keyboard(6))
+        await state.set_state(AHSTestStates.waiting_ahs6)
+        return
     await callback.message.edit_text(AHS_QUESTIONS[5]['text'], parse_mode="Markdown", reply_markup=get_ahs_keyboard(5))
     await state.set_state(AHSTestStates.waiting_ahs5)
 
@@ -70419,6 +70815,15 @@ async def ahs_q6_handler(callback: CallbackQuery, state: FSMContext):
 async def ahs_q7_handler(callback: CallbackQuery, state: FSMContext):
     score = int(callback.data.split("_")[-1])
     await state.update_data(ahs7=score)
+    # === ПРОПУСК ДУБЛЕЙ: ahs8 (восстановление после стресса) ===
+    inherited = (await state.get_data()).get("ahs_inherited", {})
+    if 8 in inherited:
+        await state.update_data(ahs8=inherited[8])
+        await _notify_skip_once(callback, state)
+        # Показываем ahs9
+        await callback.message.edit_text(AHS_QUESTIONS[9]['text'], parse_mode="Markdown", reply_markup=get_ahs_keyboard(9))
+        await state.set_state(AHSTestStates.waiting_ahs9)
+        return
     await callback.message.edit_text(AHS_QUESTIONS[8]['text'], parse_mode="Markdown", reply_markup=get_ahs_keyboard(8))
     await state.set_state(AHSTestStates.waiting_ahs8)
 

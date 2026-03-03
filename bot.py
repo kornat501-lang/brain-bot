@@ -149,7 +149,7 @@ HARD_DAY_MESSAGES = [
     "Слышу тебя. Напоминаю: папка SOS 🆘 "
     "с когерентным дыханием — твоя скорая помощь. "
     "А 4-7-8 перед сном поможет телу перезагрузиться за ночь. "
-    "Сегодня это must-do.",
+    "Сегодня это обязательно.",
 ]
 
 # ── Генетические пулы сообщений (Трек 3) ──
@@ -2944,6 +2944,11 @@ async def init_db():
             ('chronic_conditions', "TEXT DEFAULT ''"),
             ('medications_asked', "TEXT DEFAULT ''"),
             ('last_menu_msg_id', "INTEGER DEFAULT 0"),
+            ('bath_level', "TEXT DEFAULT 'basic'"),
+            # ПОПРАВКА #50: Статус болезни
+            ('is_sick', "INTEGER DEFAULT 0"),
+            ('sick_since', "TEXT"),
+            ('sick_recovery_day', "INTEGER DEFAULT 0"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
@@ -2974,14 +2979,14 @@ async def init_db():
 TIP_CATALOG = {
     "soft_start": {
         "title": "Мягкий старт", "emoji": "🌅", "category": "energy", "priority": 2,
-        "short": "🌅 Тяжёлое утро? Мягкий старт:\n10 вдохов → свет + вода → растяжка → кофе через 15 мин",
+        "short": "🌅 Тяжёлое утро? План:\n💧 Холодная вода на лицо и/или контрастный душ\n☀️ Свет 10 мин\n☕ Кофе до обеда, после — травяной\n🥩 Завтрак с белком",
         "full": (
             "🌅 *Протокол мягкого старта*\n\n"
             "Когда тяжело встать — не заставляй себя. Помоги телу включиться:\n\n"
             "1️⃣ *Лёжа:* 10 глубоких вдохов (4 сек вдох — 6 сек выдох)\n"
             "2️⃣ *Встать* → открыть шторы → 400 мл воды\n"
             "3️⃣ *Растяжка* шеи и плеч (1 минута)\n"
-            "4️⃣ *Душ* или хотя бы холодные руки/лицо\n"
+            "4️⃣ *Контрастный душ* или хотя бы холодная вода на лицо\n"
             "5️⃣ *Кофе* через 15-20 мин после подъёма\n\n"
             "☕ Кофе после плохого сна — строго до 14:00!\n"
             "📱 Телефон — не раньше чем через 10 мин.\n"
@@ -7338,7 +7343,7 @@ def format_test_progress(test_type: str, current: dict, previous: dict) -> str:
         score_now = current.get('sqs_total', 0)
         score_prev = previous.get('sqs_total', 0) if previous else None
         
-        text = f"😴 *Сон (SQS):*\n"
+        text = f"😴 *Сон:*\n"
         text += f"   Результат: {score_now}/40\n"
         
         if score_prev is not None:
@@ -7374,7 +7379,7 @@ def format_test_progress(test_type: str, current: dict, previous: dict) -> str:
         pss_now = current.get('pss_total', 0)
         pss_prev = previous.get('pss_total', 0) if previous else None
         
-        text = f"😰 *Стресс (PSS):*\n"
+        text = f"😰 *Стресс:*\n"
         text += f"   Результат: {pss_now}/40\n"
         
         if pss_prev is not None:
@@ -8934,7 +8939,7 @@ async def generate_monthly_report(telegram_id: int) -> str:
         else:
             report += f"🫀 БГС:    {get_ahs_stage_text(stage_b) if stage_b else '—':15} → {get_ahs_stage_text(stage_c) if stage_c else '—'}\n"
     
-    # Сон (SQS)
+    # Сон
     sqs_b = baseline.get('sqs_total')
     sqs_p = previous.get('sqs_total') if has_previous else None
     sqs_c = current.get('sqs_total')
@@ -9151,13 +9156,13 @@ async def show_detailed_stats(callback: CallbackQuery):
 """
     
     if current.get('sqs_total'):
-        text += f"• Сон (SQS): {current['sqs_total']}/40 {get_score_emoji(current['sqs_total'], 40)}\n"
+        text += f"• Сон: {current['sqs_total']}/40 {get_score_emoji(current['sqs_total'], 40)}\n"
     
     if current.get('circadian_score'):
         text += f"• Циркадка: {current['circadian_score']}/60 {get_score_emoji(current['circadian_score'], 60)}\n"
     
     if current.get('pss_total'):
-        text += f"• Стресс (PSS): {current['pss_total']}/40 {get_score_emoji(current['pss_total'], 40, True)}\n"
+        text += f"• Стресс: {current['pss_total']}/40 {get_score_emoji(current['pss_total'], 40, True)}\n"
     
     if current.get('ahs_total'):
         text += f"• БГС: {get_ahs_stage_text(current.get('ahs_stage'))}\n"
@@ -9308,6 +9313,11 @@ class MorningStates(StatesGroup):
     waiting_yesterday_exercise = State()
     # Ретроспективный вопрос о времени засыпания
     waiting_retro_bedtime = State()
+    # ПОПРАВКА #46: Перенесено из вечернего чекина
+    waiting_falling_asleep = State()
+    waiting_screens_yesterday = State()
+    # ПОПРАВКА #50: Проверка температуры при болезни
+    waiting_temperature = State()
 
 
 class EveningStates(StatesGroup):
@@ -10226,25 +10236,25 @@ COGNITIVE_WEIGHTS = {
 # Вопросы когнитивного трекера
 COGNITIVE_QUESTIONS = {
     "mental_clarity": {
-        "question": "🧠 **ЯСНОСТЬ МЫШЛЕНИЯ**\n\nКак вы оцениваете ясность своего мышления за последнюю неделю?",
+        "question": "🧠 **ЯСНОСТЬ МЫШЛЕНИЯ**\n\nКак вы оцениваете ясность своего мышления *ЗА ПОСЛЕДНЮЮ НЕДЕЛЮ*?",
         "scale_low": "Сильный туман, трудно думать",
         "scale_high": "Кристально ясное, острое",
         "info": "💡 «Туман в голове» — ощущение, что мысли как будто в вате, трудно сосредоточиться."
     },
     "concentration": {
-        "question": "🎯 **КОНЦЕНТРАЦИЯ**\n\nНасколько легко вам было сосредоточиться на задачах на этой неделе?",
+        "question": "🎯 **КОНЦЕНТРАЦИЯ**\n\nНасколько легко вам было сосредоточиться на задачах *НА ЭТОЙ НЕДЕЛЕ*?",
         "scale_low": "Практически не могу концентрироваться",
         "scale_high": "Легко фокусируюсь на часы",
         "info": None
     },
     "short_term_memory": {
-        "question": "📝 **ПАМЯТЬ (краткосрочная)**\n\nКак часто вы забывали что-то на этой неделе?\n(куда положил, что хотел сделать, имена...)",
+        "question": "📝 **ПАМЯТЬ (краткосрочная)**\n\nКак часто вы забывали что-то *НА ЭТОЙ НЕДЕЛЕ*?\n(куда положил, что хотел сделать, имена...)",
         "scale_low": "Постоянно забываю",
         "scale_high": "Почти ничего не забывал",
         "info": "💡 Примеры: зашёл в комнату и забыл зачем, искал очки на голове, забыл имя..."
     },
     "processing_speed": {
-        "question": "⚡ **СКОРОСТЬ МЫШЛЕНИЯ**\n\nКак быстро вы «соображали» на этой неделе?",
+        "question": "⚡ **СКОРОСТЬ МЫШЛЕНИЯ**\n\nКак быстро вы «соображали» *НА ЭТОЙ НЕДЕЛЕ*?",
         "scale_low": "Очень медленно, «тормоза»",
         "scale_high": "Очень быстро, мгновенно схватываю",
         "info": "💡 Как быстро находите нужное слово, понимаете новую информацию, принимаете решения."
@@ -10262,18 +10272,18 @@ COGNITIVE_QUESTIONS = {
         "info": None
     },
     "decision_making": {
-        "question": "🤔 **ПРИНЯТИЕ РЕШЕНИЙ**\n\nНасколько легко вам было принимать решения на этой неделе (даже простые)?",
+        "question": "🤔 **ПРИНЯТИЕ РЕШЕНИЙ**\n\nНасколько легко вам было принимать решения *НА ЭТОЙ НЕДЕЛЕ* (даже простые)?",
         "scale_low": "Парализует, не могу решить",
         "scale_high": "Легко и уверенно решаю",
         "info": None
     },
     "brain_fog_days": {
-        "question": "🌫️ **«ТУМАН В ГОЛОВЕ»**\n\nСколько дней на этой неделе вы испытывали ощущение «тумана в голове»?",
+        "question": "🌫️ **«ТУМАН В ГОЛОВЕ»**\n\nСколько дней *НА ЭТОЙ НЕДЕЛЕ* вы испытывали ощущение «тумана в голове»?",
         "scale_type": "days",  # Специальный тип: 0-7 дней
         "info": "💡 «Туман» — когда голова «ватная», трудно думать, снижена ясность и концентрация."
     },
     "overall_cognitive": {
-        "question": "🧠 **ОБЩАЯ КОГНИТИВНАЯ ФОРМА**\n\nКак бы вы оценили работу своего мозга за последнюю неделю В ЦЕЛОМ?",
+        "question": "🧠 **ОБЩАЯ КОГНИТИВНАЯ ФОРМА**\n\nКак бы вы оценили работу своего мозга *ЗА ПОСЛЕДНЮЮ НЕДЕЛЮ* В ЦЕЛОМ?",
         "scale_low": "Очень плохо, беспокоюсь",
         "scale_high": "Отлично! Лучше, чем обычно",
         "info": None
@@ -10284,7 +10294,7 @@ COGNITIVE_QUESTIONS = {
         "info": "💡 Запоминание снов = маркер качества REM-сна. REM = консолидация памяти + очистка мозга."
     },
     "creativity": {
-        "question": "💡 **КРЕАТИВНОСТЬ**\n\nКак легко приходили новые идеи, решения, творческие мысли на этой неделе?",
+        "question": "💡 **КРЕАТИВНОСТЬ**\n\nКак легко приходили новые идеи, решения, творческие мысли *НА ЭТОЙ НЕДЕЛЕ*?",
         "scale_low": "Полный ступор",
         "scale_high": "Фонтан идей!",
         "info": None
@@ -11478,17 +11488,26 @@ MORNING_RESPONSES = {
 ├── Утренний свет: {light}
 └── Завтрак: {breakfast}
 
-Это сигнал, что организму нужна поддержка.
+⚠️ *СНАЧАЛА ПРО БЕЗОПАСНОСТЬ:*
 
-⚠️ Важно сегодня:
-├── НЕ компенсировать кофеином (максимум 1 чашка до 12:00)
-├── НЕ ложиться спать днём (или максимум 20 мин до 14:00)
-├── Выйти на яркий свет хотя бы на 10 минут
-└── Вечером — ОБЯЗАТЕЛЬНО ранний отход
+Даже одна плохая ночь снижает внимание и реакцию
+как алкогольное опьянение.
 
-Я напомню вам вечером о восстановлении.
+├── По возможности *не садитесь за руль* рано утром
+├── Крупные решения, сложные сделки — *перенесите*
+└── Конфликтные разговоры — *не сегодня*
 
-Держитесь! Один тяжёлый день — не катастрофа. 💙"""
+🆘 *SOS-ПЛАН НА УТРО:*
+
+💧 Умойтесь холодной водой и/или контрастный душ — запустит симпатику
+☀️ Яркий свет 10-15 мин — перезапустит циркадку
+☕ Кофе/чай — *только до обеда*.
+После — травяные чаи без кофеина.
+🥩 Завтрак с белком — чтобы не тянуло на сладкое днём
+
+💡 Не планируйте сложных решений на вторую половину дня.
+
+Вечером ложитесь на 30-60 мин раньше 💚"""
 }
 
 # Вечерние приветствия
@@ -19297,6 +19316,7 @@ CHRONOTYPE_QUESTIONS = {
     },
     3: {
         "text": "Когда вы чувствуете ПИК энергии?",
+        "hint": "💡 _Вспомните *ОТПУСК* (через неделю отдыха), когда вы уже выспались и не привязаны к будильнику — в какое время максимум энергии?_",
         "options": [
             ("🐤 Утром (6:00-10:00)", "lark"),
             ("🕊️ Днём (10:00-14:00)", "pigeon"),
@@ -19305,7 +19325,7 @@ CHRONOTYPE_QUESTIONS = {
         ]
     },
     4: {
-        "text": "Выходные без будильника — во сколько встаёте?",
+        "text": "*ВЫХОДНЫЕ* без будильника — во сколько встаёте?",
         "options": [
             ("🐤 Как обычно, рано", "lark"),
             ("🕊️ На 1-2 часа позже", "pigeon"),
@@ -19568,7 +19588,8 @@ def get_genetic_chronotype_text(result: dict) -> str:
     # ПОПРАВКА #139: Глимфатический риск
     glyph = get_glymphatic_risk(result["chronotype"])
     risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(glyph["risk"], "⚪")
-    text += f"\n\n🧠 Глимфатика: {risk_emoji} {glyph['risk'].upper()}"
+    risk_ru = {"low": "НИЗКИЙ РИСК", "medium": "УМЕРЕННЫЙ РИСК", "high": "ВЫСОКИЙ РИСК"}.get(glyph["risk"], glyph["risk"])
+    text += f"\n\n🧠 Глимфатика: {risk_emoji} {risk_ru}"
     if glyph["risk"] != "low":
         text += f"\n_{glyph['note']}_"
         text += f"\n✅ {glyph['compensation']}"
@@ -19814,9 +19835,10 @@ def format_glymphatic_chronotype_report(chronotype: str, jetlag: dict = None,
     glyph = get_glymphatic_risk(chronotype)
     
     risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(glyph["risk"], "⚪")
+    risk_ru = {"low": "НИЗКИЙ РИСК", "medium": "УМЕРЕННЫЙ РИСК", "high": "ВЫСОКИЙ РИСК"}.get(glyph["risk"], glyph["risk"])
     
     text = f"🧠 *ГЛИМФАТИКА И ХРОНОТИП:*\n\n"
-    text += f"Риск: {risk_emoji} {glyph['risk'].upper()}\n"
+    text += f"Риск: {risk_emoji} {risk_ru}\n"
     text += f"_{glyph['note']}_\n\n"
     
     if glyph["risk"] != "low":
@@ -20360,9 +20382,9 @@ def generate_summary_report(data: dict, syndromes: dict) -> list:
 📊 *ТЕСТЫ:*
 
 ├─ 🌅 Циркадка: {circ_score}/60 {circ_emoji} {get_circ_status(circ_score)}
-├─ 😴 Сон (SQS): {sqs_score}/40 {sqs_emoji} {get_sqs_status(sqs_score)}
-├─ 🔥 Стресс (PSS): {pss_score}/40 {pss_emoji} {get_pss_status(pss_score)}
-├─ 😰 Тревожность (GAD): {gad_score}/21 {gad_emoji} {get_gad_status(gad_score)}
+├─ 😴 Сон: {sqs_score}/40 {sqs_emoji} {get_sqs_status(sqs_score)}
+├─ 🔥 Стресс: {pss_score}/40 {pss_emoji} {get_pss_status(pss_score)}
+├─ 😰 Тревожность: {gad_score}/21 {gad_emoji} {get_gad_status(gad_score)}
 ├─ ⚡ БГС: {ahs_score}/48 {ahs_emoji} Стадия {hpa_stage}: {hpa_names.get(hpa_stage, '')}
 └─ {chrono_emojis.get(chronotype, '🕊️')} Хронотип: {chrono_names.get(chronotype, 'Голубь')}"""
     
@@ -26899,11 +26921,11 @@ def get_caffeine_keyboard():
 
 
 def get_screens_keyboard():
-    """Клавиатура: экраны вечером"""
+    """Клавиатура: экраны вчера перед сном"""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Выключил за 2+ часа", callback_data="screens_off_2h")],
-        [InlineKeyboardButton(text="🌙 Выключил за 1 час", callback_data="screens_off_1h")],
-        [InlineKeyboardButton(text="🔵 Night mode включён", callback_data="screens_night_mode")],
+        [InlineKeyboardButton(text="✅ Выключил(а) за 2+ часа", callback_data="screens_off_2h")],
+        [InlineKeyboardButton(text="🌙 Выключил(а) за 1 час", callback_data="screens_off_1h")],
+        [InlineKeyboardButton(text="🔵 Ночной режим был включён", callback_data="screens_night_mode")],
         [InlineKeyboardButton(text="📱 До самого сна", callback_data="screens_until_bed")]
     ])
 
@@ -32374,10 +32396,10 @@ async def finish_mini_test(callback: CallbackQuery, state: FSMContext, answers: 
         else: return "🔴 Сильное истощение"
     
     def get_circ_level(score):
-        if score <= 3: return "🔴 Циркадка сильно сбита"
-        elif score <= 6: return "🟠 Нарушения циркадки"
+        if score <= 3: return "🔴 Сильно сбит"
+        elif score <= 6: return "🟠 Нарушения ритма"
         elif score <= 9: return "🟡 Умеренно"
-        else: return "🟢 Хорошая циркадка"
+        else: return "🟢 Хороший ритм"
     
     telegram_id = callback.from_user.id
     
@@ -32431,6 +32453,39 @@ async def finish_mini_test(callback: CallbackQuery, state: FSMContext, answers: 
     user = await get_user(telegram_id)
     name = user.get("name", "друг") if user else "друг"
     
+    # ПОПРАВКА #40: Контекст для GAD-2 — жизненные обстоятельства + разрыв тело/ощущения
+    life_context_risk = False
+    body_mind_gap = False
+    try:
+        life_events = await get_life_events(telegram_id)
+        if life_events:
+            life_events_count = sum([
+                life_events.get("has_loss", 0),
+                life_events.get("has_divorce", 0),
+                life_events.get("has_job_loss", 0),
+                life_events.get("has_illness", 0),
+                life_events.get("has_relocation", 0),
+                life_events.get("has_other", 0),
+            ])
+            emotional_state = life_events.get("emotional_state", 5) or 5
+            
+            life_context_risk = (
+                gad2_score < 3 and (
+                    (pss4_score >= 9 and life_events_count >= 2) or
+                    (life_events_count >= 3) or
+                    (emotional_state <= 2 and pss4_score >= 7)
+                )
+            )
+    except Exception as e:
+        print(f"⚠️ ПОПРАВКА #40 life_events fetch: {e}")
+    
+    body_mind_gap = (
+        gad2_score < 3 and
+        not life_context_risk and
+        (ahs_mini_score >= 9 or sqs_mini_score <= 6) and
+        pss4_score >= 7
+    )
+    
     # Алерты
     alerts = []
     if gad2_score >= 3:
@@ -32439,6 +32494,12 @@ async def finish_mini_test(callback: CallbackQuery, state: FSMContext, answers: 
         alerts.append("🔴 _Признаки апноэ — обратитесь к врачу!_")
     if answers.get("sqs_m3", 4) <= 1 and answers.get("sqs_m4", 4) <= 1:
         alerts.append("⚠️ _Фрагментированный сон + плохое восстановление_")
+    
+    # ПОПРАВКА #40: Контекстная заметка для GAD-2
+    if life_context_risk:
+        alerts.append("💡 _Тревога сейчас в норме, но при вашем уровне стресса она может нарастать — будем отслеживать_")
+    elif body_mind_gap:
+        alerts.append("💡 _Тело сигналит о перегрузке, хотя тревога не ощущается. Иногда мы привыкаем к напряжению и перестаём его замечать — стоит быть внимательнее к себе_")
     
     # ПОПРАВКА #109: Формируем динамику
     dynamics_text = ""
@@ -32478,7 +32539,7 @@ async def finish_mini_test(callback: CallbackQuery, state: FSMContext, answers: 
         if circ_diff != 0:
             arrow = "↑" if circ_diff > 0 else "↓"
             color = "🟢" if circ_diff > 0 else "🔴"
-            changes.append(f"   {color} Циркадка: {circ_diff:+d} {arrow}")
+            changes.append(f"   {color} Режим дня: {circ_diff:+d} {arrow}")
         
         if changes:
             dynamics_text = "\n\n📈 *ДИНАМИКА* (vs 2 недели назад):\n" + "\n".join(changes)
@@ -32503,7 +32564,7 @@ async def finish_mini_test(callback: CallbackQuery, state: FSMContext, answers: 
 ⚡ *НАДПОЧЕЧНИКИ:* {ahs_mini_score}/16
    {get_ahs_level(ahs_mini_score)}
 
-🌙 *ЦИРКАДКА:* {circ_mini_score}/12
+🌙 *РЕЖИМ ДНЯ:* {circ_mini_score}/12
    {get_circ_level(circ_mini_score)}
 
 ━━━━━━━━━━━━━━━━━━━━━{dynamics_text}{alerts_text}
@@ -32522,6 +32583,10 @@ async def finish_mini_test(callback: CallbackQuery, state: FSMContext, answers: 
         gad_warning = ""
         if gad2_score >= 3:
             gad_warning = "\n\n⚠️ _Вижу повышенную тревожность. Позже предложу расширенный тест._"
+        elif life_context_risk:
+            gad_warning = "\n\n💡 _Тревога сейчас в норме, но при вашем уровне стресса она может нарастать — будем отслеживать._"
+        elif body_mind_gap:
+            gad_warning = "\n\n💡 _Тело сигналит о перегрузке, хотя тревога не ощущается. Иногда мы привыкаем к напряжению и перестаём его замечать — стоит быть внимательнее к себе._"
         
         onb_text = f"""📊 *{name}, РЕЗУЛЬТАТЫ*
 
@@ -32531,7 +32596,7 @@ async def finish_mini_test(callback: CallbackQuery, state: FSMContext, answers: 
 😟 *Тревога:* {gad2_score}/6 — {get_gad2_level(gad2_score)}
 😴 *Сон:* {sqs_mini_score}/17 — {get_sqs_level(sqs_mini_score)}
 ⚡ *Надпочечники:* {ahs_mini_score}/16 — {get_ahs_level(ahs_mini_score)}
-🌙 *Циркадка:* {circ_mini_score}/12 — {get_circ_level(circ_mini_score)}
+🌙 *Режим дня:* {circ_mini_score}/12 — {get_circ_level(circ_mini_score)}
 
 ━━━━━━━━━━━━━━━━━━━━━
 
@@ -33021,141 +33086,55 @@ async def sos_box_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.update_data(box_cycle=1)
     
-    text = """📦 *ЦИКЛ 1/4*
+    # ПОПРАВКА #48: Одна инструкция вместо 16 кнопок
+    text = """📦 *КВАДРАТНОЕ ДЫХАНИЕ*
 
-━━━━━━━━━━━━━━━━━━━━━
+Ляг или сядь удобно. Закрой глаза.
 
-Сядь удобно. Спина прямая.
+Повтори 4 раза:
 
-Готов(а)?
+🫁 *ВДОХ* через нос — 4 секунды
+⏸ *ЗАДЕРЖКА* — 4 секунды
+💨 *ВЫДОХ* через рот — 4 секунды
+⏸ *ЗАДЕРЖКА* — 4 секунды
 
-Нажми когда будешь готов(а) начать."""
-
-    await callback.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="▶️ Начинаем", callback_data="sos_box_inhale_1")]
-        ])
-    )
-
-
-@router.callback_query(F.data.startswith("sos_box_inhale_"))
-async def sos_box_inhale(callback: CallbackQuery, state: FSMContext):
-    """Вдох"""
-    await callback.answer()
-    cycle = int(callback.data.split("_")[-1])
-    
-    text = f"""📦 *ЦИКЛ {cycle}/4*
-
-━━━━━━━━━━━━━━━━━━━━━
-
-🫁 *ВДОХ...*
-
-Медленно вдыхай через нос.
-Считай до 4.
-
-1... 2... 3... 4...
-
-━━━━━━━━━━━━━━━━━━━━━"""
+Это займёт 2-3 минуты.
+Расслабь плечи. Отпускай напряжение на каждом выдохе 💚"""
 
     await callback.message.edit_text(
         text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⏸ Задержка →", callback_data=f"sos_box_hold1_{cycle}")]
+            [InlineKeyboardButton(text="✅ Готово", callback_data="sos_box_finish")]
         ])
     )
 
 
-@router.callback_query(F.data.startswith("sos_box_hold1_"))
-async def sos_box_hold1(callback: CallbackQuery, state: FSMContext):
-    """Задержка после вдоха"""
-    await callback.answer()
-    cycle = int(callback.data.split("_")[-1])
-    
-    text = f"""📦 *ЦИКЛ {cycle}/4*
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #48: Пошаговые обработчики дыхания ОТКЛЮЧЕНЫ
+# Заменены на одну инструкцию + кнопка «Готово» (выше)
+# Оставлены для будущей аудио-версии с автоматической сменой шагов
+# ═══════════════════════════════════════════════════════════════
 
-━━━━━━━━━━━━━━━━━━━━━
+# @router.callback_query(F.data.startswith("sos_box_inhale_"))
+# async def sos_box_inhale(callback: CallbackQuery, state: FSMContext):
+#     """Вдох"""
+#     ...
 
-⏸ *ЗАДЕРЖКА...*
+# @router.callback_query(F.data.startswith("sos_box_hold1_"))
+# async def sos_box_hold1(callback: CallbackQuery, state: FSMContext):
+#     """Задержка после вдоха"""
+#     ...
 
-Держи воздух.
-Расслабь плечи.
+# @router.callback_query(F.data.startswith("sos_box_exhale_"))
+# async def sos_box_exhale(callback: CallbackQuery, state: FSMContext):
+#     """Выдох"""
+#     ...
 
-1... 2... 3... 4...
-
-━━━━━━━━━━━━━━━━━━━━━"""
-
-    await callback.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💨 Выдох →", callback_data=f"sos_box_exhale_{cycle}")]
-        ])
-    )
-
-
-@router.callback_query(F.data.startswith("sos_box_exhale_"))
-async def sos_box_exhale(callback: CallbackQuery, state: FSMContext):
-    """Выдох"""
-    await callback.answer()
-    cycle = int(callback.data.split("_")[-1])
-    
-    text = f"""📦 *ЦИКЛ {cycle}/4*
-
-━━━━━━━━━━━━━━━━━━━━━
-
-💨 *ВЫДОХ...*
-
-Медленно выдыхай через рот.
-Отпускай напряжение.
-
-1... 2... 3... 4...
-
-━━━━━━━━━━━━━━━━━━━━━"""
-
-    await callback.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⏸ Задержка →", callback_data=f"sos_box_hold2_{cycle}")]
-        ])
-    )
-
-
-@router.callback_query(F.data.startswith("sos_box_hold2_"))
-async def sos_box_hold2(callback: CallbackQuery, state: FSMContext):
-    """Задержка после выдоха"""
-    await callback.answer()
-    cycle = int(callback.data.split("_")[-1])
-    
-    text = f"""📦 *ЦИКЛ {cycle}/4*
-
-━━━━━━━━━━━━━━━━━━━━━
-
-⏸ *ЗАДЕРЖКА...*
-
-Пустота. Тишина.
-
-1... 2... 3... 4...
-
-━━━━━━━━━━━━━━━━━━━━━"""
-
-    if cycle < 4:
-        button_text = f"🫁 Цикл {cycle + 1} →"
-        button_data = f"sos_box_inhale_{cycle + 1}"
-    else:
-        button_text = "✅ Готово!"
-        button_data = "sos_box_finish"
-
-    await callback.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=button_text, callback_data=button_data)]
-        ])
-    )
+# @router.callback_query(F.data.startswith("sos_box_hold2_"))
+# async def sos_box_hold2(callback: CallbackQuery, state: FSMContext):
+#     """Задержка после выдоха"""
+#     ...
 
 
 @router.callback_query(F.data == "sos_box_finish")
@@ -33322,6 +33301,81 @@ _Я буду здесь, когда вернёшься 💚_"""
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+        ])
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #49 v2: SOS-план на день при плохом сне
+# ═══════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "sos_day_plan")
+async def sos_day_plan_handler(callback: CallbackQuery):
+    """ПОПРАВКА #49 v2: План на день при плохом сне"""
+    await callback.answer()
+    await callback.message.edit_text(
+        "📋 *ПЛАН НА СЕГОДНЯ:*\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🎯 *ЗАДАЧИ:*\n"
+        "Выберите *1-2 главные задачи* дня.\n"
+        "Остальное — режим «минимальный стандарт».\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🥩 *ЕДА СЕГОДНЯ:*\n"
+        "После недосыпа мозг тянет на сладкое —\n"
+        "это не слабость, а изменённая регуляция аппетита.\n\n"
+        "├── Завтрак и обед: белок + овощи + сложные углеводы\n"
+        "├── Перекусы: орехи, творог — не сладости\n"
+        "└── Сладкое — только после нормальной еды\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "⏸ *МИКРОПАУЗЫ:*\n"
+        "2-3 перерыва по 5-10 мин: встать, пройтись, подышать.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "😴 *КОФЕ-НАП (если есть 20 мин днём):*\n"
+        "Выпейте кофе → сразу лягте на 15-20 мин\n"
+        "Кофеин начнёт действовать к пробуждению.\n"
+        "⚠️ Не дольше 25 мин. Не позже 16:00.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🚫 *ЧЕГО ИЗБЕГАТЬ:*\n"
+        "├── Долгое вождение и монотонные задачи\n"
+        "├── Конфронтационные разговоры\n"
+        "├── Тяжёлый спорт вечером\n"
+        "└── Кофеин после обеда\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🌙 *ВЕЧЕРОМ:*\n"
+        "Ложитесь на 1-2 часа раньше обычного.\n"
+        "Без алкоголя «для расслабления» — он ухудшит сон.\n\n"
+        "Цель — вернуть долг сна за одну ночь 💚",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="☕ Что такое кофе-нап?", callback_data="sos_coffee_nap_info")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "sos_coffee_nap_info")
+async def sos_coffee_nap_info(callback: CallbackQuery):
+    """ПОПРАВКА #49 v2: Информация о кофе-напе"""
+    await callback.answer()
+    await callback.message.edit_text(
+        "😴☕ *КОФЕ-НАП — что это?*\n\n"
+        "Секретный приём пилотов, военных и сменных врачей.\n\n"
+        "*Как работает:*\n"
+        "├── Выпиваете кофе/чай\n"
+        "├── Сразу закрываете глаза на 15-20 мин\n"
+        "├── Кофеин усваивается ~20 мин\n"
+        "└── Просыпаетесь бодрым: и сон помог, и кофеин включился\n\n"
+        "*Правила:*\n"
+        "├── Не дольше 20-25 мин (иначе тяжело встать)\n"
+        "├── Не позже 16:00 (иначе ночной сон пострадает)\n"
+        "├── Даже если не уснули — глаза закрыты, мозг отдохнул\n"
+        "└── Одного раза в день достаточно\n\n"
+        "Кофе-нап работает лучше, чем просто кофе\n"
+        "или просто сон по отдельности 💚",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 План на день", callback_data="sos_day_plan")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")]
         ])
     )
 
@@ -36691,19 +36745,28 @@ def get_missed_habit_response(habit: str = None, had_streak: int = 0) -> str:
 
 
 def get_bad_sleep_response(name: str, sleep_quality: int) -> str:
-    """Сочувственная реакция на плохой сон"""
+    """ПОПРАВКА #49: SOS-план утра при плохом сне"""
     if sleep_quality <= 3:
-        responses = [
-            f"Ох, {name}, тяжёлая ночка была... Обнимаю 💚",
-            f"Понимаю, {name}. Это так выматывает. Давай разберёмся вместе.",
-            f"Эх, {name}, бывает... Как ты сейчас себя чувствуешь?",
-        ]
+        return (
+            f"😴 *{name}, ночь была тяжёлой. Вот план на утро:*\n\n"
+            f"💧 Умой лицо холодной водой и/или контрастный душ — запустит симпатику\n"
+            f"☀️ Яркий свет 10-15 мин — перезапустит циркадку\n"
+            f"☕ Кофе/чай — но *только до обеда*.\n"
+            f"После — травяные чаи без кофеина.\n"
+            f"Иначе ночью не уснёшь, а завтра будет ещё тяжелее.\n"
+            f"🥩 Завтрак с белком — чтобы не тянуло на сладкое днём\n\n"
+            f"💡 Сегодня не планируй сложных решений\n"
+            f"на вторую половину дня — мозг устанет раньше.\n\n"
+            f"Вечером ляг на 30 мин раньше 💚"
+        )
     else:
-        responses = [
-            f"Не лучшая ночь, да? Ничего, {name}, разберёмся 💚",
-            f"Бывают такие ночи. Давай посмотрим что можно улучшить.",
-        ]
-    return random.choice(responses)
+        return (
+            f"😴 *{name}, сон мог быть лучше. Мини-план:*\n\n"
+            f"💧 Холодная вода на лицо и/или контрастный душ — взбодрит\n"
+            f"☀️ Свет утром 10 мин — поможет проснуться\n"
+            f"☕ Кофе — до обеда. После — травяной чай\n\n"
+            f"Вечером постарайся лечь вовремя 💚"
+        )
 
 
 def get_good_sleep_response(name: str, context: dict = None) -> str:
@@ -37063,6 +37126,21 @@ async def start_morning_checkin(callback: CallbackQuery, state: FSMContext):
     
     name = user.get("name", "друг")
     
+    # ПОПРАВКА #50: Если вчера болел — спрашиваем температуру
+    if user.get('is_sick', 0) == 1:
+        await callback.message.answer(
+            f"🌡 *Доброе утро, {name}! Вчера ты болел(а).*\n\n"
+            f"Измерь температуру:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🌡 До 36.9 — норма", callback_data="temp_normal")],
+                [InlineKeyboardButton(text="🤒 37.0-37.9", callback_data="temp_low_fever")],
+                [InlineKeyboardButton(text="🔴 38.0+", callback_data="temp_high_fever")],
+            ])
+        )
+        await state.set_state(MorningStates.waiting_temperature)
+        return
+    
     # Проверяем есть ли вчерашняя рекомендация без ответа
     yesterday_rec = await get_yesterday_recommendation(callback.from_user.id)
     if yesterday_rec:
@@ -37387,7 +37465,93 @@ async def morning_sleep(callback: CallbackQuery, state: FSMContext):
     except:
         pass
     
-    # ПОПРАВКА #137: Спрашиваем про дыхание 4-7-8 (после дня 3)
+    # ПОПРАВКА #46: После качества сна → засыпание вчера
+    user = await get_user(callback.from_user.id)
+    name = user.get('name', 'Друг') if user else 'Друг'
+    
+    await callback.message.answer(
+        f"😴 *КАК ВЧЕРА ЗАСЫПАЛОСЬ?*\n\n"
+        f"{name}, быстро уснули вчера?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, норм", callback_data="mfall_ok")],
+            [InlineKeyboardButton(text="😬 Ворочался(ась) 30+ минут", callback_data="mfall_30min")],
+            [InlineKeyboardButton(text="😫 Больше часа не мог(ла)", callback_data="mfall_1hour")],
+            [InlineKeyboardButton(text="😵 Не до сна — форс-мажор", callback_data="mfall_force_majeure")]
+        ])
+    )
+    await state.set_state(MorningStates.waiting_falling_asleep)
+
+
+@router.callback_query(MorningStates.waiting_falling_asleep, F.data.startswith("mfall_"))
+async def morning_falling_asleep(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #46: Засыпание вчера — в утреннем чекине"""
+    await callback.answer()
+    falling = callback.data.replace("mfall_", "")
+    await state.update_data(falling_asleep_yesterday=falling)
+    
+    # Удаляем предыдущее сообщение с кнопками
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    
+    # Если форс-мажор — показываем SOS-план
+    if falling == 'force_majeure':
+        user = await get_user(callback.from_user.id)
+        name = user.get('name', 'Друг') if user else 'Друг'
+        
+        # ПОПРАВКА #50: Убираем контрастный душ при болезни
+        is_sick = user.get('is_sick', 0) if user else 0
+        if is_sick:
+            water_tip = "💧 Умойтесь тёплой водой — взбодрит"
+        else:
+            water_tip = "💧 Умойтесь холодной водой и/или контрастный душ — взбодрит"
+        
+        await callback.message.answer(
+            f"😵 *{name}, бывает!*\n\n"
+            f"Форс-мажор — это не проблема со сном, а проблема с обстоятельствами.\n\n"
+            f"🆘 *SOS-план на сегодня:*\n\n"
+            f"{water_tip}\n"
+            f"☕ Кофе/чай — *только до обеда*.\n"
+            f"После — травяные чаи без кофеина.\n"
+            f"Иначе ночью не уснёте, а завтра будет ещё тяжелее.\n"
+            f"🥩 Усильте белок в еде — чтобы не тянуло на сладкое\n"
+            f"🌅 Яркий свет утром 15-20 мин — перезапустит циркадку\n"
+            f"😴 Сегодня ложитесь на 30-60 мин раньше обычного\n\n"
+            f"Не корите себя — завтра будет лучше 💚",
+            parse_mode="Markdown"
+        )
+    
+    # Переходим к экранам вчера
+    await callback.message.answer(
+        "📱 *ЭКРАНЫ ВЧЕРА ПЕРЕД СНОМ?*\n\n"
+        "Как было с экранами перед сном?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Выключил(а) за 2+ часа", callback_data="mscr_off_2h")],
+            [InlineKeyboardButton(text="🌙 Выключил(а) за 1 час", callback_data="mscr_off_1h")],
+            [InlineKeyboardButton(text="🔵 Ночной режим был включён", callback_data="mscr_night_mode")],
+            [InlineKeyboardButton(text="📱 До самого сна", callback_data="mscr_until_bed")]
+        ])
+    )
+    await state.set_state(MorningStates.waiting_screens_yesterday)
+
+
+@router.callback_query(MorningStates.waiting_screens_yesterday, F.data.startswith("mscr_"))
+async def morning_screens_yesterday(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #46: Экраны вчера перед сном — ретроспектива в утреннем чекине"""
+    await callback.answer()
+    screens = callback.data.replace("mscr_", "")
+    await state.update_data(screens=screens)
+    
+    # Удаляем предыдущее сообщение с кнопками
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    
+    # Продолжаем к дыханию 4-7-8 или свету (существующая логика)
     user = await get_user(callback.from_user.id)
     days_in_program = 0
     if user and user.get('created_at'):
@@ -37398,7 +37562,6 @@ async def morning_sleep(callback: CallbackQuery, state: FSMContext):
             days_in_program = 0
     
     if days_in_program >= 3:
-        # День 3+ — спрашиваем про дыхание
         await callback.message.answer(
             "🫁 Делал(а) вчера *дыхание 4-7-8* перед сном?",
             parse_mode="Markdown",
@@ -37411,7 +37574,6 @@ async def morning_sleep(callback: CallbackQuery, state: FSMContext):
         )
         await state.set_state(MorningStates.waiting_breathing_478)
     else:
-        # Первые 3 дня — пропускаем вопрос
         await state.update_data(breathing_478_done=False, breathing_478_minutes=0)
         await callback.message.answer(
             "☀️ Увидели утренний яркий свет?\n\n"
@@ -38510,6 +38672,11 @@ async def _complete_morning_checkin(callback, state: FSMContext):
     my_target = await get_target_bedtime_text(tid)  # ПОПРАВКА #139
     response = get_morning_response(data, name)
     
+    # ПОПРАВКА #50: Если болеет — убираем ванну/контрастный душ из рекомендаций
+    if user and user.get('is_sick', 0) == 1:
+        response = response.replace("и/или контрастный душ", "")
+        response = response.replace("контрастный душ", "умыться тёплой водой")
+    
     # ═══════════════════════════════════════════════════════════════
     # КОПИЛОЧКА СОВЕТОВ — приоритезация
     # ═══════════════════════════════════════════════════════════════
@@ -38571,8 +38738,9 @@ async def _complete_morning_checkin(callback, state: FSMContext):
             pass
     
     # Холодное умывание / контрастный душ (приоритет 7-8)
+    # ПОПРАВКА #50: Не предлагать контрастный душ при болезни
     suggestion = await check_cold_habit_suggestion(tid)
-    if suggestion.get("suggest"):
+    if suggestion.get("suggest") and not (user and user.get('is_sick', 0) == 1):
         if suggestion["type"] == "cold_wash":
             morning_tips.append((7, "cold_wash"))
         elif suggestion["type"] == "contrast_shower":
@@ -38629,6 +38797,11 @@ async def _complete_morning_checkin(callback, state: FSMContext):
                 InlineKeyboardButton(text="🚿 Попробую!", callback_data="start_contrast_shower"),
                 InlineKeyboardButton(text="💧 Пока умывание", callback_data="skip_contrast_shower"),
             ])
+    
+    # ПОПРАВКА #49 v2: Кнопки SOS при очень плохом сне
+    if sleep_quality <= 3:
+        buttons.append([InlineKeyboardButton(text="📋 План на день", callback_data="sos_day_plan")])
+        buttons.append([InlineKeyboardButton(text="☕ Что такое кофе-нап?", callback_data="sos_coffee_nap_info")])
     
     buttons.append([InlineKeyboardButton(text="🏠 Меню", callback_data="back_to_menu")])
     
@@ -38813,6 +38986,11 @@ async def _complete_morning_checkin_from_message(message: Message, state: FSMCon
     my_target = await get_target_bedtime_text(tid)  # ПОПРАВКА #139
     response = get_morning_response(data, name)
     
+    # ПОПРАВКА #50: Если болеет — убираем ванну/контрастный душ из рекомендаций
+    if user and user.get('is_sick', 0) == 1:
+        response = response.replace("и/или контрастный душ", "")
+        response = response.replace("контрастный душ", "умыться тёплой водой")
+    
     # ═══════════════════════════════════════════════════════════════
     # КОПИЛОЧКА СОВЕТОВ — приоритезация (from_message версия)
     # ═══════════════════════════════════════════════════════════════
@@ -38867,7 +39045,8 @@ async def _complete_morning_checkin_from_message(message: Message, state: FSMCon
             pass
     
     suggestion = await check_cold_habit_suggestion(tid)
-    if suggestion.get("suggest"):
+    # ПОПРАВКА #50: Не предлагать контрастный душ при болезни
+    if suggestion.get("suggest") and not (user and user.get('is_sick', 0) == 1):
         if suggestion["type"] == "cold_wash":
             morning_tips.append((7, "cold_wash"))
         elif suggestion["type"] == "contrast_shower":
@@ -38922,6 +39101,11 @@ async def _complete_morning_checkin_from_message(message: Message, state: FSMCon
                 InlineKeyboardButton(text="🚿 Попробую!", callback_data="start_contrast_shower"),
                 InlineKeyboardButton(text="💧 Пока умывание", callback_data="skip_contrast_shower"),
             ])
+    
+    # ПОПРАВКА #49 v2: Кнопки SOS при очень плохом сне
+    if sleep_quality <= 3:
+        buttons.append([InlineKeyboardButton(text="📋 План на день", callback_data="sos_day_plan")])
+        buttons.append([InlineKeyboardButton(text="☕ Что такое кофе-нап?", callback_data="sos_coffee_nap_info")])
     
     buttons.append([InlineKeyboardButton(text="🏠 Меню", callback_data="back_to_menu")])
     
@@ -39046,7 +39230,20 @@ async def skip_cold_wash(callback: CallbackQuery):
 @router.callback_query(F.data == "start_contrast_shower")
 async def start_contrast_shower(callback: CallbackQuery):
     """Пользователь согласился на контрастный душ"""
-    await callback.answer("Супер! 🚿")
+    await callback.answer()
+    
+    # ПОПРАВКА #50: Блокировка при болезни
+    user = await get_user(callback.from_user.id)
+    if user and user.get('is_sick', 0) == 1:
+        name = user.get('name', 'Друг')
+        await callback.message.answer(
+            f"🤒 *{name}, ты болеешь — контрастный душ пока нельзя.*\n\n"
+            f"Контрастный стресс при температуре опасен.\n\n"
+            f"✅ Вместо этого: просто умойся тёплой водой.\n"
+            f"Когда выздоровеешь — вернёмся к закаливанию 💚",
+            parse_mode="Markdown"
+        )
+        return
     
     # Проверяем БГС — не истощение ли
     ahs_test = await get_last_ahs_test(callback.from_user.id)
@@ -39390,18 +39587,25 @@ async def evening_caffeine(callback: CallbackQuery, state: FSMContext):
         pass
     
     await callback.message.answer(
-        "📱 Экраны вечером?",
-        reply_markup=get_screens_keyboard()
+        "📱 *Напоминаю: включи ночной режим на всех экранах.*\n\n"
+        "Синий свет подавляет мелатонин на 50% —\n"
+        "это напрямую влияет на качество сна\n"
+        "и продуктивность завтра.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Включил(а)", callback_data="screens_reminder_done")],
+            [InlineKeyboardButton(text="⏭️ Далее", callback_data="screens_reminder_skip")]
+        ])
     )
     await state.set_state(EveningStates.waiting_screens)
 
 
-@router.callback_query(EveningStates.waiting_screens, F.data.startswith("screens_"))
-async def evening_screens(callback: CallbackQuery, state: FSMContext):
-    """Экраны"""
+@router.callback_query(EveningStates.waiting_screens, F.data.in_(["screens_reminder_done", "screens_reminder_skip"]))
+async def evening_screens_reminder(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #46: Экраны вечером — напоминание, не вопрос"""
     await callback.answer()
-    screens = callback.data.replace("screens_", "")
-    await state.update_data(screens=screens)
+    screens_action = "night_mode_on" if callback.data == "screens_reminder_done" else "skipped"
+    await state.update_data(screens=screens_action)
     
     # Удаляем предыдущее сообщение с кнопками
     try:
@@ -39714,48 +39918,43 @@ async def evening_craving(callback: CallbackQuery, state: FSMContext):
     except:
         pass
     
-    user = await get_user(callback.from_user.id)
-    name = user.get("name", "друг") if user else "друг"
-    
     if craving == "none":
-        # Без тяги — сразу дальше
         await state.update_data(craving_type="none", sweet_amount="none", coffee_cups=0)
-        await evening_show_falling_asleep(callback.message, state, name)
     elif craving == "sweet_little":
         await state.update_data(craving_type="sweet", sweet_amount="little", coffee_cups=0)
-        await evening_show_falling_asleep(callback.message, state, name)
     elif craving == "sweet_moderate":
         await state.update_data(craving_type="sweet", sweet_amount="moderate", coffee_cups=0)
-        await evening_show_falling_asleep(callback.message, state, name)
     elif craving == "sweet_much":
         await state.update_data(craving_type="sweet", sweet_amount="much", coffee_cups=0)
-        await evening_show_falling_asleep(callback.message, state, name)
     else:
-        # Fallback для старых callback (sweet/coffee/both) — на случай если кто-то нажмёт из кэша
         await state.update_data(craving_type=craving, sweet_amount="unknown", coffee_cups=0)
-        await evening_show_falling_asleep(callback.message, state, name)
-
-
-
-async def evening_show_falling_asleep(message, state: FSMContext, name: str):
-    """Показать вопрос про засыпание"""
-    await message.answer(
-        f"😴 *КАК ВЧЕРА ЗАСЫПАЛОСЬ?*\n\n"
-        f"{name}, быстро уснули вчера?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Да, норм", callback_data="falling_ok")],
-            [InlineKeyboardButton(text="😬 Ворочался(ась) 30+ минут", callback_data="falling_30min")],
-            [InlineKeyboardButton(text="😫 Больше часа не мог(ла)", callback_data="falling_1hour")]
-        ])
+    
+    # ПОПРАВКА #46: Засыпание перенесено в утренний чекин
+    # Сразу переходим к расслаблению
+    await callback.message.answer(
+        "🧘 Расслабление перед сном?",
+        reply_markup=get_relaxation_keyboard()
     )
-    await state.set_state(EveningStates.waiting_falling_asleep)
+    await state.set_state(EveningStates.waiting_relaxation)
 
 
-# ПОПРАВКА #75: Засыпание вчера
+# ПОПРАВКА #46: evening_show_falling_asleep ПЕРЕНЕСЕНА в утренний чекин
+# Оставлена для обратной совместимости (если кто-то нажмёт из кэша)
+async def evening_show_falling_asleep(message, state: FSMContext, name: str):
+    """DEPRECATED: Вопрос про засыпание перенесён в утренний чекин (#46)"""
+    # Fallback — сразу к расслаблению
+    await message.answer(
+        "🧘 Расслабление перед сном?",
+        reply_markup=get_relaxation_keyboard()
+    )
+    await state.set_state(EveningStates.waiting_relaxation)
+
+
+# ПОПРАВКА #46: Засыпание перенесено в утренний чекин
+# Обработчик оставлен для обратной совместимости (старые кэшированные кнопки)
 @router.callback_query(EveningStates.waiting_falling_asleep, F.data.startswith("falling_"))
 async def evening_falling_asleep(callback: CallbackQuery, state: FSMContext):
-    """Засыпание вчера — переход к расслаблению"""
+    """DEPRECATED: Засыпание перенесено в утренний чекин (#46). Fallback → расслабление."""
     await callback.answer()
     falling = callback.data.replace("falling_", "")
     await state.update_data(falling_asleep_yesterday=falling)
@@ -39842,57 +40041,45 @@ async def evening_relaxation_final(callback: CallbackQuery, state: FSMContext):
     red_trigger = stress >= 8 or energy <= 3 or mood <= 3
     yellow_trigger = 5 <= stress <= 7
     
-    # Ванна 🔴 (приоритет 0 — здоровье)
-    if red_trigger or high_stress_detected:
-        bath_rec = ZalmanovCourseManager.should_recommend_bath_for_stress(stress)
-        bp = user.get('blood_pressure', 'normal') if user else 'normal'
-        bath_type_name = {
-            'low': '🤍 БЕЛАЯ (повысит давление)',
-            'high': '💛 ЖЁЛТАЯ (снизит давление)', 
-            'normal': '🟢 СМЕШАННАЯ или 💛 ЖЁЛТАЯ'
-        }.get(bp, '💛 ЖЁЛТАЯ')
-        
-        bath_msg = f"""
-🔴 *{name}, РЕКОМЕНДУЮ ВАННУ СЕГОДНЯ!*
-
-📊 Твои показатели:
-├── Стресс: {stress}/10 {'🔴' if stress >= 8 else '🟡'}
-├── Энергия: {energy}/10 {'🔴' if energy <= 3 else ''}
-└── Настроение: {mood}/10 {'🔴' if mood <= 3 else ''}
-
-{bath_rec['reason']}
-
-🛁 *ПЛАН НА ВЕЧЕР:*
-
-1️⃣ Ванна {bath_type_name}
-   ├── Температура: 37-38°C
-   ├── Время: 15-20 минут
-   └── После: завернуться в халат
-2️⃣ Сразу спать 💤
-
-_Ванна восстановит адаптационные резервы (Залманов)_"""
-        
-        bath_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Сделаю ванну", callback_data="bath_will_do")],
-            [InlineKeyboardButton(text="❌ Сегодня не могу", callback_data="bath_cant_today")],
-            [InlineKeyboardButton(text="📅 Напомни завтра", callback_data="bath_remind_tomorrow")]
-        ])
-        evening_queue.append((0, "bath_red", bath_msg, bath_kb))
+    # ПОПРАВКА: Дедупликация ванны — если сценарий "red", ванна уже в итоге чекина
+    bath_already_in_checkin = scenario_data.get("scenario", "") in ("red", "yellow")
     
-    elif yellow_trigger:
-        bath_msg = f"""
-🟡 *{name}, ванна сегодня — хорошая идея*
+    # ПОПРАВКА #50: Проверка самочувствия перед рекомендацией ванны
+    is_sick = user.get('is_sick', 0) if user else 0
+    
+    bath_would_be_recommended = ((red_trigger or high_stress_detected) or yellow_trigger) and not bath_already_in_checkin
+    
+    if bath_would_be_recommended and is_sick == 1:
+        # ПОПРАВКА #50: Болеет — заменяем ванну на щадящий режим
+        sick_msg = f"""🤒 *{name}, ты болеешь — ванну пропускаем.*
 
-Стресс {stress}/10 — организму пригодится поддержка.
+✅ *Вместо этого:*
+├── Тёплый чай (мёд + лимон)
+├── Дыхание 4-7-8 (расслабит)
+└── Пораньше спать
 
-🛁 Если есть силы — сделай ванну вечером.
-Это поможет восстановиться."""
-        
-        bath_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Сделаю", callback_data="bath_will_do")],
-            [InlineKeyboardButton(text="⏭️ Пропущу", callback_data="bath_skip")]
+Когда выздоровеешь — вернём ванну 💚"""
+        sick_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💚 Спасибо", callback_data="back_to_menu")]
         ])
-        evening_queue.append((1, "bath_yellow", bath_msg, bath_kb))
+        evening_queue.append((0, "bath_sick", sick_msg, sick_kb))
+    
+    elif bath_would_be_recommended and is_sick == 0:
+        # ПОПРАВКА #50: Не болеет — спрашиваем самочувствие перед ванной
+        # Сохраняем флаг что нужно спросить здоровье
+        await state.update_data(bath_health_check_pending=True, bath_trigger="red" if red_trigger else "yellow")
+        
+        health_msg = ("🌡 *Как самочувствие?*\n\n"
+                     "Перед тем как рекомендовать процедуру — уточню:")
+        health_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Нормально", callback_data="health_ok")],
+            [InlineKeyboardButton(text="🤒 Болею / температура", callback_data="health_sick")]
+        ])
+        evening_queue.append((0, "health_check", health_msg, health_kb))
+    
+    # Ванна — оригинальная логика перенесена в health_ok handler (ПОПРАВКА #50)
+    # health_check → health_ok → build_bath_recommendation()
+    # health_check → health_sick → sick alternative
     
     # Дыхание 4-7-8 (приоритет 1)
     evening_queue.append((1, "breathing", None, None))  # Специальная метка
@@ -40087,16 +40274,30 @@ async def bath_recommendation_response(callback: CallbackQuery):
     name = user.get("name", "друг") if user else "друг"
     
     if response == "bath_will_do":
-        # Получаем текущую дозировку
-        course = await get_active_bath_course(callback.from_user.id)
-        if course:
-            dose = course.get('current_dose', 20)
-            bath_num = course.get('baths_done', 0) + 1
-        else:
-            dose = 20
-            bath_num = 1
+        bath_level = user.get("bath_level", "basic") if user else "basic"
         
-        text = f"""✅ *Отлично, {name}!*
+        if bath_level == 'basic':
+            # Базовый уровень — без дозировки и курса
+            text = f"""✅ *Отлично, {name}!*
+
+🛁 Тёплая ванна (37°C, 15 мин) или горячий компресс на шею.
+После — сразу в кровать 💤
+
+Хорошего вечера! 💚"""
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+            ])
+        else:
+            # Продвинутый уровень — с курсом
+            course = await get_active_bath_course(callback.from_user.id)
+            if course:
+                dose = course.get('current_dose', 20)
+                bath_num = course.get('baths_done', 0) + 1
+            else:
+                dose = 20
+                bath_num = 1
+            
+            text = f"""✅ *Отлично, {name}!*
 
 🛁 Твоя ванна сегодня:
 ├── Номер: #{bath_num}
@@ -40105,11 +40306,11 @@ async def bath_recommendation_response(callback: CallbackQuery):
 └── Время: 15-20 минут
 
 После ванны нажми кнопку — запишу результат."""
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Ванна сделана!", callback_data="record_stress_bath")],
-            [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
-        ])
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Ванна сделана!", callback_data="record_stress_bath")],
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+            ])
         
     elif response == "bath_cant_today":
         text = f"""💛 Понимаю, {name}.
@@ -40148,6 +40349,397 @@ async def bath_recommendation_response(callback: CallbackQuery):
         ])
     
     await callback.message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #50: Проверка самочувствия перед ванной
+# ═══════════════════════════════════════════════════════════════
+
+async def build_bath_recommendation(user: dict, name: str, stress: int, energy: int, mood: int, trigger: str):
+    """ПОПРАВКА #50: Строит рекомендацию ванны (вызывается из health_ok)"""
+    bath_level = user.get('bath_level', 'basic') if user else 'basic'
+    
+    # Проверка тайминга
+    target_bedtime = user.get('target_bedtime', '23:00') if user else '23:00'
+    try:
+        bed_h, bed_m = map(int, str(target_bedtime).split(':'))
+        bed_mins = bed_h * 60 + bed_m
+        now_mins = datetime.now().hour * 60 + datetime.now().minute
+        too_late_for_bath = (bed_mins - now_mins) < 90
+    except:
+        too_late_for_bath = False
+    
+    if trigger == "yellow":
+        bath_msg = f"""
+🟡 *{name}, ванна сегодня — хорошая идея*
+
+Стресс {stress}/10 — организму пригодится поддержка.
+
+🛁 Если есть силы — сделай ванну вечером.
+Это поможет восстановиться."""
+        bath_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Сделаю", callback_data="bath_will_do")],
+            [InlineKeyboardButton(text="⏭️ Пропущу", callback_data="bath_skip")]
+        ])
+        return bath_msg, bath_kb
+    
+    # Red trigger
+    if too_late_for_bath:
+        bath_msg = f"""
+🔴 *{name}, стресс высокий!*
+
+До отбоя мало времени для ванны.
+
+🧣 *Быстрый вариант:*
+├── Горячий компресс на воротниковую зону (10 мин)
+└── Дыхание 4-7-8 (2 минуты)
+
+Завтра напомню про ванну вовремя 💚"""
+        bath_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Сделаю компресс", callback_data="bath_will_do")],
+            [InlineKeyboardButton(text="❌ Сегодня не могу", callback_data="bath_cant_today")]
+        ])
+    elif bath_level == 'basic':
+        bath_msg = f"""
+🔴 *{name}, стресс высокий — нужна помощь!*
+
+📊 Твои показатели:
+├── Стресс: {stress}/10 {'🔴' if stress >= 8 else '🟡'}
+├── Энергия: {energy}/10 {'🔴' if energy <= 3 else ''}
+└── Настроение: {mood}/10 {'🔴' if mood <= 3 else ''}
+
+🛁 *ПЛАН НА ВЕЧЕР:*
+
+1️⃣ Тёплая ванна (37°C, 15 мин)
+   └── Просто тёплая вода — уже работает!
+2️⃣ Или: горячий компресс на воротниковую зону (10 мин)
+   └── Полотенце в горячую воду → на шею и плечи
+3️⃣ После — сразу в кровать 💤
+
+💡 _В продвинутом варианте у нас есть специальные ванны Залманова — они в разы эффективнее. Хочешь узнать?_"""
+        bath_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Сделаю ванну/компресс", callback_data="bath_will_do")],
+            [InlineKeyboardButton(text="💡 Расскажи про ванны Залманова", callback_data="bath_info_zalmanov")],
+            [InlineKeyboardButton(text="❌ Сегодня не могу", callback_data="bath_cant_today")]
+        ])
+    else:
+        # Продвинутый уровень
+        bath_rec = ZalmanovCourseManager.should_recommend_bath_for_stress(stress)
+        bp = user.get('blood_pressure', 'normal') if user else 'normal'
+        bath_type_name = {
+            'low': '🤍 БЕЛАЯ (повысит давление)',
+            'high': '💛 ЖЁЛТАЯ (снизит давление)',
+            'normal': '🟢 СМЕШАННАЯ или 💛 ЖЁЛТАЯ'
+        }.get(bp, '💛 ЖЁЛТАЯ')
+        
+        bath_msg = f"""
+🔴 *{name}, РЕКОМЕНДУЮ ВАННУ СЕГОДНЯ!*
+
+📊 Твои показатели:
+├── Стресс: {stress}/10 {'🔴' if stress >= 8 else '🟡'}
+├── Энергия: {energy}/10 {'🔴' if energy <= 3 else ''}
+└── Настроение: {mood}/10 {'🔴' if mood <= 3 else ''}
+
+{bath_rec['reason']}
+
+🛁 *ПЛАН НА ВЕЧЕР:*
+
+1️⃣ Ванна {bath_type_name}
+   ├── Температура: 37-38°C
+   ├── Время: 15-20 минут
+   └── После: завернуться в халат
+2️⃣ Сразу спать 💤
+
+💡 *Как усилить эффект:*
+├── Дыхание 4-7-8 во время ванны
+├── Не есть за 1.5 часа до ванны
+└── После — в халат, НЕ вытираться
+
+_Ванна восстановит адаптационные резервы (Залманов)_"""
+        bath_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Сделаю ванну", callback_data="bath_will_do")],
+            [InlineKeyboardButton(text="❌ Сегодня не могу", callback_data="bath_cant_today")],
+            [InlineKeyboardButton(text="📅 Напомни завтра", callback_data="bath_remind_tomorrow")]
+        ])
+    
+    return bath_msg, bath_kb
+
+
+@router.callback_query(F.data == "health_ok")
+async def health_ok_handler(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #50: Самочувствие нормальное — показываем рекомендацию ванны"""
+    await callback.answer()
+    
+    # Сбрасываем статус болезни если был
+    await save_user(callback.from_user.id, {"is_sick": 0, "sick_recovery_day": 0})
+    
+    # Получаем данные для рекомендации ванны
+    user = await get_user(callback.from_user.id)
+    name = user.get('name', 'Друг') if user else 'Друг'
+    
+    data = await state.get_data()
+    stress = data.get('stress', 5)
+    energy = data.get('energy', 5)
+    mood = data.get('mood', 5)
+    trigger = data.get('bath_trigger', 'red')
+    
+    bath_msg, bath_kb = await build_bath_recommendation(user, name, stress, energy, mood, trigger)
+    
+    await callback.message.edit_text(
+        bath_msg,
+        parse_mode="Markdown",
+        reply_markup=bath_kb
+    )
+
+
+@router.callback_query(F.data == "health_sick")
+async def health_sick_handler(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #50: Человек болеет — блокируем ванну"""
+    await callback.answer()
+    
+    # Сохраняем статус болезни
+    await save_user(callback.from_user.id, {
+        "is_sick": 1,
+        "sick_since": datetime.now().isoformat(),
+        "sick_recovery_day": 0
+    })
+    
+    user = await get_user(callback.from_user.id)
+    name = user.get('name', 'Друг') if user else 'Друг'
+    
+    await callback.message.edit_text(
+        f"🤒 *{name}, понял! Болеть — не время для процедур.*\n\n"
+        f"🚫 Сегодня пропускаем:\n"
+        f"├── Ванну (любую)\n"
+        f"├── Контрастный душ\n"
+        f"└── Интенсивное движение\n\n"
+        f"✅ Вместо этого:\n"
+        f"├── Тёплый чай (мёд + лимон)\n"
+        f"├── Дыхание 4-7-8 (расслабит)\n"
+        f"└── Пораньше спать\n\n"
+        f"🌡 Завтра утром спрошу про температуру 💚",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💚 Спасибо", callback_data="back_to_menu")]
+        ])
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #50: Утренняя проверка температуры
+# ═══════════════════════════════════════════════════════════════
+
+@router.callback_query(MorningStates.waiting_temperature, F.data == "temp_normal")
+async def temp_normal_handler(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #50: Температура в норме"""
+    await callback.answer()
+    
+    user = await get_user(callback.from_user.id)
+    name = user.get('name', 'Друг') if user else 'Друг'
+    recovery_day = user.get('sick_recovery_day', 0) if user else 0
+    
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    
+    if recovery_day == 0:
+        # Первый день нормальной температуры — ещё щадящий
+        await save_user(callback.from_user.id, {"sick_recovery_day": 1})
+        await callback.message.answer(
+            f"🌡 *{name}, температура в норме — отлично!*\n\n"
+            f"Сегодня ещё щадящий день для надёжности:\n"
+            f"🚫 Ванна и контрастный душ — пока нет\n"
+            f"✅ Лёгкая активность — можно\n\n"
+            f"Завтра, если всё ок — возвращаемся к полному режиму 💚",
+            parse_mode="Markdown"
+        )
+    else:
+        # 2+ дней нормы → выздоровел
+        await save_user(callback.from_user.id, {
+            "is_sick": 0,
+            "sick_recovery_day": 0,
+            "sick_since": None
+        })
+        await callback.message.answer(
+            f"🎉 *{name}, 2 дня нормальной температуры!*\n\n"
+            f"Возвращаемся к полному режиму.\n"
+            f"Ванна вечером — можно 💚",
+            parse_mode="Markdown"
+        )
+    
+    # Продолжаем обычный утренний чекин
+    yesterday_rec = await get_yesterday_recommendation(callback.from_user.id)
+    if yesterday_rec:
+        followup = get_followup_question(yesterday_rec)
+        buttons = [
+            [InlineKeyboardButton(text=text, callback_data=f"rec_{followup['recommendation_id']}_{value}")]
+            for text, value in followup['options']
+        ]
+        await callback.message.answer(
+            f"📋 *{name}, вчера я советовала:*\n"
+            f"_{yesterday_rec['recommendation_text']}_\n\n"
+            f"{followup['question']}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+        await state.set_state(MorningStates.waiting_recommendation_followup)
+    else:
+        await callback.message.answer(
+            f"☀️ *{name}, как проснулись?*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="😫 Тяжело", callback_data="wake_feeling_hard")],
+                [InlineKeyboardButton(text="😐 Нормально", callback_data="wake_feeling_normal")],
+                [InlineKeyboardButton(text="😊 Легко!", callback_data="wake_feeling_easy")]
+            ])
+        )
+        await state.set_state(MorningStates.waiting_wake_feeling)
+
+
+@router.callback_query(MorningStates.waiting_temperature, F.data == "temp_low_fever")
+async def temp_low_fever_handler(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #50: Субфебрильная температура"""
+    await callback.answer()
+    
+    # is_sick остаётся = 1, сбрасываем recovery_day
+    await save_user(callback.from_user.id, {"sick_recovery_day": 0})
+    
+    user = await get_user(callback.from_user.id)
+    name = user.get('name', 'Друг') if user else 'Друг'
+    
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    
+    await callback.message.answer(
+        f"🤒 *{name}, субфебрильная температура.*\n\n"
+        f"Сегодня щадящий режим:\n"
+        f"🚫 Ванна, контрастный душ, спорт\n"
+        f"✅ Тёплое питьё, покой, лёгкая еда\n\n"
+        f"⚠️ Если поднимется выше 38 → врач\n\n"
+        f"Завтра снова спрошу температуру 💚",
+        parse_mode="Markdown"
+    )
+    
+    # Продолжаем утренний чекин (облегчённый)
+    await callback.message.answer(
+        f"☀️ *{name}, как проснулись?*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="😫 Тяжело", callback_data="wake_feeling_hard")],
+            [InlineKeyboardButton(text="😐 Нормально", callback_data="wake_feeling_normal")],
+            [InlineKeyboardButton(text="😊 Легко!", callback_data="wake_feeling_easy")]
+        ])
+    )
+    await state.set_state(MorningStates.waiting_wake_feeling)
+
+
+@router.callback_query(MorningStates.waiting_temperature, F.data == "temp_high_fever")
+async def temp_high_fever_handler(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #50: Высокая температура — минимальный чекин"""
+    await callback.answer()
+    
+    # is_sick остаётся = 1, сбрасываем recovery_day
+    await save_user(callback.from_user.id, {"sick_recovery_day": 0})
+    
+    user = await get_user(callback.from_user.id)
+    name = user.get('name', 'Друг') if user else 'Друг'
+    
+    # Проверяем сколько дней болеет
+    sick_since = user.get('sick_since', '') if user else ''
+    days_sick = 0
+    if sick_since:
+        try:
+            start = datetime.fromisoformat(sick_since.split('+')[0].replace('Z', ''))
+            days_sick = (datetime.now() - start).days
+        except:
+            pass
+    
+    doctor_warning = ""
+    if days_sick >= 3:
+        doctor_warning = "\n⚠️ *Температура держится 3+ дней — обратись к врачу!*\n"
+    
+    await callback.message.edit_text(
+        f"🔴 *{name}, температура высокая.*\n\n"
+        f"Сегодня:\n"
+        f"🚫 Никаких процедур\n"
+        f"✅ Покой + обильное питьё\n"
+        f"💊 Парацетамол по инструкции\n"
+        f"{doctor_warning}\n"
+        f"Выздоравливай! Чекин сегодня пропускаем 💚",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💚 Спасибо", callback_data="back_to_menu")]
+        ])
+    )
+    await state.clear()
+
+
+@router.callback_query(F.data == "bath_info_zalmanov")
+async def bath_info_zalmanov_handler(callback: CallbackQuery):
+    """ПОПРАВКА #47: Информация о ваннах Залманова для новичков"""
+    await callback.answer()
+    await callback.message.edit_text(
+        "🛁 *ВАННЫ ЗАЛМАНОВА — что это?*\n\n"
+        "Лечебные ванны с натуральными скипидарными эмульсиями. "
+        "Залманов — врач, который открыл метод восстановления "
+        "капиллярной системы через кожу.\n\n"
+        "✅ *Что они дают:*\n"
+        "├── Восстанавливают капилляры\n"
+        "├── Снимают стресс в разы эффективнее обычной ванны\n"
+        "├── Улучшают сон\n"
+        "└── Снижают биологический возраст\n\n"
+        "🛒 *Что нужно купить:*\n"
+        "├── Скипидарный раствор (белый, жёлтый или смешанный)\n"
+        "├── Водяной термометр\n"
+        "├── Мерный стаканчик\n"
+        "├── Мятное масло или мазь с ментолом (для компрессов)\n"
+        "└── Миндальное или персиковое масло (база для мятного масла)\n\n"
+        "📦 Всё можно заказать онлайн за 1500-2000₽.\n\n"
+        "Когда будет готово — нажми кнопку, "
+        "и я переключусь на продвинутые рекомендации 💚",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Уже купил(а) — готов(а)!", callback_data="bath_set_advanced")],
+            [InlineKeyboardButton(text="🛒 Закажу на днях", callback_data="bath_will_order")],
+            [InlineKeyboardButton(text="❌ Пока не интересно", callback_data="back_to_menu")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "bath_set_advanced")
+async def bath_set_advanced_handler(callback: CallbackQuery):
+    """ПОПРАВКА #47: Переключение на продвинутый уровень ванн"""
+    await callback.answer("🎉 Отлично!")
+    await save_user(callback.from_user.id, {"bath_level": "advanced"})
+    await callback.message.edit_text(
+        "✅ *Готово!*\n\n"
+        "Теперь при высоком стрессе я буду рекомендовать "
+        "конкретный тип ванны Залманова под твоё давление.\n\n"
+        "💡 А ещё подскажу, как усилить эффект ванны 💚",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "bath_will_order")
+async def bath_will_order_handler(callback: CallbackQuery):
+    """ПОПРАВКА #47: Напоминание про заказ"""
+    await callback.answer()
+    await callback.message.edit_text(
+        "🛒 Отлично! Когда всё придёт — нажми в Настройках "
+        "«Готов к ваннам Залманова» и я переключусь.\n\n"
+        "А пока буду рекомендовать обычную тёплую ванну "
+        "или компресс — они тоже работают! 💚",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+        ])
+    )
 
 
 @router.callback_query(F.data == "record_stress_bath")
@@ -41579,6 +42171,23 @@ def get_craving_sleep_analysis(data: dict, name: str) -> str:
 3️⃣ Если 3+ дня подряд — посмотрим глубже.
 
 Завтра спрошу, как уснулось 💚""")
+    
+    elif falling == 'force_majeure':
+        messages.append(f"""😵 *{name}, бывает!*
+
+Форс-мажор — это не проблема со сном, а проблема с обстоятельствами.
+
+🆘 *SOS-план на сегодня:*
+
+💧 Умойтесь холодной водой и/или контрастный душ — взбодрит и запустит нервную систему
+☕ Кофе/чай — *только до обеда*.
+После — травяные чаи без кофеина.
+Иначе ночью не уснёте, а завтра будет ещё тяжелее.
+🥩 Усильте белок в еде — чтобы не тянуло на сладкое
+🌅 Яркий свет утром 15-20 мин — перезапустит циркадку
+😴 Сегодня ложитесь на 30-60 мин раньше обычного
+
+Не корите себя — завтра будет лучше 💚""")
     
     return "\n\n━━━━━━━━━━━━━━━━━━━━━\n\n".join(messages) if messages else ""
 
@@ -45289,7 +45898,7 @@ async def _check_abandoned_tests(db, now):
             
             test_labels = {
                 "ahs": ("⚡ БГС", "5 минут"),
-                "sqs": ("😴 Сон (SQS)", "3 минуты"),
+                "sqs": ("😴 Сон", "3 минуты"),
                 "circadian": ("🌅 Циркадка", "3 минуты"),
                 "stress": ("😰 Стресс", "5 минут"),
                 "mini_test": ("📝 Мини-тест", "5 минут"),
@@ -52418,6 +53027,32 @@ async def onb_step1_complete(callback: CallbackQuery, state: FSMContext):
     if circ_score < 15:
         alerts.append("⚠️ Циркадные ритмы нарушены — ключевой фактор")
     
+    # ПОПРАВКА #40: Контекстная заметка для GAD-2
+    if gad2 < 3 and (pss4 >= 9 or ahs >= 9 or sqs <= 6):
+        _life_context = False
+        _body_mind = False
+        try:
+            life_ev = await get_life_events(callback.from_user.id)
+            if life_ev:
+                ev_count = sum([
+                    life_ev.get("has_loss", 0), life_ev.get("has_divorce", 0),
+                    life_ev.get("has_job_loss", 0), life_ev.get("has_illness", 0),
+                    life_ev.get("has_relocation", 0), life_ev.get("has_other", 0),
+                ])
+                em_state = life_ev.get("emotional_state", 5) or 5
+                if (pss4 >= 9 and ev_count >= 2) or ev_count >= 3 or (em_state <= 2 and pss4 >= 7):
+                    _life_context = True
+            
+            if not _life_context and (ahs >= 9 or sqs <= 6) and pss4 >= 7:
+                _body_mind = True
+        except:
+            pass
+        
+        if _life_context:
+            alerts.append("💡 Тревога в норме, но при вашем стрессе будем отслеживать")
+        elif _body_mind:
+            alerts.append("💡 Тело сигналит о перегрузке, хотя тревога не ощущается — стоит быть внимательнее к себе")
+    
     alerts_text = "\n".join(alerts) if alerts else "✅ Критических отклонений нет"
     
     # Сообщение 2: Что видно + что пока нет
@@ -53441,8 +54076,8 @@ async def show_stress_results(callback: CallbackQuery, state: FSMContext, result
         status_emoji = "🔴"
         level = "высокий"
     
-    short_text = f"""🔥 *Стресс (PSS): {pss}/40* {status_emoji}
-😰 *Тревожность (GAD): {gad}/21*
+    short_text = f"""🔥 *Стресс: {pss}/40* {status_emoji}
+😰 *Тревожность: {gad}/21*
 _{level}_
 
 ✅ Записала! Идём дальше."""
@@ -54306,8 +54941,9 @@ async def chronotype_q2(callback: CallbackQuery, state: FSMContext):
     buttons = [[InlineKeyboardButton(text=text, callback_data=f"chrono3_{val}")] 
                for text, val in q["options"]]
     
+    hint = f"\n\n{q['hint']}" if q.get('hint') else ""
     await callback.message.edit_text(
-        f"*Вопрос 3 из 4:*\n\n❓ {q['text']}",
+        f"*Вопрос 3 из 4:*\n\n❓ {q['text']}{hint}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
@@ -54373,6 +55009,7 @@ async def chronotype_q4(callback: CallbackQuery, state: FSMContext):
     }
     glyph = get_glymphatic_risk(chrono_to_glyph.get(chronotype, "neutral"))
     risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(glyph["risk"], "⚪")
+    risk_ru = {"low": "НИЗКИЙ РИСК", "medium": "УМЕРЕННЫЙ РИСК", "high": "ВЫСОКИЙ РИСК"}.get(glyph["risk"], glyph["risk"])
     
     # Социальный джетлаг из Q4 (выходные)
     jetlag_warning = ""
@@ -54410,7 +55047,7 @@ async def chronotype_q4(callback: CallbackQuery, state: FSMContext):
     text = (
         f"{emoji} {name}, ТВОЙ ХРОНОТИП — *{type_name}*\n\n"
         f"🌙 Твой оптимальный отбой: *{target}*\n"
-        f"🧠 Глимфатика: {risk_emoji} {glyph['risk'].upper()}"
+        f"🧠 Глимфатика: {risk_emoji} {risk_ru}"
         f"{chrono_note}"
         f"{jetlag_warning}"
     )
@@ -55283,7 +55920,7 @@ async def circadian_protocol(callback: CallbackQuery):
 
 🌙 *ВЕЧЕР:*
 
-├── Night mode на устройствах с 20:00
+├── Ночной режим на устройствах с 20:00
 ├── Amber-очки желательно
 ├── Мелатонин 1-3 мг (опционально)
 ├── Экраны выключить за 1 час до сна
@@ -55313,7 +55950,7 @@ async def circadian_protocol(callback: CallbackQuery):
 ├── Стабильный режим (±30 мин)
 ├── Утренний свет (хотя бы 10-15 мин)
 ├── Завтрак в течение 1 часа
-├── Night mode вечером
+├── Ночной режим вечером
 └── Сон до 23:00
 
 ━━━━━━━━━━━━━━━━━━━━━━
@@ -55645,7 +56282,7 @@ async def circadian_ideal_day(callback: CallbackQuery):
 └── За 3-4 часа до сна
 
 *19:00* 🌅 Диммируем свет
-└── Night mode на устройствах
+└── Ночной режим на устройствах
 
 *19:30-20:30* 🛁 Ванна / расслабление
 
@@ -57372,6 +58009,25 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
     ahs_score = ahs.get("ahs_total", 0)
     hpa_stage = ahs.get("hpa_stage", 0)
     
+    # ПОПРАВКА #45: Fallback на мини-тест
+    sqs_is_mini = False
+    pss_is_mini = False
+    gad_is_mini = False
+    ahs_is_mini = False
+    
+    if not sqs_score and data.get("mini_sqs") is not None:
+        sqs_score = data["mini_sqs"]
+        sqs_is_mini = True
+    if not pss_score and data.get("mini_pss") is not None:
+        pss_score = data["mini_pss"]
+        pss_is_mini = True
+    if not gad_score and data.get("mini_gad") is not None:
+        gad_score = data["mini_gad"]
+        gad_is_mini = True
+    if not ahs_score and data.get("mini_ahs") is not None:
+        ahs_score = data["mini_ahs"]
+        ahs_is_mini = True
+    
     # Эмодзи статусов
     def get_emoji(score, thresholds, invert=False):
         if invert:
@@ -57381,11 +58037,27 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
         elif score >= thresholds[2]: return "🟠"
         else: return "🔴"
     
-    sqs_emoji = get_emoji(sqs_score, [28, 20, 15]) if sqs_score else "⬜"
-    pss_emoji = get_emoji(40 - pss_score, [27, 20, 13]) if pss_score else "⬜"
-    gad_emoji = get_emoji(21 - gad_score, [16, 11, 6]) if gad_score else "⬜"
+    if sqs_is_mini:
+        sqs_emoji = get_emoji(sqs_score, [12, 8, 5]) if sqs_score else "⬜"
+    else:
+        sqs_emoji = get_emoji(sqs_score, [28, 20, 15]) if sqs_score else "⬜"
+    
+    if pss_is_mini:
+        pss_emoji = get_emoji(16 - pss_score, [10, 7, 4]) if pss_score else "⬜"
+    else:
+        pss_emoji = get_emoji(40 - pss_score, [27, 20, 13]) if pss_score else "⬜"
+    
+    if gad_is_mini:
+        gad_emoji = get_emoji(6 - gad_score, [4, 3, 1]) if gad_score else "⬜"
+    else:
+        gad_emoji = get_emoji(21 - gad_score, [16, 11, 6]) if gad_score else "⬜"
+    
     circ_emoji = get_emoji(circ_score, [45, 30, 15]) if circ_score else "⬜"
-    ahs_emoji = get_emoji(48 - ahs_score, [36, 24, 12]) if ahs_score else "⬜"
+    
+    if ahs_is_mini:
+        ahs_emoji = get_emoji(16 - ahs_score, [12, 8, 4]) if ahs_score else "⬜"
+    else:
+        ahs_emoji = get_emoji(48 - ahs_score, [36, 24, 12]) if ahs_score else "⬜"
     
     # Уровни
     def get_level(score, thresholds, labels):
@@ -57394,9 +58066,15 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
                 return labels[i]
         return labels[-1]
     
-    sqs_level = get_level(sqs_score, [28, 20, 15, 0], ["отличный", "хороший", "сниженный", "критический"])
+    if sqs_is_mini:
+        sqs_level = get_level(sqs_score, [12, 8, 5, 0], ["отличный", "хороший", "сниженный", "критический"])
+    else:
+        sqs_level = get_level(sqs_score, [28, 20, 15, 0], ["отличный", "хороший", "сниженный", "критический"])
     circ_level = get_level(circ_score, [45, 30, 15, 0], ["отличный", "умеренный", "сниженный", "критический"])
-    pss_level = get_level(40 - pss_score, [27, 20, 13, 0], ["низкий", "умеренный", "повышенный", "высокий"])
+    if pss_is_mini:
+        pss_level = get_level(16 - pss_score, [10, 7, 4, 0], ["низкий", "умеренный", "повышенный", "высокий"])
+    else:
+        pss_level = get_level(40 - pss_score, [27, 20, 13, 0], ["низкий", "умеренный", "повышенный", "высокий"])
     
     # HPA стадия
     hpa_names = {0: "Норма", 1: "ALERT", 2: "RESISTANCE", 3: "EXHAUSTION"}
@@ -57548,6 +58226,36 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
             f"Осталось:\n{missing_text}\n"
         )
 
+    # ПОПРАВКА #45: формируем строки с учётом мини/полный
+    mini_tag = " _(экспресс тест)_"
+    
+    if sqs_score:
+        sqs_max = 17 if sqs_is_mini else 40
+        sqs_line = f"😴 Сон: {sqs_score}/{sqs_max} {sqs_emoji} {sqs_level}{mini_tag if sqs_is_mini else ''}"
+    else:
+        sqs_line = "😴 Сон: — _ещё не пройден_"
+    
+    if pss_score:
+        pss_max = 16 if pss_is_mini else 40
+        pss_line = f"🔥 Стресс: {pss_score}/{pss_max} {pss_emoji} {pss_level}{mini_tag if pss_is_mini else ''}"
+    else:
+        pss_line = "🔥 Стресс: — _ещё не пройден_"
+    
+    if gad_score:
+        gad_max = 6 if gad_is_mini else 21
+        gad_line = f"😰 Тревожность: {gad_score}/{gad_max} {gad_emoji}{mini_tag if gad_is_mini else ''}"
+    else:
+        gad_line = "😰 Тревожность: — _ещё не пройден_"
+    
+    if ahs_score:
+        ahs_max = 16 if ahs_is_mini else 48
+        if ahs_is_mini:
+            ahs_line = f"⚡ БГС: {ahs_score}/{ahs_max} {ahs_emoji}{mini_tag}"
+        else:
+            ahs_line = f"⚡ БГС: {ahs_score}/{ahs_max} {ahs_emoji} Стадия {hpa_stage}: {hpa_name}"
+    else:
+        ahs_line = "⚡ БГС: — _ещё не пройден_"
+
     # Формируем текст
     text = f"""📋 *СВОДНЫЙ ОТЧЁТ*
 {partial_banner}
@@ -57555,10 +58263,10 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
 📊 *Твои результаты тестов:*
 
 🌅 Циркадка: {circ_score}/60 {circ_emoji} {circ_level}
-😴 Сон (SQS): {sqs_score}/40 {sqs_emoji} {sqs_level}
-🔥 Стресс (PSS): {pss_score}/40 {pss_emoji} {pss_level}
-😰 Тревожность (GAD): {gad_score}/21 {gad_emoji}
-⚡ БГС: {ahs_score}/48 {ahs_emoji} Стадия {hpa_stage}: {hpa_name}{chrono_text}{bp_text}{dermo_text}{modifiers_text}
+{sqs_line}
+{pss_line}
+{gad_line}
+{ahs_line}{chrono_text}{bp_text}{dermo_text}{modifiers_text}
 
 🟢 норма  🟡 внимание  🟠 риск  🔴 критично"""
 
@@ -57583,7 +58291,7 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
     else:
         # Кнопка на следующий непройденный тест
         if not data.get("sqs"):
-            buttons.append([InlineKeyboardButton(text=f"▶️ Продолжить диагностику (осталось {tests_remaining})", callback_data="sleep_test_start_locked")])
+            buttons.append([InlineKeyboardButton(text=f"▶️ Продолжить диагностику (осталось {tests_remaining})", callback_data="sqs_test_start_locked")])
         elif not data.get("stress"):
             buttons.append([InlineKeyboardButton(text=f"▶️ Продолжить диагностику (осталось {tests_remaining})", callback_data="stress_test_start_locked")])
         elif not data.get("circadian"):
@@ -63458,6 +64166,24 @@ async def collect_summary_data(telegram_id: int) -> dict:
             # БАГ 1: Проверяем все ли тесты пройдены
             data["all_tests_done"] = (data["tests_completed"] >= data["tests_total"])
             
+            # ПОПРАВКА #45: Fallback на мини-тест если полные не пройдены
+            if not data["sqs"] or not data["stress"] or not data["ahs"]:
+                cursor = await db.execute(
+                    "SELECT * FROM mini_test_results WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (telegram_id,)
+                )
+                mini = await cursor.fetchone()
+                if mini:
+                    mini = dict(mini)
+                    if not data["sqs"] and mini.get("sqs_mini_score") is not None:
+                        data["mini_sqs"] = mini["sqs_mini_score"]
+                    if not data["stress"] and mini.get("pss4_score") is not None:
+                        data["mini_pss"] = mini["pss4_score"]
+                    if not data["stress"] and mini.get("gad2_score") is not None:
+                        data["mini_gad"] = mini["gad2_score"]
+                    if not data["ahs"] and mini.get("ahs_mini_score") is not None:
+                        data["mini_ahs"] = mini["ahs_mini_score"]
+            
             # Дермографизм
             cursor = await db.execute(
                 "SELECT * FROM hydro_profile WHERE telegram_id = ?",
@@ -63708,9 +64434,9 @@ def format_summary_card(data: dict) -> str:
     # Показатели блок
     indicators_block = f"""📋 *ПОКАЗАТЕЛИ:*
 
-😴 Сон (SQS): {sqs_score or '—'}/40 {get_emoji('sqs', sqs_score)}
-🔥 Стресс (PSS): {pss_score or '—'}/40 {get_emoji('pss', pss_score)}
-😰 Тревожность (GAD): {gad_score or '—'}/21 {get_emoji('gad', gad_score)}
+😴 Сон: {sqs_score or '—'}/40 {get_emoji('sqs', sqs_score)}
+🔥 Стресс: {pss_score or '—'}/40 {get_emoji('pss', pss_score)}
+😰 Тревожность: {gad_score or '—'}/21 {get_emoji('gad', gad_score)}
 🌅 Циркадка: {circ_score or '—'}/60 {get_emoji('circadian', circ_score)}
 ⚡ БГС (HPA): {ahs_score or '—'}/48{hpa_text} {get_emoji('ahs', ahs_score)}
 🔬 Дермографизм: {derm_text}
@@ -64957,7 +65683,7 @@ ROADMAP_NOT_GENERATED_TEXT = """🗺️ Маршрут ещё не постро�
 
 ROADMAP_NEED_TESTS_TEXT = """🗺️ Для маршрута нужны минимум 3 из 4 тестов:
 • 😴 Качество сна (SQS)
-• 🔥 Стресс (PSS)
+• 🔥 Стресс
 • ⚡ Надпочечники (БГС)
 • 🌅 Циркадка
 
@@ -76200,7 +76926,8 @@ async def genetics_chronotype_handler(callback: CallbackQuery):
         # Добавляем глимфатику
         glyph = get_glymphatic_risk(chrono.get("chronotype", "neutral"))
         risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(glyph["risk"], "⚪")
-        text += f"\n\n🧠 *Глимфатика:* {risk_emoji} {glyph['risk'].upper()}"
+        risk_ru = {"low": "НИЗКИЙ РИСК", "medium": "УМЕРЕННЫЙ РИСК", "high": "ВЫСОКИЙ РИСК"}.get(glyph["risk"], glyph["risk"])
+        text += f"\n\n🧠 *Глимфатика:* {risk_emoji} {risk_ru}"
         if glyph["risk"] != "low":
             text += f"\n_{glyph['note']}_"
             text += f"\n✅ {glyph['compensation']}"
@@ -81266,8 +81993,8 @@ def format_test_indicators_card(data: dict) -> str:
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-😴 Сон (SQS): {sqs_score or '—'}/40 {get_emoji('sqs', sqs_score)}{get_trend(dynamics.get('sqs_change'))}
-🔥 Стресс (PSS): {pss_score or '—'}/40 {get_emoji('pss', pss_score)}{get_trend(dynamics.get('pss_change'))}
+😴 Сон: {sqs_score or '—'}/40 {get_emoji('sqs', sqs_score)}{get_trend(dynamics.get('sqs_change'))}
+🔥 Стресс: {pss_score or '—'}/40 {get_emoji('pss', pss_score)}{get_trend(dynamics.get('pss_change'))}
 🌅 Циркадка: {circ_score or '—'}/60 {get_emoji('circadian', circ_score)}{get_trend(dynamics.get('circadian_change'))}
 ⚡ БГС (AHS): {ahs_score or '—'}/48 {get_emoji('ahs', ahs_score)}"""
 

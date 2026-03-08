@@ -25,6 +25,7 @@ import json
 import random
 import base64
 import httpx  # ПОПРАВКА #126: Для Claude Vision API
+import aiohttp  # ПОПРАВКА #169: Для Claude Anthropic API (планировщик)
 import os
 import re
 import statistics
@@ -45,6 +46,9 @@ DB_PATH = "brain_bot.db"
 
 # ПОПРАВКА #126: Claude API для распознавания скриншотов HRV
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")  # Из .env файла
+
+# ═══ ПОПРАВКА #169: Anthropic API для планировщика (разгрузка + эмоции) ═══
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # Из .env файла
 
 # ═══════════════════════════════════════════════════════════════
 # ПОПРАВКА #138: Константы модуля дыхательных практик
@@ -2958,6 +2962,333 @@ async def init_db():
         await db.commit()
         print("✅ База данных готова (включая Маршрутную карту омоложения — Чат 42)!")
 
+    # ═══════════════════════════════════════════════════════════════
+    # ПОПРАВКА #164: Профильная система — поля + таблица
+    # ═══════════════════════════════════════════════════════════════
+    async with aiosqlite.connect(DB_PATH) as db:
+        profile_fields = [
+            ('profile_type', "TEXT DEFAULT 'base'"),
+            ('caregiver_active', 'INTEGER DEFAULT 0'),
+            ('caregiver_is_professional', 'INTEGER DEFAULT 0'),
+            ('caregiver_duration', 'TEXT'),
+            ('menopause_status', "TEXT DEFAULT 'none'"),
+            ('mrs_short_score', 'INTEGER'),
+            ('mrs_last_date', 'TEXT'),
+            ('ptsd_screen_score', 'INTEGER DEFAULT 0'),
+            ('ptsd_probable', 'INTEGER DEFAULT 0'),
+            ('dissociation_risk', 'INTEGER DEFAULT 0'),
+            ('pcl_last_date', 'TEXT'),
+            ('zbi_short_score', 'INTEGER'),
+            ('zbi_last_date', 'TEXT'),
+            ('profile_screening_done', 'INTEGER DEFAULT 0'),
+            ('profile_screening_date', 'TEXT'),
+            ('last_referral_date', 'TEXT'),
+            ('vitamin_plan_needs_rebuild', 'INTEGER DEFAULT 0'),  # ПОПРАВКА #165
+        ]
+        for col_name, col_type in profile_fields:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+        await db.commit()
+
+    # ═══ ПОПРАВКА #166: Поля питания в users ═══
+    async with aiosqlite.connect(DB_PATH) as db:
+        nutrition_fields = [
+            ('nutrition_module_active', 'INTEGER DEFAULT 0'),
+            ('nutrition_tips_enabled', 'INTEGER DEFAULT 1'),
+            ('nutrition_shopping_day', "TEXT DEFAULT 'sunday'"),
+            ('last_food_tip_date', 'TEXT'),
+        ]
+        for col_name, col_type in nutrition_fields:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+        await db.commit()
+
+    # ═══ ПОПРАВКА #167: Отдельные симптомы MRS для фильтрации ═══
+    async with aiosqlite.connect(DB_PATH) as db:
+        mrs_symptom_fields = [
+            ('mrs_hot_flashes', 'INTEGER DEFAULT 0'),   # MRS Q1: приливы (0-4)
+            ('mrs_sleep_issues', 'INTEGER DEFAULT 0'),   # MRS Q2: сон (0-4)
+            ('mrs_anxiety', 'INTEGER DEFAULT 0'),        # MRS Q3: тревожность (0-4)
+            ('mrs_exhaustion', 'INTEGER DEFAULT 0'),     # MRS Q4: истощение (0-4)
+            ('mrs_dryness', 'INTEGER DEFAULT 0'),        # MRS Q5: вагинальная сухость (0-4)
+        ]
+        for col_name, col_type in mrs_symptom_fields:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+        await db.commit()
+
+    # ═══ ПОПРАВКА #168: Мужские профили ═══
+    async with aiosqlite.connect(DB_PATH) as db:
+        male_profile_fields = [
+            ('adam_short_score', 'INTEGER DEFAULT 0'),
+            ('adam_last_date', 'TEXT'),
+            ('adam_energy', 'INTEGER DEFAULT 0'),
+            ('adam_libido', 'INTEGER DEFAULT 0'),
+            ('adam_focus', 'INTEGER DEFAULT 0'),
+            ('adam_weight', 'INTEGER DEFAULT 0'),
+            ('adam_sleep', 'INTEGER DEFAULT 0'),
+            ('andropause_probable', 'INTEGER DEFAULT 0'),
+            ('alcohol_risk_flag', 'INTEGER DEFAULT 0'),
+        ]
+        for col_name, col_type in male_profile_fields:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+        await db.commit()
+
+    # ═══ ПОПРАВКА #167а: Гидротерапия v2 ═══
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bath_courses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                course_type TEXT NOT NULL,
+                baths_planned INTEGER DEFAULT 12,
+                baths_completed INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                pause_started TEXT,
+                pause_duration_days INTEGER DEFAULT 60,
+                hrv_baseline REAL,
+                hrv_last REAL,
+                frequency TEXT DEFAULT 'every_other_day',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bath_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                course_id INTEGER,
+                date TEXT NOT NULL,
+                bath_type TEXT NOT NULL,
+                dose_grams INTEGER,
+                temp_celsius REAL,
+                duration_minutes INTEGER,
+                bp_systolic INTEGER,
+                bp_diastolic INTEGER,
+                dermographism TEXT,
+                sleepiness INTEGER,
+                nausea INTEGER,
+                general_state INTEGER,
+                allergy INTEGER DEFAULT 0,
+                allergy_note TEXT,
+                hrv_post REAL,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (course_id) REFERENCES bath_courses(id)
+            )
+        """)
+        await db.commit()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        hydro_fields = [
+            ('has_bathtub', "TEXT DEFAULT 'unknown'"),
+            ('hydro_course_active', 'INTEGER DEFAULT 0'),
+            ('hydro_allergy_tested', 'INTEGER DEFAULT 0'),
+            ('hydro_elbow_test_result', "TEXT DEFAULT 'not_done'"),
+            ('work_shift', "TEXT DEFAULT 'day'"),
+        ]
+        for col_name, col_type in hydro_fields:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+        await db.commit()
+        for col_name, col_type in profile_fields:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS profile_monthly_tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                test_type TEXT NOT NULL,
+                date TEXT NOT NULL,
+                q1 INTEGER, q2 INTEGER, q3 INTEGER,
+                q4 INTEGER, q5 INTEGER,
+                total_score INTEGER,
+                previous_score INTEGER,
+                trend TEXT,
+                red_flag INTEGER DEFAULT 0,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # ═══ ПОПРАВКА #166: Антикортизоловое питание ═══
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS nutrition_profile (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                bgs_stage TEXT DEFAULT 'C',
+                profile_type TEXT DEFAULT 'base',
+                diet_goal TEXT DEFAULT 'cortisol_support',
+                restrictions TEXT,
+                shopping_day TEXT DEFAULT 'sunday',
+                last_shopping_list TEXT,
+                food_swaps_shown INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS food_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                meal_type TEXT,
+                quality TEXT,
+                had_protein INTEGER DEFAULT 0,
+                had_vegetables INTEGER DEFAULT 0,
+                had_complex_carbs INTEGER DEFAULT 0,
+                craving_type TEXT,
+                craving_managed TEXT,
+                note TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        await db.commit()
+        print("✅ ПОПРАВКА #164: Профильная система — БД готова!")
+
+    # ═══ ПОПРАВКА #169: Планировщик — таблицы и поля ═══
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Таблица задач пользователя (планировщик)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS planner_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                text TEXT NOT NULL,
+                source TEXT DEFAULT 'unload',
+                priority INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                scheduled_date TEXT,
+                context TEXT,
+                ai_note TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_planner_tasks_active
+            ON planner_tasks(telegram_id, status, scheduled_date)
+        """)
+
+        # Таблица сессий разгрузки
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS unload_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                mode TEXT DEFAULT 'tasks',
+                raw_text TEXT,
+                ai_response TEXT,
+                tasks_created INTEGER DEFAULT 0,
+                emotion_tags TEXT,
+                red_flag INTEGER DEFAULT 0,
+                consecutive_heavy INTEGER DEFAULT 0,
+                profile_type TEXT,
+                duration_seconds INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Таблица утренних планов
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS morning_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                plan_text TEXT,
+                tasks_planned INTEGER DEFAULT 0,
+                tasks_completed INTEGER DEFAULT 0,
+                adapted_reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(telegram_id, date)
+            )
+        """)
+
+        # Поля в users для планировщика
+        planner_fields = [
+            ('unload_enabled', 'INTEGER DEFAULT 0'),
+            ('unload_mode', "TEXT DEFAULT 'sort'"),
+            ('last_unload_date', 'TEXT'),
+            ('total_unloads', 'INTEGER DEFAULT 0'),
+            ('morning_plan_enabled', 'INTEGER DEFAULT 1'),
+        ]
+        for col_name, col_type in planner_fields:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+
+        await db.commit()
+        print("✅ ПОПРАВКА #169: Планировщик — БД готова!")
+
+    # ═══ ПОПРАВКА #170: Монетизация ═══
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                level INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'free',
+                trial_start TEXT,
+                trial_end TEXT,
+                paid_start TEXT,
+                paid_end TEXT,
+                amount_paid INTEGER DEFAULT 0,
+                payment_method TEXT,
+                auto_renew INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS upgrade_hints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                hint_type TEXT NOT NULL,
+                shown_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                clicked INTEGER DEFAULT 0
+            )
+        """)
+
+        subscription_fields = [
+            ('subscription_level', 'INTEGER DEFAULT 0'),
+            ('trial_end_date', 'TEXT'),
+            ('paid_until', 'TEXT'),
+            ('upgrade_hints_shown', 'INTEGER DEFAULT 0'),
+            ('last_upgrade_hint_date', 'TEXT'),
+            ('upgrade_2_declines', 'INTEGER DEFAULT 0'),
+            ('upgrade_3_declines', 'INTEGER DEFAULT 0'),
+            ('upgrade_4_declines', 'INTEGER DEFAULT 0'),
+            ('upgrade_2_stopped', 'INTEGER DEFAULT 0'),
+            ('upgrade_3_stopped', 'INTEGER DEFAULT 0'),
+            ('upgrade_4_stopped', 'INTEGER DEFAULT 0'),
+        ]
+        for col_name, col_type in subscription_fields:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except:
+                pass
+
+        await db.commit()
+        print("✅ ПОПРАВКА #170: Монетизация — БД готова!")
+
     # ПОПРАВКА ЧАТ44: Миграция — колонки для стрессорной коррекции AHS
     async with aiosqlite.connect(DB_PATH) as db:
         for col_name, col_type in [
@@ -3037,6 +3368,23 @@ TIP_CATALOG = {
             "• Тройничный нерв → сигнал бодрости в мозг\n"
             "• Кортизол ↑ (здоровый утренний пик)\n\n"
             "Делайте каждое утро 7 дней → станет привычкой."
+        ),
+    },
+    # ═══ ПОПРАВКА #167: Безопасная альтернатива для ПТСР ═══
+    "warm_wash": {
+        "title": "Тёплое умывание + прохладный финиш",
+        "emoji": "🌊",
+        "category": "energy",
+        "priority": 7,
+        "short": "🌊 Тёплое умывание утром + слегка прохладный финиш.\n"
+                 "Мягкая стимуляция без шока.",
+        "full": (
+            "🌊 *Тёплое умывание с прохладным финишем*\n\n"
+            "1. Умойся тёплой водой — лицо, шея, руки\n"
+            "2. В конце — слегка прохладной (НЕ ледяной)\n"
+            "3. Промокни полотенцем\n\n"
+            "Мягкая стимуляция капилляров без холодового шока.\n"
+            "Безопасно при повышенной чувствительности."
         ),
     },
     "contrast_shower": {
@@ -9244,6 +9592,37 @@ class OnboardingStates(StatesGroup):
     waiting_onb_fog = State()         # Быстрая оценка: туман
     waiting_onb_rejuv = State()       # Трекер омоложения (онбординг)
     waiting_onb_cog = State()         # Когнитивный трекер (онбординг)
+    # ═══ ПОПРАВКА #164: Профильный скрининг ═══
+    waiting_profile_caregiver = State()
+    waiting_profile_caregiver_duration = State()
+    waiting_profile_menopause = State()
+    waiting_profile_mrs_q1 = State()
+    waiting_profile_mrs_q2 = State()
+    waiting_profile_mrs_q3 = State()
+    waiting_profile_mrs_q4 = State()
+    waiting_profile_mrs_q5 = State()
+    waiting_profile_ptsd_intro = State()
+    waiting_profile_ptsd_q1 = State()
+    waiting_profile_ptsd_q2 = State()
+    waiting_profile_ptsd_q3 = State()
+    waiting_profile_ptsd_q4 = State()
+    # ═══ ПОПРАВКА #168: ADAM-скрининг для мужчин ═══
+    waiting_profile_adam_q1 = State()
+    waiting_profile_adam_q2 = State()
+    waiting_profile_adam_q3 = State()
+    waiting_profile_adam_q4 = State()
+    waiting_profile_adam_q5 = State()
+    waiting_profile_ptsd_alcohol = State()
+
+
+class BathStates(StatesGroup):
+    """ПОПРАВКА #167а: Гидротерапия v2 — Post-bath мониторинг"""
+    waiting_bp = State()              # Давление после ванны
+    waiting_dermo = State()           # Дермографизм
+    waiting_sleepiness = State()      # Сонливость
+    waiting_nausea = State()          # Тошнота
+    waiting_general_state = State()   # Общее состояние
+    waiting_elbow_test = State()      # Тест на локте
 
 
 class LifeEventsStates(StatesGroup):
@@ -10216,6 +10595,22 @@ class ZalmanovCourseManager:
 📊 *ИТОГО В ГОД:* 65 ванн, 4 курса
 🎯 *РЕЗУЛЬТАТ:* стойкое улучшение капилляров!"""
 
+    # ═══ ПОПРАВКА #167: Профильная коррекция типа ванны ═══
+    @staticmethod
+    def adjust_bath_type_for_profile(bath_type: str, user: dict) -> str:
+        """Корректирует тип ванны под профиль симптомов.
+        Возвращает скорректированный тип или исходный.
+        """
+        safety = check_bath_safety_for_profile(user)
+
+        # Если белые предпочтительны и давление не низкое
+        if 'white' in safety.get('prefer_types', []):
+            bp = user.get('blood_pressure', 'normal')
+            if bp != 'low':
+                return 'white'
+
+        return bath_type
+
 
 # ═══════════════════════════════════════════════════════════════
 # КОНСТАНТЫ КОГНИТИВНОГО ТРЕКЕРА
@@ -10340,12 +10735,12 @@ VITAMIN_BASE_DOSAGES = {
         'nac': 600, 'vitamin_e': 200, 'ashwagandha': 600,
     },
     'B': {  # Умеренное истощение
-        'vitamin_d': 4000, 'b12': 1500, 'b_complex': 'full',
+        'vitamin_d': 2000, 'b12': 1500, 'b_complex': 'full',
         'vitamin_c': 2000, 'magnesium': 800, 'omega3': '2-3',
         'nac': 800, 'vitamin_e': 300, 'ashwagandha': 1000,
     },
     'A': {  # Тяжёлое истощение
-        'vitamin_d': 5000, 'b12': 2000, 'b_complex': 'full_plus',
+        'vitamin_d': 2000, 'b12': 2000, 'b_complex': 'full_plus',  # 2000 МЕ без анализа (безопасно); с анализом D<20 → 5000-10000
         'vitamin_c': 3000, 'magnesium': 1000, 'omega3': '3',
         'nac': 1200, 'vitamin_e': 400, 'ashwagandha': 1500,
     },
@@ -10355,17 +10750,88 @@ VITAMIN_BASE_DOSAGES = {
 VITAMIN_MODIFIERS = {
     'heredity_cvd': {'omega3': '2-3', 'magnesium': 800, 'vitamin_e': 300},
     'heredity_diabetes': {'b12': 1500, 'magnesium': 1000},
-    'heredity_cancer': {'vitamin_d': 5000, 'nac': 1000, 'vitamin_c': 2000, 'vitamin_e': 300},
-    'heredity_mental': {'omega3': '2-3', 'b12': 1500, 'magnesium': 900, 'vitamin_d': 4000},
+    'heredity_cancer': {'vitamin_d': 2000, 'nac': 1000, 'vitamin_c': 2000, 'vitamin_e': 300},  # 2000 МЕ без анализа; с анализом → корректировка
+    'heredity_mental': {'omega3': '2-3', 'b12': 1500, 'magnesium': 900, 'vitamin_d': 2000},
     'heredity_dementia': {'omega3': '2-3', 'b12': 1500, 'nac': 800, 'vitamin_e': 300},
     'ptsd': {
-        'vitamin_d': 4000, 'nac': 1200, 'magnesium': 1000,
+        'vitamin_d': 2000, 'nac': 1200, 'magnesium': 1000,  # 2000 МЕ без анализа
         'l_theanine': 200, 'l_gaba': 500, 'melatonin': 10, 'omega3': '2-3',
     },
     'ptsd_high': {'l_gaba': 1000, 'melatonin': 10},
     'motherhood': {
-        'vitamin_d': 5000, 'b12': 1500, 'b_complex': 'full',
+        'vitamin_d': 2000, 'b12': 1500, 'b_complex': 'full',  # 2000 МЕ без анализа
         'l_5htp': 100, 'omega3': '2-3', 'magnesium': 800,
+    },
+
+    # ═══════════════════════════════════════════════════════════════
+    # ПОПРАВКА #165: Профильные модификаторы
+    # ═══════════════════════════════════════════════════════════════
+
+    # Caregiver: энергия + защита от выгорания
+    'profile_caregiver': {
+        'ashwagandha': 300,         # KSM-66, 6 мес курс
+        'rhodiola': 200,            # утром, энергия без перестимуляции
+        'magnesium': 600,           # повышенная доза (истощение)
+        'glycine': 3000,            # перед сном (улучшение сна)
+        'omega3': '2-3',            # противовоспалительное
+    },
+
+    # Менопауза: гормональная поддержка + костная + сон
+    'profile_menopause': {
+        'phytoestrogens': 60,       # изофлавоны сои 40-80мг
+        'sage_extract': 300,        # при приливах (Salvia officinalis)
+        'glycine': 3000,            # сон
+        'melatonin': 2,             # 1-3мг, нарушения сна при менопаузе
+        'calcium': 1000,            # профилактика остеопороза
+        'vitamin_d': 2000,          # для усвоения Ca (без анализа); с анализом → корректировка
+        'vitamin_e': 400,           # hot flashes
+    },
+
+    # ПТСР: стабилизация нервной системы
+    'profile_ptsd': {
+        'nac': 2400,                # N-ацетилцистеин (нейропротектор)
+        'glycine': 3000,            # снижение кошмаров
+        'magnesium': 600,           # расслабление
+        'l_theanine': 200,          # GABA-ергическая поддержка
+        'omega3': '2-3',            # нейровоспаление
+        'vitamin_d': 2000,          # часто дефицит (без анализа); с анализом → корректировка
+        # ВНИМАНИЕ: ашваганда УБИРАЕТСЯ или снижается (см. фильтр ниже)
+    },
+
+    # ПТСР высокий (PCL > 12): + CBD если в протоколе
+    'profile_ptsd_high': {
+        'cbd': 25,                  # 25-50мг, перед сном
+        'l_gaba': 500,              # дополнительная GABA-поддержка
+    },
+
+    # Caregiver + Менопауза: двойной GABA-дефицит
+    'profile_cg_meno': {
+        'magnesium': 600,           # повышенная доза
+        'melatonin': 3,             # обязательно
+        'glycine': 3000,
+        'phytoestrogens': 60,
+        'sage_extract': 300,
+        'rhodiola': 200,
+        'calcium': 1000,
+        'vitamin_d': 2000,          # без анализа; с анализом → корректировка
+    },
+
+    # Triple: МИНИМУМ — только самое безопасное
+    'profile_triple': {
+        'magnesium': 400,           # базовый
+        'l_theanine': 200,          # мягкий
+        'glycine': 3000,            # безопасный
+        # ВСЁ. Никаких экспериментов.
+    },
+
+    # ═══ ПОПРАВКА #168: Андропауза ═══
+    'profile_andropause': {
+        'zinc': 30,                 # цинк пиколинат — поддержка тестостерона
+        'vitamin_d': 2000,          # часто дефицит, связь с Т (без анализа); с анализом → корректировка
+        'magnesium': 600,           # мышечная функция + сон
+        'ashwagandha': 600,         # KSM-66: доказано ↑Т на 15-17%
+        'omega3': '2-3',            # противовоспалительное
+        'boron': 10,                # ↑ свободный тестостерон
     },
 }
 
@@ -10376,12 +10842,36 @@ VITAMIN_NAMES_RU = {
     'ashwagandha': 'Ашваганда', 'l_theanine': 'L-Theanine',
     'l_gaba': 'L-GABA', 'l_5htp': 'L-5-HTP', 'melatonin': 'Мелатонин',
 }
+# ═══ ПОПРАВКА #165: Новые добавки для профилей ═══
+VITAMIN_NAMES_RU.update({
+    'glycine': 'Глицин',
+    'rhodiola': 'Родиола розовая',
+    'phytoestrogens': 'Фитоэстрогены (изофлавоны сои)',
+    'sage_extract': 'Экстракт шалфея',
+    'calcium': 'Кальций',
+    'cbd': 'CBD масло',
+    # ═══ ПОПРАВКА #168: Андропауза ═══
+    'zinc': 'Цинк пиколинат',
+    'boron': 'Бор',
+})
 
 VITAMIN_UNITS = {
     'vitamin_d': 'МЕ', 'b12': 'мкг', 'vitamin_c': 'мг', 'magnesium': 'мг',
     'omega3': 'гр', 'nac': 'мг', 'vitamin_e': 'МЕ', 'ashwagandha': 'мг',
     'l_theanine': 'мг', 'l_gaba': 'мг', 'l_5htp': 'мг', 'melatonin': 'мг',
 }
+# ═══ ПОПРАВКА #165 ═══
+VITAMIN_UNITS.update({
+    'glycine': 'мг',
+    'rhodiola': 'мг',
+    'phytoestrogens': 'мг',
+    'sage_extract': 'мг',
+    'calcium': 'мг',
+    'cbd': 'мг',
+    # ═══ ПОПРАВКА #168 ═══
+    'zinc': 'мг',
+    'boron': 'мг',
+})
 
 VITAMIN_TIMING = {
     'morning_empty': ['b12', 'b_complex', 'vitamin_c', 'nac'],
@@ -10390,6 +10880,12 @@ VITAMIN_TIMING = {
     'evening_30m': ['magnesium', 'ashwagandha', 'omega3'],
     'bedtime': ['melatonin'],
 }
+# ═══ ПОПРАВКА #165: Тайминг новых добавок ═══
+VITAMIN_TIMING['morning_food'].extend(['rhodiola', 'phytoestrogens', 'calcium'])
+VITAMIN_TIMING['evening_30m'].extend(['glycine', 'sage_extract'])
+VITAMIN_TIMING['bedtime'].append('cbd')
+# ═══ ПОПРАВКА #168: Андропауза ═══
+VITAMIN_TIMING['morning_food'].extend(['zinc', 'boron'])
 
 # Вопросы опросника ПТСР
 PTSD_QUESTIONS = [
@@ -12700,8 +13196,1157 @@ PROTOCOL_SUPPLEMENTS = {
                 "iherb": "https://iherb.com/pr/ashwagandha-ksm66"
             }
         ]
-    }
+    },
+
+    # ═══════════════════════════════════════════════════════════════
+    # ПОПРАВКА #165: Профильные добавки (добавляются к A/B/C)
+    # ═══════════════════════════════════════════════════════════════
+    "PROFILE_CAREGIVER": {
+        "morning": [
+            {
+                "id": "rhodiola",
+                "name": "Родиола розовая",
+                "dosage": "200mg",
+                "description": "Энергия без перестимуляции, адаптоген",
+                "iherb": "https://iherb.com/pr/rhodiola-rosea-200"
+            },
+        ],
+        "evening": [
+            {
+                "id": "glycine",
+                "name": "Глицин",
+                "dosage": "3000mg (3г)",
+                "description": "Улучшение качества сна",
+                "iherb": "https://iherb.com/pr/glycine-1000"
+            },
+        ]
+    },
+    "PROFILE_MENOPAUSE": {
+        "morning": [
+            {
+                "id": "phytoestrogens",
+                "name": "Фитоэстрогены (изофлавоны сои)",
+                "dosage": "40-80mg",
+                "description": "Снижение приливов, поддержка гормонов",
+                "iherb": "https://iherb.com/pr/soy-isoflavones"
+            },
+            {
+                "id": "calcium",
+                "name": "Кальций + Витамин D",
+                "dosage": "1000mg Ca + 800 МЕ D",
+                "description": "Профилактика остеопороза",
+                "iherb": "https://iherb.com/pr/calcium-d3"
+            },
+        ],
+        "evening": [
+            {
+                "id": "sage_extract",
+                "name": "Экстракт шалфея",
+                "dosage": "300mg",
+                "description": "Снижение приливов и ночной потливости",
+                "iherb": "https://iherb.com/pr/sage-extract-300"
+            },
+            {
+                "id": "glycine",
+                "name": "Глицин",
+                "dosage": "3000mg (3г)",
+                "description": "Улучшение качества сна",
+                "iherb": "https://iherb.com/pr/glycine-1000"
+            },
+        ]
+    },
+    "PROFILE_PTSD": {
+        "morning": [
+            {
+                "id": "nac",
+                "name": "NAC (N-ацетилцистеин)",
+                "dosage": "600-2400mg (наращивать!)",
+                "description": "Нейропротектор, снижение руминаций",
+                "iherb": "https://iherb.com/pr/nac-600"
+            },
+        ],
+        "evening": [
+            {
+                "id": "glycine",
+                "name": "Глицин",
+                "dosage": "3000mg (3г)",
+                "description": "Снижение кошмаров, улучшение сна",
+                "iherb": "https://iherb.com/pr/glycine-1000"
+            },
+        ]
+    },
+    "PROFILE_TRIPLE": {
+        "morning": [],
+        "evening": [
+            {
+                "id": "magnesium",
+                "name": "Магний глицинат",
+                "dosage": "400mg",
+                "description": "Базовая поддержка НС",
+                "iherb": "https://iherb.com/pr/magnesium-glycinate-400"
+            },
+            {
+                "id": "l_theanine",
+                "name": "L-Теанин",
+                "dosage": "200mg",
+                "description": "Мягкое успокоение без сонливости",
+                "iherb": "https://iherb.com/pr/l-theanine-200"
+            },
+            {
+                "id": "glycine",
+                "name": "Глицин",
+                "dosage": "3000mg (3г)",
+                "description": "Улучшение качества сна",
+                "iherb": "https://iherb.com/pr/glycine-1000"
+            },
+        ]
+    },
 }
+
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #166: АНТИКОРТИЗОЛОВОЕ ПИТАНИЕ — КОНСТАНТЫ
+# ═══════════════════════════════════════════════════════════════
+
+CORTISOL_FOODS = {
+    'A': {
+        'breakfast': {
+            'must': [
+                '🥚 Яйца (2-3 шт, варёные или омлет)',
+                '🥑 Авокадо (½ шт)',
+                '🫐 Ягоды (горсть)',
+            ],
+            'good': [
+                '🧈 Масло гхи / кокосовое масло',
+                '🍠 Батат запечённый',
+                '🥜 Ореховая паста (миндаль / кешью)',
+            ],
+            'avoid': [
+                '❌ Сладкие каши / хлопья',
+                '❌ Сок (даже свежевыжатый)',
+                '❌ Кофе натощак',
+            ],
+            'tip': "Завтрак в первые 30 минут после подъёма. Белок + жир обязательно.",
+        },
+        'general_must': [
+            '🐟 Жирная рыба 3-4 раза/нед (лосось, сардины, скумбрия)',
+            '🥩 Белок в каждом приёме пищи',
+            '🥬 Зелёные овощи — минимум 3 порции/день',
+            '🫒 Оливковое масло extra virgin — 3-4 ст.л./день',
+            '🥜 Орехи — 30г/день (грецкие, миндаль)',
+            '🧂 Морская соль (не экономить — надпочечники нуждаются)',
+            '🫐 Ягоды — 1 чашка/день (черника, голубика)',
+            '💧 Вода — 30мл на кг веса',
+        ],
+        'general_avoid': [
+            '❌ Сахар, сладости, выпечка',
+            '❌ Белый хлеб, макароны из белой муки',
+            '❌ Фастфуд, полуфабрикаты',
+            '❌ Кофе (максимум 1 чашка ДО 12:00, не натощак)',
+            '❌ Алкоголь (полностью исключить на 8 недель)',
+            '❌ Энергетики',
+        ],
+        'meal_timing': "Есть каждые 3 часа. Не пропускать приёмы пищи. Последний приём — за 3 часа до сна.",
+    },
+    'B': {
+        'breakfast': {
+            'must': [
+                '🥚 Яйца или творог 5%+',
+                '🫐 Ягоды / фрукт',
+                '🍞 Цельнозерновой хлеб',
+            ],
+            'good': [
+                '🥜 Орехи / семена',
+                '🥑 Авокадо',
+                '🧀 Сыр твёрдый',
+            ],
+            'avoid': [
+                '❌ Сладкие йогурты',
+                '❌ Белый хлеб / булочки',
+                '❌ Кофе натощак',
+            ],
+            'tip': "Завтрак в первый час после подъёма. Белок обязателен.",
+        },
+        'general_must': [
+            '🐟 Рыба 2-3 раза/нед',
+            '🥩 Белок в каждом основном приёме',
+            '🥬 Овощи — 2-3 порции/день',
+            '🫒 Оливковое масло',
+            '🥜 Орехи — 30г/день',
+            '🫐 Ягоды — 1 чашка/день',
+            '💧 Вода — 25-30мл на кг',
+        ],
+        'general_avoid': [
+            '❌ Сахар — максимально сократить',
+            '❌ Фастфуд, полуфабрикаты',
+            '❌ Кофе после 14:00',
+            '❌ Алкоголь — минимизировать (макс 1-2 раза/мес)',
+        ],
+        'meal_timing': "Есть каждые 3-4 часа. Не пропускать завтрак.",
+    },
+    'C': {
+        'breakfast': {
+            'must': [
+                '🥚 Белок (яйца / творог / йогурт)',
+                '🍇 Фрукт или ягоды',
+            ],
+            'good': [
+                '🥜 Орехи',
+                '🍞 Цельнозерновой хлеб',
+                '🥑 Авокадо',
+            ],
+            'avoid': [
+                '❌ Кофе натощак (хотя бы после еды)',
+            ],
+            'tip': "Завтрак с белком — лучший старт дня.",
+        },
+        'general_must': [
+            '🐟 Рыба 2 раза/нед',
+            '🥬 Овощи — 2+ порции/день',
+            '🫒 Оливковое масло',
+            '🫐 Ягоды — 3-4 раза/нед',
+            '💧 Вода — 25мл на кг',
+        ],
+        'general_avoid': [
+            '❌ Ультрапроцессированные продукты (<10% рациона)',
+            '❌ Кофе — не более 2-3 чашек/день',
+        ],
+        'meal_timing': "Регулярные приёмы пищи. Не пропускать завтрак.",
+    },
+}
+
+
+FOOD_SWAPS = {
+    'sugar': {
+        'craving_text': "🍫 Тянет на сладкое",
+        'why': "Кортизол провоцирует тягу к быстрым углеводам — это нормально.",
+        'swaps': [
+            {'instead': 'Шоколадный батончик / конфеты',
+             'try': '🍫 Тёмный шоколад 85% (2-3 дольки) + банан',
+             'why': 'Магний + триптофан → серотонин'},
+            {'instead': 'Торт / пирожное',
+             'try': '🫐 Ягоды + горсть орехов + ложка мёда',
+             'why': 'Антоцианы + полезные жиры'},
+            {'instead': 'Мороженое',
+             'try': '🍌 Замороженный банан (блендер) + какао',
+             'why': 'Натуральный «мороженое» без сахара'},
+            {'instead': 'Сладкая газировка',
+             'try': '💧 Вода + лимон + мята + мёд (1 ч.л.)',
+             'why': 'Гидратация без скачка сахара'},
+        ],
+    },
+    'salt': {
+        'craving_text': "🧂 Тянет на солёное",
+        'why': "При истощении надпочечников — это сигнал о нехватке натрия.",
+        'swaps': [
+            {'instead': 'Чипсы / солёные снеки',
+             'try': '🥒 Огурец + морская соль + оливковое масло',
+             'why': 'Натрий + полезные жиры'},
+            {'instead': 'Солёные крекеры',
+             'try': '🥜 Солёные миндаль / кешью (небольшая горсть)',
+             'why': 'Магний + здоровые жиры'},
+            {'instead': 'Фастфуд',
+             'try': '🥑 Авокадо-тост с морской солью + помидор',
+             'why': 'Калий + натрий = баланс'},
+        ],
+    },
+    'caffeine': {
+        'craving_text': "☕ Хочется ещё кофе",
+        'why': "Кофеин «одалживает» энергию у надпочечников — платить придётся позже.",
+        'swaps': [
+            {'instead': '3-й кофе за день',
+             'try': '🍵 Матча (½ дозы кофеина + L-теанин)',
+             'why': 'Мягкая энергия без скачка кортизола'},
+            {'instead': 'Кофе после 14:00',
+             'try': '🫖 Травяной чай (мята / ройбуш / иван-чай)',
+             'why': 'Не мешает мелатонину'},
+            {'instead': 'Энергетик',
+             'try': '💧 Вода + щепотка соли + лимон',
+             'why': 'Электролиты = настоящая энергия'},
+        ],
+    },
+    'carbs': {
+        'craving_text': "🍞 Тянет на хлеб / макароны",
+        'why': "Серотонин низкий → мозг просит углеводы для его синтеза.",
+        'swaps': [
+            {'instead': 'Белый хлеб',
+             'try': '🍞 Цельнозерновой хлеб / на закваске',
+             'why': 'Медленные углеводы + клетчатка'},
+            {'instead': 'Белые макароны',
+             'try': '🍠 Батат запечённый + оливковое масло',
+             'why': 'Сложные углеводы + витамин A'},
+            {'instead': 'Белый рис',
+             'try': '🫘 Киноа / бурый рис / булгур',
+             'why': 'Белок + клетчатка + B-витамины'},
+        ],
+    },
+}
+
+
+PROFILE_FOOD_MODS = {
+    'caregiver': {
+        'add': [
+            '🍵 Ашваганда-латте (вместо вечернего чая)',
+            '🧄 Чеснок + имбирь (иммунитет при хроническом стрессе)',
+            '🍌 Банан + арахисовая паста (быстрая энергия между сменами)',
+        ],
+        'note': "💚 Ты заботишься о других — не забывай есть сама. Даже перекус лучше, чем голод.",
+    },
+    'menopause': {
+        'add': [
+            '🫘 Соя / тофу / эдамаме (фитоэстрогены — 1 порция/день)',
+            '🥦 Крестоцветные (брокколи, капуста — метаболизм эстрогена)',
+            '🫘 Льняное семя (1 ст.л./день, молотое — лигнаны)',
+            '🦴 Кунжут (кальций — на салаты, в каши)',
+            '🌿 Шалфей (чай — при приливах)',
+        ],
+        'note': "🌸 При hot flashes: избегать горячей пищи, специй, алкоголя. Охлаждающие продукты: огурец, мята, арбуз.",
+        'avoid_extra': [
+            '⚠️ Острые специи (усиливают приливы)',
+            '⚠️ Горячие напитки залпом (провоцируют приливы)',
+            '⚠️ Алкоголь (нарушает и без того хрупкий сон)',
+        ],
+    },
+    'ptsd': {
+        'add': [
+            '🍌 Бананы (триптофан → серотонин)',
+            '🦃 Индейка (триптофан)',
+            '🥬 Шпинат (магний + фолат)',
+            '🫐 Черника (антоцианы — нейропротекция)',
+        ],
+        'note': "🕊 Регулярные приёмы пищи = стабильность. Голод повышает тревожность и реактивность.",
+        'avoid_extra': [
+            '⚠️ Кофе при тревоге (только утром, не более 1 чашки)',
+            '⚠️ Алкоголь (нарушает и без того нарушенный сон)',
+            '⚠️ Сахар (скачки → усиление тревоги)',
+        ],
+    },
+    'triple': {
+        'add': [
+            '🍌 Банан + орехи (проще не бывает)',
+            '🥚 Варёные яйца (можно заготовить)',
+        ],
+        'note': "🕊 Минимум усилий, максимум пользы. Готовые варёные яйца, нарезанные овощи, орехи — всё что не требует готовки.",
+        'avoid_extra': [],
+    },
+    # ═══ ПОПРАВКА #168: Андропауза ═══
+    'andropause': {
+        'add': [
+            '🎃 Тыквенные семечки (цинк — 30г/день)',
+            '🥩 Красное мясо 2-3 раза/нед (цинк + B12 + железо)',
+            '🥚 Яйца цельные (холестерин → тестостерон)',
+            '🥦 Крестоцветные (брокколи, капуста — метаболизм эстрогена)',
+            '🫒 Оливковое масло (мononенасыщенные → тестостерон)',
+            '🧄 Чеснок (аллицин → снижение кортизола)',
+        ],
+        'note': "💪 Тестостерон любит: сон 7-8ч, силовые тренировки, цинк, витамин D. "
+                "Враги: алкоголь, недосып, хронический стресс, висцеральный жир.",
+        'avoid_extra': [
+            '⚠️ Алкоголь (прямо снижает тестостерон и повышает эстроген)',
+            '⚠️ Соя в больших количествах (фитоэстрогены)',
+            '⚠️ Трансжиры (нарушают гормональный синтез)',
+            '⚠️ Сахар (инсулин↑ → тестостерон↓)',
+        ],
+    },
+}
+
+SHOPPING_LISTS_MALE_EXTRAS = {
+    'andropause': [
+        'Тыквенные семечки (300г)',
+        'Говядина / баранина (500г)',
+        'Бразильские орехи (100г, селен — 3-4 шт/день)',
+        'Гранатовый сок (без сахара)',
+    ],
+}
+
+
+SHOPPING_LISTS = {
+    'A': {
+        'protein': [
+            'Яйца (20 шт/нед)', 'Лосось / форель (400г)',
+            'Скумбрия / сардины (300г)', 'Курица / индейка (500г)',
+            'Творог 5%+ (500г)',
+        ],
+        'fats': [
+            'Авокадо (3-4 шт)', 'Оливковое масло extra virgin (500мл)',
+            'Масло гхи / кокосовое (200г)', 'Грецкие орехи (200г)',
+            'Миндаль (200г)',
+        ],
+        'vegetables': [
+            'Шпинат / рукола (300г)', 'Брокколи (400г)',
+            'Огурцы (5 шт)', 'Помидоры (5 шт)',
+            'Батат (3-4 шт)', 'Лук, чеснок',
+        ],
+        'fruits_berries': [
+            'Черника / голубика (500г, можно замор.)',
+            'Бананы (7 шт)', 'Лимоны (3 шт)',
+        ],
+        'other': [
+            'Морская соль (крупная)', 'Цельнозерновой хлеб',
+            'Травяной чай (мята / ройбуш)',
+            'Киноа или бурый рис (500г)',
+            'Бобовые (нут / чечевица, 500г)',
+        ],
+        'estimated_cost': '~5,000-7,000₽/нед',
+    },
+    'B': {
+        'protein': [
+            'Яйца (15 шт/нед)', 'Рыба (лосось / скумбрия, 300г)',
+            'Курица / индейка (400г)', 'Творог / йогурт натур. (500г)',
+        ],
+        'fats': [
+            'Авокадо (2-3 шт)', 'Оливковое масло (500мл)',
+            'Орехи микс (200г)',
+        ],
+        'vegetables': [
+            'Зелень (шпинат / рукола, 200г)',
+            'Брокколи / цветная капуста (300г)',
+            'Огурцы, помидоры', 'Батат / тыква',
+        ],
+        'fruits_berries': [
+            'Черника / смесь ягод (400г)',
+            'Бананы (5 шт)', 'Сезонные фрукты',
+        ],
+        'other': [
+            'Цельнозерновой хлеб',
+            'Крупы (гречка / киноа, 500г)',
+            'Бобовые (400г)',
+        ],
+        'estimated_cost': '~4,000-5,500₽/нед',
+    },
+    'C': {
+        'protein': [
+            'Яйца (10 шт/нед)', 'Рыба (200-300г)',
+            'Мясо / птица (300г)', 'Творог / йогурт (400г)',
+        ],
+        'fats': [
+            'Оливковое масло (500мл)', 'Орехи (150г)',
+        ],
+        'vegetables': [
+            'Зелень (200г)', 'Овощи по сезону',
+        ],
+        'fruits_berries': [
+            'Ягоды (300г)', 'Фрукты по сезону',
+        ],
+        'other': [
+            'Крупы', 'Хлеб цельнозерновой',
+        ],
+        'estimated_cost': '~3,000-4,500₽/нед',
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #167: Матрица безопасности водных процедур
+# ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #167а: Гидротерапия v2 — Домашний санаторий
+# ═══════════════════════════════════════════════════════════════
+
+BATH_TYPES = {
+    'zalmanov_white': {
+        'name': 'Залманов белая (скипидарная)',
+        'type': 'stimulation',
+        'minerals': 'Скипидар живичный',
+        'effect': 'Вазодилатация, детокс, гиперемия',
+        'temp_range': (37, 39),
+        'duration_min': (10, 15),
+        'course': (10, 15),
+        'frequency': 'through_day',
+        'pause_after_course_days': 60,  # 60-90 дней, адаптивно по HRV (Залманов оригинал)
+        'contraindications': ['hypertension_2_3', 'skin_wounds', 'fever'],
+    },
+    'zalmanov_yellow': {
+        'name': 'Залманов жёлтая (скипидарная)',
+        'type': 'stimulation',
+        'minerals': 'Скипидар + касторовое масло',
+        'effect': 'Глубокий прогрев, суставы, потоотделение',
+        'temp_range': (38, 42),
+        'duration_min': (12, 20),
+        'course': (10, 15),
+        'frequency': 'through_day',
+        'pause_after_course_days': 60,  # 60-90 дней, адаптивно по HRV (Залманов оригинал)
+        'contraindications': ['hypertension_2_3', 'skin_wounds', 'fever', 'heart_failure'],
+    },
+    'bishofit': {
+        'name': 'Бишофитная (MgCl₂)',
+        'type': 'relaxation',
+        'minerals': 'MgCl₂ + Br + I',
+        'effect': 'Релаксация, GABA↑, сон, мышечное напряжение↓',
+        'dose_grams': (100, 200),
+        'dose_foot_grams': (30, 50),
+        'temp_range': (36, 38),
+        'duration_min': (15, 20),
+        'course': (10, 15),
+        'frequency': 'every_other_day',
+        'pause_after_course_days': 180,
+        'price_rub': '300-500₽/1.5кг (3-5 ванн)',
+        'where_to_buy': 'Аптека, Ozon, Wildberries',
+        'contraindications': ['skin_wounds', 'iodine_allergy', 'kidney_failure'],
+        'safe_ptsd': False,
+        'safe_ptsd_foot': True,
+    },
+    'epsom': {
+        'name': 'Английская соль (MgSO₄, Epsom)',
+        'type': 'relaxation_detox',
+        'minerals': 'MgSO₄',
+        'effect': 'Detox, мышцы, антистресс, HRV↑',
+        'dose_grams': (400, 600),
+        'dose_detox_grams': (800, 1000),
+        'dose_foot_grams': (50, 100),
+        'temp_range': (37, 39),
+        'duration_min': (20, 30),
+        'course': (10, 12),
+        'frequency': 'every_other_day',
+        'pause_after_course_days': 60,
+        'price_rub': '200₽/кг',
+        'where_to_buy': 'Аптека (горькая соль), Ozon',
+        'contraindications': ['skin_wounds', 'kidney_failure', 'dehydration'],
+        'note': 'Пить воду 0.5л до и после!',
+        'safe_ptsd': False,
+        'safe_ptsd_foot': True,
+    },
+    'sea_salt': {
+        'name': 'Морская соль (NaCl + Mg + K)',
+        'type': 'relaxation_universal',
+        'minerals': 'NaCl, Mg, K, йод',
+        'effect': 'Универсал: кожа, иммунитет, сон, гормоны',
+        'dose_grams': (300, 500),
+        'dose_foot_grams': (50, 80),
+        'temp_range': (36, 38),
+        'duration_min': (15, 20),
+        'course': (12, 15),
+        'frequency': '3-5x_week',
+        'pause_after_course_days': 30,
+        'price_rub': '100-300₽/кг',
+        'where_to_buy': 'Любая аптека, супермаркет, Ozon',
+        'contraindications': ['skin_wounds', 'severe_eczema'],
+        'safe_ptsd': False,
+        'safe_ptsd_foot': True,
+    },
+}
+
+FOOT_BATH_TYPES = {
+    'foot_bishofit': {
+        'name': 'Ножная бишофитная',
+        'base': 'bishofit',
+        'dose_grams': (30, 50),
+        'water_liters': (10, 15),
+        'temp_range': (37, 38),
+        'duration_min': (15, 20),
+        'frequency': 'daily',
+        'safe_ptsd': True,
+        'effect_vs_full': '60-80% от полной ванны',
+        'note': 'Тазик есть у всех. Сидишь свободно.',
+    },
+    'foot_epsom': {
+        'name': 'Ножная Epsom',
+        'base': 'epsom',
+        'dose_grams': (50, 100),
+        'water_liters': (10, 15),
+        'temp_range': (37, 39),
+        'duration_min': (15, 20),
+        'frequency': 'daily',
+        'safe_ptsd': True,
+    },
+    'foot_sea': {
+        'name': 'Ножная морская',
+        'base': 'sea_salt',
+        'dose_grams': (50, 80),
+        'water_liters': (10, 15),
+        'temp_range': (36, 38),
+        'duration_min': (15, 20),
+        'frequency': 'daily',
+        'safe_ptsd': True,
+    },
+    'foot_zalmanov': {
+        'name': 'Ножная Залманов',
+        'base': 'zalmanov_white',
+        'dose_grams': (10, 15),
+        'water_liters': (10, 15),
+        'temp_range': (37, 38),
+        'duration_min': (10, 15),
+        'frequency': 'through_day',
+        'safe_ptsd': True,
+    },
+}
+
+BATH_BY_PROFILE = {
+    'base': {
+        'primary': 'sea_salt',
+        'reason': 'Универсальная, мягкая, доступная',
+        'combo': '+ Epsom 200г для усиления',
+    },
+    'menopause': {
+        'primary': 'sea_salt',
+        'reason': 'Йод/бром для гормонов, кожа',
+        'dose': '300-500г, 15мин',
+        'combo': '+ Epsom 200г',
+    },
+    'caregiver': {
+        'primary': 'bishofit',
+        'reason': 'Мягкий релакс для истощённых. Нервы, сон.',
+        'dose': '100-150г, 15мин, 2x/нед вечер',
+        'combo': '+ лаванда 5 капель',
+    },
+    'ptsd': {
+        'primary': 'foot_bishofit',
+        'reason': 'Безопасно: контроль, мягко, без иммерсии.',
+        'dose': '50г/10л, ежедневно',
+        'combo': None,
+        'full_bath_blocked': True,
+        'block_reason': 'Полная ванна может быть триггером. '
+                        'Ножные — 60-80% эффекта, полный контроль.',
+    },
+    'cg_meno': {
+        'primary': 'bishofit',
+        'reason': 'Caregiver + менопауза → мягкий Mg + релакс',
+        'combo': '+ морская 200г',
+    },
+    'cg_ptsd': {
+        'primary': 'foot_bishofit',
+        'reason': 'ПТСР-фильтр: только ножные',
+        'full_bath_blocked': True,
+    },
+    'meno_ptsd': {
+        'primary': 'foot_bishofit',
+        'reason': 'ПТСР-фильтр: только ножные + Mg для менопаузы',
+        'full_bath_blocked': True,
+    },
+    'triple': {
+        'primary': 'foot_bishofit',
+        'reason': 'Тройной: минимальная нагрузка, максимальная безопасность',
+        'dose': '30г/10л, 10мин',
+        'full_bath_blocked': True,
+    },
+    'andropause': {
+        'primary': 'epsom',
+        'reason': 'Detox, мышцы, энергия.',
+        'dose': '400-600г, 20мин, 3x/нед',
+        'combo': '+ гималайская соль 200г',
+    },
+    'cg_andro': {
+        'primary': 'bishofit',
+        'reason': 'Caregiver → мягче. Но Epsom по выходным.',
+        'combo': '+ Epsom 300г по выходным',
+    },
+    'andro_ptsd': {
+        'primary': 'foot_epsom',
+        'reason': 'ПТСР-фильтр: только ножные. Epsom для мужчин.',
+        'full_bath_blocked': True,
+    },
+}
+
+# ── ПТСР-фильтр ──
+PTSD_SAFE_BATHS = ['foot_bishofit', 'foot_epsom', 'foot_sea', 'foot_zalmanov']
+PTSD_BLOCKED_BATHS = ['bishofit', 'epsom', 'sea_salt', 'zalmanov_white', 'zalmanov_yellow']
+
+PTSD_BATH_DISCLAIMER = (
+    "Полная ванна может быть триггером: замкнутое пространство, "
+    "невозможность быстро выйти. Ножные ванны — 60-80% эффекта, "
+    "при этом ты сидишь свободно и контролируешь ситуацию.\n\n"
+    "Можешь прекратить в любой момент.\n"
+    "Если триггер — дыхание 4-7-8."
+)
+
+# ── Противопоказания ──
+BATH_CONTRAINDICATIONS = {
+    'absolute': [
+        {'key': 'hypertension_3', 'name': 'Гипертония 3 ст.', 'action': 'block'},
+        {'key': 'heart_failure_decomp', 'name': 'Декомпенсированная СН', 'action': 'block'},
+        {'key': 'cancer_active', 'name': 'Онкология (активная)', 'action': 'block'},
+        {'key': 'tuberculosis', 'name': 'Туберкулёз', 'action': 'block'},
+        {'key': 'bleeding_tendency', 'name': 'Склонность к кровотечениям', 'action': 'block'},
+        {'key': 'stroke_recent', 'name': 'Инсульт в анамнезе', 'action': 'doctor'},
+        {'key': 'pregnancy_1st', 'name': 'Беременность (1 триместр)', 'action': 'block'},
+    ],
+    'relative': [
+        {'key': 'hypertension_2', 'name': 'Гипертония 2 ст.',
+         'action': 'limit_temp', 'max_temp': 37},
+        {'key': 'skin_wounds', 'name': 'Открытые раны/ожоги',
+         'action': 'block_affected_area'},
+        {'key': 'eczema', 'name': 'Экзема/дерматозы',
+         'action': 'sea_salt_blocked'},
+        {'key': 'menstruation', 'name': 'Менструация',
+         'action': 'foot_only'},
+        {'key': 'fever', 'name': 'Температура >37.5°C',
+         'action': 'block_all'},
+        {'key': 'iodine_allergy', 'name': 'Аллергия на йод/бром',
+         'action': 'bishofit_blocked'},
+        {'key': 'kidney_disease', 'name': 'Почечная недостаточность',
+         'action': 'doctor_required'},
+    ],
+}
+
+# ── Work Mode ──
+BATH_BY_SHIFT = {
+    'day': {
+        'bath_time': '18:00-20:00',
+        'type': 'full',
+        'note': 'Вечером, за 1.5ч до сна',
+    },
+    'night': {
+        'bath_time': 'post_shift',
+        'type': 'foot',
+        'note': 'После ночной — ножная для recovery.',
+    },
+    'rotating': {
+        'bath_time': 'adaptive',
+        'type': 'adaptive',
+        'note': 'Аврора адаптирует под твой график.',
+    },
+    'freelance': {
+        'bath_time': 'evening_preferred',
+        'type': 'full',
+        'note': 'Лучше вечером, но ты сама выбираешь.',
+    },
+}
+
+# ── Mg комбо-безопасность ──
+MG_COMBO_RULES = {
+    'safe': True,
+    'reason': (
+        "Mg перорально (300-400мг/день) + бишофит/Epsom ванна = безопасно. "
+        "Кожа поглощает ~5-20мг/ч трансдермально — не конкурирует с ЖКТ."
+    ),
+    'monitor': 'Стул + сон (Mg эффект)',
+    'contraindication': 'Почечная недостаточность → врач!',
+}
+
+# ── Ротация курсов ──
+HYDRO_ROTATION = {
+    'zalmanov': {
+        'phase': 'stimulation',
+        'course_baths': (8, 15),
+        'frequency': 'through_day',
+        'pause_days': 60,
+        'pause_fill': 'soft_baths',
+    },
+    'soft_baths': {
+        'phase': 'relaxation',
+        'course_baths': (10, 15),
+        'frequency': 'every_other_day',
+        'pause_days': None,
+        'next': 'zalmanov',
+    },
+}
+
+
+def filter_bath_for_ptsd(bath_key: str, profile_type: str) -> str:
+    """ПОПРАВКА #167а: Заменяет полную ванну на ножную для ПТСР."""
+    ptsd_profiles = ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd', 'triple')
+    if profile_type not in ptsd_profiles:
+        return bath_key
+    if bath_key in PTSD_BLOCKED_BATHS:
+        foot_key = f"foot_{bath_key}"
+        if foot_key in FOOT_BATH_TYPES:
+            return foot_key
+        return 'foot_bishofit'
+    return bath_key
+
+
+def recommend_bath(user: dict, context: str = 'evening') -> dict:
+    """ПОПРАВКА #167а: Рекомендует ванну по профилю и контексту."""
+    profile = user.get('profile_type', 'base')
+    has_bath = user.get('has_bathtub', 'unknown')
+    bath_rec = BATH_BY_PROFILE.get(profile, BATH_BY_PROFILE['base'])
+
+    if bath_rec.get('full_bath_blocked'):
+        bath_key = bath_rec['primary']
+        return {
+            'type': bath_key,
+            'bath': FOOT_BATH_TYPES.get(bath_key, {}),
+            'reason': bath_rec.get('reason', ''),
+            'safety_note': PTSD_BATH_DISCLAIMER,
+        }
+
+    if has_bath == 'none':
+        base_type = bath_rec['primary']
+        foot_key = f"foot_{base_type}"
+        if foot_key not in FOOT_BATH_TYPES:
+            foot_key = 'foot_bishofit'
+        return {
+            'type': foot_key,
+            'bath': FOOT_BATH_TYPES[foot_key],
+            'reason': f"Нет ванны — ножная не хуже! {bath_rec.get('reason', '')}",
+        }
+
+    shift = user.get('work_shift', 'day')
+    if shift == 'night' and context == 'evening':
+        base_type = bath_rec['primary']
+        foot_key = f"foot_{base_type}"
+        if foot_key in FOOT_BATH_TYPES:
+            return {
+                'type': foot_key,
+                'bath': FOOT_BATH_TYPES[foot_key],
+                'reason': 'После ночной: быстрая ножная для recovery.',
+                'time': 'После смены, утром',
+            }
+
+    bath_key = bath_rec['primary']
+    bath_info = BATH_TYPES.get(bath_key, {})
+    return {
+        'type': bath_key,
+        'bath': bath_info,
+        'reason': bath_rec.get('reason', ''),
+        'combo': bath_rec.get('combo'),
+        'dose': bath_rec.get('dose', f"{bath_info.get('dose_grams', (150, 200))[0]}г"),
+    }
+
+
+def adapt_bath_for_shift(user: dict, bath_rec: dict) -> dict:
+    """ПОПРАВКА #167а: Адаптирует рекомендацию ванны под рабочий график."""
+    shift = user.get('work_shift', 'day')
+    shift_rules = BATH_BY_SHIFT.get(shift, BATH_BY_SHIFT['day'])
+
+    if shift == 'night':
+        bath_type = bath_rec.get('type', '')
+        if not bath_type.startswith('foot'):
+            base = bath_type if bath_type else 'bishofit'
+            foot_key = f"foot_{base}"
+            if foot_key in FOOT_BATH_TYPES:
+                bath_rec = {
+                    **bath_rec,
+                    'type': foot_key,
+                    'bath': FOOT_BATH_TYPES[foot_key],
+                    'shift_note': shift_rules['note'],
+                }
+
+    bath_rec['bath_time'] = shift_rules['bath_time']
+    return bath_rec
+
+
+BATH_SAFETY_RULES = {
+    'hot_flashes': {
+        'threshold': 2,
+        'rules': {
+            'max_temp': 37,
+            'avoid': [],
+            'prefer': ['white'],
+            'note': "🌡 Температура до 37°C — чтобы не провоцировать приливы.",
+        },
+    },
+    'dryness': {
+        'threshold': 2,
+        'rules': {
+            'prefer': ['white'],
+            'note': "🤍 Белые ванны могут помочь при вагинальной сухости —\n"
+                    "улучшают микроциркуляцию малого таза.\n"
+                    "Это дополнение к лечению, не замена. Обсуди с гинекологом.",
+            'referral': 'gynecologist',
+        },
+    },
+    'dissociation': {
+        'threshold': 1,
+        'rules': {
+            'avoid': ['contrast_shower', 'cold_wash', 'diving_response'],
+            'max_temp': 38,
+            'prefer': ['bath_white', 'bath_yellow'],
+            'note': "🕊 Контрастные процедуры убраны — безопасность на первом месте.\n"
+                    "Если чувствуешь дискомфорт в ванне — выходи. Это нормально.",
+        },
+    },
+    'ptsd_no_dissociation': {
+        'threshold': 9,
+        'rules': {
+            'avoid': ['diving_response'],
+            'contrast_caution': True,
+            'note': "🕊 Ванна — безопасное пространство. Ты контролируешь.\n"
+                    "Можешь выйти в любой момент.",
+        },
+    },
+    'triple': {
+        'threshold': 1,
+        'rules': {
+            'avoid': ['contrast_shower', 'diving_response'],
+            'max_temp': 37,
+            'prefer': ['bath_white'],
+            'frequency': 'max_2_per_week',
+            'note': "🕊 Только тёплая вода (37°C), только мягкие ванны.\n"
+                    "Не больше 2 раз в неделю.",
+        },
+    },
+    'caregiver': {
+        'threshold': 1,
+        'rules': {
+            'avoid': [],
+            'prefer': ['bath_yellow', 'bath_mixed'],
+            'note': "💚 Ванна — это время ТОЛЬКО для тебя.\n"
+                    "Закрой дверь. Включи музыку. 20 минут.",
+        },
+    },
+}
+
+
+def parse_blood_pressure(text: str):
+    """ПОПРАВКА #167а: Парсит давление из текста. '120/80' → (120, 80)"""
+    import re
+    match = re.search(r'(\d{2,3})\s*[/\\]\s*(\d{2,3})', text)
+    if match:
+        sys_ = int(match.group(1))
+        dia_ = int(match.group(2))
+        if 70 <= sys_ <= 250 and 40 <= dia_ <= 150:
+            return (sys_, dia_)
+    return None
+
+
+async def save_bath_session(telegram_id, bath_type, bp_systolic=None,
+                             bp_diastolic=None, dermographism=None,
+                             sleepiness=None, nausea=None,
+                             general_state=None, hrv_post=None):
+    """ПОПРАВКА #167а: Сохраняет данные одной ванны."""
+    course = await get_active_bath_course(telegram_id)
+    course_id = course['id'] if course else None
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO bath_sessions "
+            "(telegram_id, course_id, date, bath_type, "
+            "bp_systolic, bp_diastolic, dermographism, "
+            "sleepiness, nausea, general_state, hrv_post) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (telegram_id, course_id, date.today().isoformat(),
+             bath_type, bp_systolic, bp_diastolic, dermographism,
+             sleepiness, nausea, general_state, hrv_post)
+        )
+        await db.commit()
+
+
+async def get_active_bath_course(telegram_id: int) -> dict:
+    """ПОПРАВКА #167а: Получить текущий активный курс ванн."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM bath_courses "
+            "WHERE telegram_id = ? AND status = 'active' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (telegram_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_last_bath_date(telegram_id: int) -> str:
+    """ПОПРАВКА #167а: Дата последней ванны."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT date FROM bath_sessions "
+            "WHERE telegram_id = ? ORDER BY date DESC LIMIT 1",
+            (telegram_id,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def update_bath_course_count(course_id: int, new_count: int):
+    """ПОПРАВКА #167а: Обновить счётчик ванн в курсе."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE bath_courses SET baths_completed = ? WHERE id = ?",
+            (new_count, course_id)
+        )
+        await db.commit()
+
+
+async def complete_bath_course(course_id: int):
+    """ПОПРАВКА #167а: Завершить курс, начать паузу."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE bath_courses SET status = 'paused', "
+            "pause_started = ?, completed_at = ? WHERE id = ?",
+            (date.today().isoformat(), datetime.now().isoformat(), course_id)
+        )
+        await db.commit()
+
+
+def is_bath_day(last_bath_date: str, frequency: str) -> bool:
+    """ПОПРАВКА #167а: Проверяет: сегодня день ванны по расписанию?"""
+    if not last_bath_date:
+        return True
+    last = date.fromisoformat(last_bath_date)
+    days_since = (date.today() - last).days
+    if frequency in ('through_day', 'every_other_day'):
+        return days_since >= 2
+    elif frequency in ('3-5x_week',):
+        return days_since >= 1
+    elif frequency == 'daily':
+        return days_since >= 1
+    return days_since >= 2
+
+
+async def check_elbow_test(telegram_id: int) -> dict:
+    """ПОПРАВКА #167а: Проверяет прошёл ли тест на локте."""
+    user = await get_user(telegram_id)
+    test_result = user.get('hydro_elbow_test_result', 'not_done') if user else 'not_done'
+
+    if test_result == 'not_done':
+        return {
+            'allowed': False,
+            'action': 'elbow_test',
+            'message': (
+                "🧪 *Перед первой ванной — тест на аллергию.*\n\n"
+                "1. Раствори 1 ч.л. соли в 0.5л воды\n"
+                "2. Нанеси на внутреннюю сторону локтя\n"
+                "3. Подожди 15 минут\n\n"
+                "Нет покраснения/зуда → ванна ОК ✅\n"
+                "Есть реакция → этот тип не подходит, попробуем другой."
+            ),
+        }
+    elif test_result == 'reaction':
+        return {'allowed': False, 'action': 'change_type',
+                'message': 'На этот тип была реакция. Предложу другой.'}
+
+    return {'allowed': True}
+
+
+async def check_bath_contraindications_full(telegram_id: int) -> dict:
+    """ПОПРАВКА #167а: Проверяет противопоказания перед ванной."""
+    user = await get_user(telegram_id)
+    if not user:
+        return {'allowed': True, 'warnings': []}
+
+    blocks = []
+    warnings = []
+
+    last_bp = user.get('last_bp_systolic', 120)
+    if last_bp and last_bp > 160:
+        blocks.append("Давление высокое (>160). Сегодня без ванны.")
+    elif last_bp and last_bp > 140:
+        warnings.append("Давление повышено. Только ножная, T ≤ 37°C.")
+
+    if blocks:
+        return {'allowed': False, 'blocks': blocks}
+
+    return {'allowed': True, 'warnings': warnings}
+
+
+async def check_course_status(telegram_id: int) -> dict:
+    """ПОПРАВКА #167а: Проверяет статус текущего курса ванн."""
+    course = await get_active_bath_course(telegram_id)
+
+    if not course:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT * FROM bath_courses WHERE telegram_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (telegram_id,)
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return {'status': 'no_course', 'action': 'start_first'}
+            course = dict(row) if row else {}
+
+    status = course.get('status', 'active')
+    baths_done = course.get('baths_completed', 0)
+    baths_planned = course.get('baths_planned', 12)
+
+    if status == 'active':
+        if baths_done >= baths_planned:
+            return {'status': 'completed', 'action': 'start_pause', 'baths_done': baths_done}
+        return {
+            'status': 'active',
+            'action': 'continue',
+            'baths_done': baths_done,
+            'baths_remaining': baths_planned - baths_done,
+            'progress': f'{baths_done} из {baths_planned}',
+        }
+    elif status == 'paused':
+        pause_start_str = course.get('pause_started')
+        if pause_start_str:
+            pause_start = date.fromisoformat(pause_start_str)
+            pause_days = course.get('pause_duration_days', 60)
+            days_elapsed = (date.today() - pause_start).days
+            if days_elapsed >= pause_days:
+                return {'status': 'pause_complete', 'action': 'ready_for_new_course',
+                        'days_paused': days_elapsed}
+            return {'status': 'paused', 'action': 'soft_baths_ok',
+                    'days_remaining': pause_days - days_elapsed,
+                    'note': 'Пауза после Залманова. Мягкие ванны доступны.'}
+
+    return {'status': 'unknown'}
+
+
+def check_bath_safety_for_profile(user: dict) -> dict:
+    """
+    ПОПРАВКА #167: Проверяет безопасность водных процедур по симптомам.
+    Фильтрует по СИМПТОМАМ, а не по диагнозу.
+    """
+    result = {
+        'max_temp': 39,
+        'avoid_procedures': [],
+        'prefer_types': [],
+        'notes': [],
+        'white_bath_bonus': False,
+        'referrals': [],
+    }
+
+    profile = user.get('profile_type', 'base')
+
+    # ── Приливы ──
+    hot_flashes = user.get('mrs_hot_flashes', 0)
+    if hot_flashes >= 2:
+        result['max_temp'] = min(result['max_temp'], 37)
+        result['prefer_types'].append('white')
+        result['notes'].append("🌡 Температура до 37°C — у тебя выраженные приливы.")
+    elif hot_flashes == 1:
+        result['max_temp'] = min(result['max_temp'], 38)
+        result['notes'].append("🌡 Температура до 38°C — лёгкие приливы, осторожно с горячим.")
+
+    # ── Вагинальная сухость ──
+    dryness = user.get('mrs_dryness', 0)
+    if dryness >= 2:
+        result['white_bath_bonus'] = True
+        result['prefer_types'].append('white')
+        result['notes'].append(
+            "🤍 Белые ванны рекомендуются — "
+            "улучшают микроциркуляцию малого таза, "
+            "что помогает при вагинальной сухости.\n"
+            "Это поддержка, не замена лечения."
+        )
+        result['referrals'].append('gynecologist')
+
+    # ── Диссоциация ──
+    dissociation = user.get('dissociation_risk', 0)
+    if dissociation:
+        result['avoid_procedures'].extend(['contrast_shower', 'cold_wash', 'diving_response'])
+        result['max_temp'] = min(result['max_temp'], 38)
+        result['notes'].append(
+            "🕊 Контрастные процедуры убраны — безопасность первична.\n"
+            "Если в ванне чувствуешь дискомфорт — выходи. Это нормально."
+        )
+    # ── ПТСР без диссоциации ──
+    elif profile in ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd'):
+        result['avoid_procedures'].append('diving_response')
+        result['notes'].append("🕊 Ванна — безопасное пространство. Ты контролируешь.")
+
+    # ── Triple ──
+    if profile == 'triple':
+        result['avoid_procedures'].extend(['contrast_shower', 'diving_response'])
+        result['max_temp'] = min(result['max_temp'], 37)
+        result['prefer_types'] = ['white']
+        result['notes'].append("🕊 Только тёплая вода и мягкие ванны. Не больше 2 раз в неделю.")
+
+    # ── Caregiver ──
+    if profile in ('caregiver', 'cg_meno', 'cg_ptsd', 'cg_andro'):
+        if user.get('caregiver_is_professional', 0):
+            result['notes'].append("💚 Ванна после смены — лучшее восстановление.")
+        else:
+            result['notes'].append("💚 Ванна — это время ТОЛЬКО для тебя. Закрой дверь.")
+
+    # ═══ ПОПРАВКА #168: Андропауза — ванны ═══
+    if profile in ('andropause', 'cg_andro', 'andro_ptsd'):
+        result['notes'].append(
+            "💪 Контрастный душ рекомендуется — стимулирует тестостерон.\n"
+            "Ванны: тёплые (не горячие) — яички чувствительны к температуре."
+        )
+        result['max_temp'] = min(result['max_temp'], 38)
+
+    # Дедупликация
+    result['avoid_procedures'] = list(set(result['avoid_procedures']))
+    result['prefer_types'] = list(dict.fromkeys(result['prefer_types']))
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -12906,6 +14551,70 @@ async def send_morning_reminders():
             
             name = user.get("name", "друг")
             
+            # ═══ ПОПРАВКА #164: Миграция — предложить скрининг существующим ═══
+            if user.get('onboarding_completed') and not user.get('profile_screening_done'):
+                try:
+                    await bot.send_message(
+                        chat_id=tid,
+                        text=f"💚 *{name}, у Авроры новая возможность!*\n\n"
+                             f"8 вопросов — и я смогу лучше подстроиться\n"
+                             f"под твою ситуацию.\n\n"
+                             f"Это займёт 2 минуты 🕐",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="▶️ Пройти", callback_data="profile_screen_start")],
+                            [InlineKeyboardButton(text="⏭ Не сейчас", callback_data="profile_screen_skip")]
+                        ])
+                    )
+                except:
+                    pass
+            
+            # ═══ ПОПРАВКА #164: Ежемесячные тесты по профилям (1 числа) ═══
+            if date.today().day == 1 and user.get('profile_screening_done'):
+                try:
+                    profile = user.get('profile_type', 'base')
+                    tests_needed = []
+                    
+                    if profile in ('caregiver', 'cg_meno', 'cg_ptsd', 'cg_andro', 'triple'):
+                        last_zbi = user.get('zbi_last_date')
+                        if not last_zbi or (date.today() - date.fromisoformat(last_zbi)).days >= 28:
+                            tests_needed.append('zbi_short')
+                    if profile in ('menopause', 'cg_meno', 'meno_ptsd', 'triple'):
+                        last_mrs = user.get('mrs_last_date')
+                        if not last_mrs or (date.today() - date.fromisoformat(last_mrs)).days >= 28:
+                            tests_needed.append('mrs_short')
+                    if profile in ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd', 'triple'):
+                        last_pcl = user.get('pcl_last_date')
+                        if not last_pcl or (date.today() - date.fromisoformat(last_pcl)).days >= 28:
+                            tests_needed.append('pcl_short')
+                    # ═══ ПОПРАВКА #168: ADAM ежемесячный тест ═══
+                    if profile in ('andropause', 'cg_andro', 'andro_ptsd'):
+                        last_adam = user.get('adam_last_date')
+                        if not last_adam or (date.today() - date.fromisoformat(last_adam)).days >= 28:
+                            tests_needed.append('adam_short')
+
+                    if tests_needed:
+                        test_names = {
+                            'zbi_short': 'мониторинг нагрузки ухаживающего',
+                            'mrs_short': 'мониторинг менопаузы',
+                            'pcl_short': 'мониторинг стресса',
+                            'adam_short': 'мониторинг самочувствия',
+                        }
+                        test_list = "\n".join(f"  • {test_names[t]}" for t in tests_needed)
+                        await bot.send_message(
+                            chat_id=tid,
+                            text=f"📋 *{name}, пора на ежемесячную проверку!*\n\n"
+                                 f"Доступны:\n{test_list}\n\n"
+                                 f"Это займёт 2 минуты и поможет отслеживать динамику.",
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="📋 Пройти сейчас", callback_data="monthly_tests_start")],
+                                [InlineKeyboardButton(text="⏭ Позже", callback_data="back_to_menu")]
+                            ])
+                        )
+                except:
+                    pass
+            
             # ПОПРАВКА #139: Удаляем старые напоминания если не ответили
             for old_key in ("evening_reminder_msg_id", "bedtime_reminder_msg_id"):
                 old_msg = user.get(old_key)
@@ -12991,6 +14700,56 @@ async def send_morning_reminders():
             
             # ПОПРАВКА #139: Сохраняем ID для удаления если не ответят
             await save_user(tid, {"morning_reminder_msg_id": msg.message_id})
+
+            # ═══ ПОПРАВКА #169: Утренний план из разгрузки ═══
+            try:
+                if user.get('morning_plan_enabled', 1):
+                    # ═══ ПОПРАВКА #170: адаптивный план только для Уровня 2+ ═══
+                    access_plan = await check_feature_access(tid, 'morning_plan_adaptive')
+                    if access_plan.get('allowed'):
+                        plan = await generate_morning_task_plan(tid)
+                    else:
+                        # FREE: базовый список (без адаптации)
+                        plan = await generate_morning_task_plan(tid)  # fallback тот же
+                    if plan:
+                        await bot.send_message(
+                            chat_id=tid,
+                            text=plan,
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="👍 Принято", callback_data="plan_accepted")],
+                                [InlineKeyboardButton(text="😮‍💨 Много, сократи", callback_data="plan_reduce")],
+                            ])
+                        )
+            except Exception as e:
+                logger.error(f"Morning plan error {tid}: {e}")
+
+            # ═══ ПОПРАВКА #166: Напоминание о покупках (воскресенье) ═══
+            try:
+                shopping_day = user.get('nutrition_shopping_day', 'sunday')
+                weekday_map = {
+                    'monday': 0, 'tuesday': 1, 'wednesday': 2,
+                    'thursday': 3, 'friday': 4, 'saturday': 5, 'sunday': 6
+                }
+                if date.today().weekday() == weekday_map.get(shopping_day, 6):
+                    if user.get('nutrition_tips_enabled', 1):
+                        plan_s = await get_vitamin_plan(tid)
+                        if plan_s:
+                            bgs_s = plan_s.get('bgs_protocol', 'C')
+                            shopping_s = SHOPPING_LISTS.get(bgs_s, SHOPPING_LISTS['C'])
+                            await bot.send_message(
+                                chat_id=tid,
+                                text=f"🛒 *{name}, день покупок!*\n\n"
+                                     f"Твой список под стадию {bgs_s} готов.\n"
+                                     f"Примерный бюджет: {shopping_s['estimated_cost']}",
+                                parse_mode="Markdown",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text="🛒 Открыть список", callback_data="nutrition_shopping")],
+                                    [InlineKeyboardButton(text="⏭ Не сегодня", callback_data="back_to_menu")],
+                                ])
+                            )
+            except:
+                pass
 
             print(f"✅ Утреннее напоминание: {user['telegram_id']}")
         except Exception as e:
@@ -25991,12 +27750,12 @@ def format_cognitive_comparison(baseline: dict, current: dict) -> str:
     return text
 
 
-def get_menu_keyboard(onboarding_phase: int = 0, current_mode: str = "home"):
+def get_menu_keyboard(onboarding_phase: int = 0, current_mode: str = "home", profile_type: str = "base"):
     """
     ПОПРАВКА #113: Иерархическое меню
     ПОПРАВКА #120: Добавлен сводный отчёт
     ОЧЕРЕДЬ 2: Добавлена кнопка режима
-    ПОПРАВКА: Меню по фазам онбординга — не показываем лишнее
+    ПОПРАВКА #164: Добавлена кнопка Grounding для ПТСР-профилей
     """
     mode_label = MODE_LABELS.get(current_mode, "🏠 Дома")
     
@@ -26048,6 +27807,21 @@ def get_menu_keyboard(onboarding_phase: int = 0, current_mode: str = "home"):
             [InlineKeyboardButton(text="🔬 Продвинутое", callback_data="menu_advanced")],
             [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
         ]
+        # ПОПРАВКА #164: Кнопка Grounding для ПТСР-профилей
+        if profile_type in ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd', 'triple'):
+            buttons.insert(1, [InlineKeyboardButton(text="🌿 Заземление", callback_data="grounding_now")])
+
+        # ═══ ПОПРАВКА #166: Кнопка Питание ═══
+        buttons.insert(-1, [InlineKeyboardButton(text="🥩 Питание", callback_data="nutrition_menu")])
+
+        # ═══ ПОПРАВКА #169: Кнопки Разгрузки ═══
+        buttons.insert(-1, [
+            InlineKeyboardButton(text="📋 Дела", callback_data="unload_start_tasks"),
+            InlineKeyboardButton(text="💭 Эмоции", callback_data="unload_start_emotions"),
+        ])
+
+        # ═══ ПОПРАВКА #170: Кнопка Подписки ═══
+        buttons.insert(-1, [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription_menu")])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -27895,8 +29669,50 @@ def determine_evening_scenario(data: dict) -> dict:
     return {"scenario": "blue", "color": "🔵"}
 
 
-def get_smart_recommendation(scenario: str, name: str, data: dict) -> str:
+def get_smart_recommendation(scenario: str, name: str, data: dict, user: dict = None) -> str:
     """Умная рекомендация с учётом всех факторов сна"""
+    result = _get_smart_recommendation_base(scenario, name, data)
+    
+    # ═══ ПОПРАВКА #164: Профильные добавки ═══
+    profile = user.get("profile_type", "base") if user else "base"
+    
+    if profile in ('caregiver', 'cg_meno', 'cg_ptsd', 'cg_andro') and scenario in ('red', 'yellow'):
+        is_prof = user.get('caregiver_is_professional', 0) if user else 0
+        if is_prof:
+            result += (
+                "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"💚 *{name}, ты заботишься о других профессионально —*\n"
+                f"но выгорание от этого не менее реальное.\n"
+                f"Сегодня вечер для СЕБЯ."
+            )
+        else:
+            result += (
+                "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"💚 *{name}, напоминаю:* ты заботишься о других — "
+                f"но сегодня позаботься о СЕБЕ.\n"
+                f"Даже 10 минут тишины — это уже забота."
+            )
+    elif profile in ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd', 'triple') and scenario == 'red':
+        result += (
+            "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🌿 *{name}, дыхание 4-7-8:*\n"
+            f"Вдох 4 сек → задержка 7 сек → выдох 8 сек\n"
+            f"3-4 цикла. Ты в безопасности."
+        )
+    elif profile in ('menopause', 'cg_meno', 'meno_ptsd'):
+        fog = data.get("brain_fog", "none")
+        if fog in ("strong", "moderate", "yes"):
+            result += (
+                "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🌸 Туман сегодня — это нормально при менопаузе.\n"
+                f"Это физиология, не ты «поглупела». Завтра может быть лучше."
+            )
+    
+    return result
+
+
+def _get_smart_recommendation_base(scenario: str, name: str, data: dict) -> str:
+    """Базовая рекомендация (оригинальная логика)"""
     stress = data.get("stress", 5)
     energy = data.get("energy", 5)
     mood = data.get("mood", 5)
@@ -28828,7 +30644,8 @@ async def show_main_menu(bot, telegram_id: int, chat_id: int, edit_message=None)
     user = await get_user(telegram_id)
     phase = user.get("onboarding_phase", 0) if user else 0
     mode = user.get("current_mode", "home") if user else "home"
-    keyboard = get_menu_keyboard(onboarding_phase=phase or 0, current_mode=mode)
+    profile = user.get("profile_type", "base") if user else "base"
+    keyboard = get_menu_keyboard(onboarding_phase=phase or 0, current_mode=mode, profile_type=profile)
     
     # Если есть сообщение для edit — пробуем edit_text (не создаёт дубль)
     if edit_message:
@@ -28858,6 +30675,27 @@ async def show_main_menu(bot, telegram_id: int, chat_id: int, edit_message=None)
 async def back_to_menu(callback: CallbackQuery):
     """Вернуться в меню"""
     await callback.answer()
+    
+    # ПОПРАВКА #164 G: Миграция — предложить скрининг существующим
+    user = await get_user(callback.from_user.id)
+    if (user and user.get('onboarding_completed') 
+            and not user.get('profile_screening_done')
+            and not user.get('_profile_offered')):
+        name = user.get("name", "друг")
+        # Помечаем что предложили (через _profile_offered — temp, скрининг/скип установит done)
+        await callback.message.edit_text(
+            f"💚 *{name}, у Авроры новая возможность!*\n\n"
+            f"8 вопросов — и я смогу лучше подстроиться\n"
+            f"под твою ситуацию.\n\n"
+            f"Это займёт 2 минуты 🕐",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="▶️ Пройти", callback_data="profile_screen_start")],
+                [InlineKeyboardButton(text="⏭ Не сейчас", callback_data="profile_screen_skip")]
+            ])
+        )
+        return
+    
     await show_main_menu(callback.bot, callback.from_user.id, callback.message.chat.id, edit_message=callback.message)
 
 
@@ -34203,14 +36041,11 @@ async def sos_grounding_next(callback: CallbackQuery, state: FSMContext):
     
     if step > 5:
         await state.clear()
-        text = """✅ *Молодец!*
-
-Ты здесь. Ты в безопасности.
-_Перегрузка — временная._
-
-━━━━━━━━━━━━━━━━━━━━━
-
-Как сейчас голова?"""
+        # ═══ ПОПРАВКА #168: Финальный текст по полу ═══
+        user_g = await get_user(callback.from_user.id)
+        gender_g = user_g.get('gender', 'female') if user_g else 'female'
+        grounding_end = get_gendered_text('grounding_final', gender_g)
+        text = f"✅ *Молодец!*\n\n{grounding_end}\n_Перегрузка — временная._\n\n━━━━━━━━━━━━━━━━━━━━━\n\nКак сейчас голова?"
         
         await callback.message.edit_text(
             text,
@@ -36186,8 +38021,8 @@ async def recalculate_vitamins_with_heredity(telegram_id: int) -> dict:
     mod_descriptions = {
         'heredity_cvd': {'risk': '❤️ Сердце и сосуды', 'added': 'Omega-3 (2-3г), Магний (800мг), Витамин E (300мг)'},
         'heredity_diabetes': {'risk': '🩸 Диабет', 'added': 'B12 (1500мкг), Магний (1000мг)'},
-        'heredity_cancer': {'risk': '🎗 Онкология', 'added': 'Витамин D (5000 МЕ), NAC (1000мг), Витамин C (2000мг)'},
-        'heredity_mental': {'risk': '🧠 Психика', 'added': 'Omega-3 (2-3г), B12 (1500мкг), Магний (900мг), Витамин D (4000 МЕ)'},
+        'heredity_cancer': {'risk': '🎗 Онкология', 'added': 'Витамин D (2000 МЕ), NAC (1000мг), Витамин C (2000мг)'},
+        'heredity_mental': {'risk': '🧠 Психика', 'added': 'Omega-3 (2-3г), B12 (1500мкг), Магний (900мг), Витамин D (2000 МЕ)'},
         'heredity_dementia': {'risk': '🧠 Деменция', 'added': 'Omega-3 (2-3г), B12 (1500мкг), NAC (800мг), Витамин E (300мг)'},
     }
     
@@ -38726,6 +40561,29 @@ async def _complete_morning_checkin(callback, state: FSMContext):
     vitamin_reminder = await get_vitamin_reminder_for_checkin(tid, 'morning')
     if vitamin_reminder:
         morning_tips.append((5, "vitamin_morning"))
+
+    # ═══ ПОПРАВКА #166: Совет по завтраку (раз в 3 дня) ═══
+    if user and user.get('nutrition_tips_enabled', 1):
+        try:
+            plan_b = await get_vitamin_plan(tid)
+            bgs_b = plan_b.get('bgs_protocol', 'C') if plan_b else 'C'
+            foods_b = CORTISOL_FOODS.get(bgs_b, CORTISOL_FOODS['C'])
+            tip_b = foods_b['breakfast']['tip']
+            last_tip_b = user.get('last_food_tip_date')
+            show_tip_b = (
+                not last_tip_b or
+                (date.today() - date.fromisoformat(last_tip_b)).days >= 3
+            )
+            if show_tip_b:
+                import random as _rnd
+                rec_b = _rnd.choice(foods_b['breakfast']['must'])
+                await callback.message.answer(
+                    f"🍳 *Завтрак:* {rec_b}\n\n💡 _{tip_b}_",
+                    parse_mode="Markdown"
+                )
+                await save_user(tid, {'last_food_tip_date': date.today().isoformat()})
+        except:
+            pass
     
     # CBT-I при долгом засыпании (приоритет 6)
     if latency in ("long", "verylong"):
@@ -38741,7 +40599,17 @@ async def _complete_morning_checkin(callback, state: FSMContext):
     # ПОПРАВКА #50: Не предлагать контрастный душ при болезни
     suggestion = await check_cold_habit_suggestion(tid)
     if suggestion.get("suggest") and not (user and user.get('is_sick', 0) == 1):
-        if suggestion["type"] == "cold_wash":
+        # ═══ ПОПРАВКА #167: Фильтрация холодных процедур по профилю ═══
+        safety_cold = check_bath_safety_for_profile(user) if user else {}
+        avoided_cold = safety_cold.get('avoid_procedures', [])
+
+        if suggestion["type"] == "contrast_shower" and "contrast_shower" in avoided_cold:
+            suggestion["type"] = "warm_wash"
+            morning_tips.append((7, "warm_wash"))
+        elif suggestion["type"] == "cold_wash" and "cold_wash" in avoided_cold:
+            suggestion["type"] = "warm_wash"
+            morning_tips.append((7, "warm_wash"))
+        elif suggestion["type"] == "cold_wash":
             morning_tips.append((7, "cold_wash"))
         elif suggestion["type"] == "contrast_shower":
             morning_tips.append((8, "contrast_shower"))
@@ -38955,6 +40823,18 @@ async def _complete_morning_checkin(callback, state: FSMContext):
         await post_morning_checkin_drift_check(tid, user)
     except Exception as e:
         logger.error(f"Drift check error: {e}")
+
+    # ═══ ПОПРАВКА #164: Проверка направления к специалисту ═══
+    try:
+        referrals = await check_specialist_referral(tid)
+        if referrals:
+            last_referral = user.get('last_referral_date') if user else None
+            if not last_referral or (date.today() - date.fromisoformat(last_referral)).days >= 7:
+                for ref_text in referrals[:1]:
+                    await callback.message.answer(ref_text, parse_mode="Markdown")
+                await save_user(tid, {'last_referral_date': date.today().isoformat()})
+    except:
+        pass
 
     await state.clear()
 
@@ -40015,15 +41895,63 @@ async def evening_relaxation_final(callback: CallbackQuery, state: FSMContext):
     name = user.get("name", "друг") if user else "друг"
     
     # Формируем УМНУЮ рекомендацию с учётом факторов
-    recommendation = get_smart_recommendation(scenario_data["scenario"], name, data)
+    recommendation = get_smart_recommendation(scenario_data["scenario"], name, data, user)
     
     # НОВОЕ: Добавляем напоминание о витаминах
     vitamin_reminder = await get_vitamin_reminder_for_checkin(callback.from_user.id, 'evening')
     if vitamin_reminder:
         recommendation += "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n" + vitamin_reminder
-    
+
     await callback.message.answer(recommendation, reply_markup=get_scenario_keyboard())
+
+    # ═══ ПОПРАВКА #166: Реакция на тягу → умная замена ═══
+    try:
+        craving_raw = data.get('craving') or data.get('sugar_craving')
+        if craving_raw and craving_raw != 'none':
+            craving_map = {
+                'sugar': 'sugar', 'sweet': 'sugar',
+                'salt': 'salt', 'salty': 'salt',
+                'caffeine': 'caffeine', 'coffee': 'caffeine',
+                'carbs': 'carbs', 'bread': 'carbs',
+            }
+            swap_type = craving_map.get(str(craving_raw).lower(), 'sugar')
+            swap = FOOD_SWAPS.get(swap_type)
+            if swap:
+                import random as _rnd_e
+                s = _rnd_e.choice(swap['swaps'])
+                await callback.message.answer(
+                    f"🔄 *{swap['craving_text']}*\n\n"
+                    f"Вместо: {s['instead']}\n"
+                    f"Попробуй: {s['try']}\n\n"
+                    f"_({s['why']})_",
+                    parse_mode="Markdown"
+                )
+    except:
+        pass
     
+    # ═══ ПОПРАВКА #167а: Проверка ванны в вечернем чекине ═══
+    try:
+        bath_course = await get_active_bath_course(callback.from_user.id)
+        if bath_course and bath_course.get('status') == 'active':
+            last_bath = await get_last_bath_date(callback.from_user.id)
+            freq = bath_course.get('frequency', 'every_other_day')
+            if is_bath_day(last_bath, freq):
+                await callback.message.answer(
+                    "🛁 Сегодня по плану — ванна. Удалось?",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(
+                            text="✅ Да, сделала",
+                            callback_data="bath_done_today"
+                        )],
+                        [InlineKeyboardButton(
+                            text="❌ Не сегодня",
+                            callback_data="bath_skipped"
+                        )],
+                    ])
+                )
+    except:
+        pass
+
     # ═══ ПОПРАВКА ЧАТ44 #13: Очередь вечерних доп. сообщений с лимитом 2 ═══
     MAX_EVENING_EXTRA = 2
     evening_queue = []  # (priority, async_factory_label)
@@ -40194,6 +42122,71 @@ async def evening_relaxation_final(callback: CallbackQuery, state: FSMContext):
     
     # Чекин завершён
     await save_user(callback.from_user.id, {"evening_checkin_status": "completed"})
+    
+    # ═══ ПОПРАВКА #164: Проверка направления к специалисту ═══
+    try:
+        referrals = await check_specialist_referral(callback.from_user.id)
+        if referrals:
+            last_referral = user.get('last_referral_date') if user else None
+            if not last_referral or (date.today() - date.fromisoformat(last_referral)).days >= 7:
+                for ref_text in referrals[:1]:
+                    await callback.message.answer(ref_text, parse_mode="Markdown")
+                await save_user(callback.from_user.id, {'last_referral_date': date.today().isoformat()})
+    except:
+        pass
+
+    # ═══ ПОПРАВКА #169: Обзор задач планировщика + предложение разгрузки ═══
+    try:
+        planner_tasks_today = await get_active_planner_tasks(callback.from_user.id)
+        urgent_today = [t for t in planner_tasks_today if t['category'] == 'urgent']
+        if urgent_today:
+            text_tasks = "📋 *Задачи из вчерашней разгрузки:*\n\n"
+            task_buttons = []
+            for t in urgent_today[:5]:
+                text_tasks += f"→ {t['text']}\n"
+                task_buttons.append([
+                    InlineKeyboardButton(
+                        text=f"✅ {t['text'][:30]}",
+                        callback_data=f"planner_task_done_{t['id']}"
+                    )
+                ])
+            task_buttons.append([
+                InlineKeyboardButton(text="⏭ Пропустить", callback_data="planner_tasks_skip_review")
+            ])
+            await callback.message.answer(
+                text_tasks, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=task_buttons)
+            )
+    except Exception as e:
+        logger.error(f"Planner tasks review error: {e}")
+
+    # Предложение разгрузки
+    try:
+        onboarding_phase_ev = user.get('onboarding_phase', 0) if user else 0
+        if onboarding_phase_ev >= 1:
+            stress_ev = data.get('stress', 5)
+            if stress_ev >= 7:
+                unload_text = "🌙 *Время разгрузить голову.*\nЧто нужно прямо сейчас?"
+            else:
+                unload_text = "🌙 *Подготовимся к новому дню?*"
+            await callback.message.answer(
+                unload_text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="📋 Разложить дела по полочкам",
+                        callback_data="unload_start_tasks"
+                    )],
+                    [InlineKeyboardButton(
+                        text="💭 Освободить голову от эмоций",
+                        callback_data="unload_start_emotions"
+                    )],
+                    [InlineKeyboardButton(text="😌 Всё ок, спать", callback_data="unload_skip")],
+                ])
+            )
+    except Exception as e:
+        logger.error(f"Unload offer error: {e}")
+
     await state.clear()
 
 
@@ -40462,6 +42455,28 @@ _Ванна восстановит адаптационные резервы (З
             [InlineKeyboardButton(text="📅 Напомни завтра", callback_data="bath_remind_tomorrow")]
         ])
     
+    # ═══ ПОПРАВКА #167: Адаптация ванн по симптомам ═══
+    safety = check_bath_safety_for_profile(user) if user else {}
+
+    if safety:
+        # Корректируем температуру в тексте
+        max_temp = safety.get('max_temp', 39)
+        if max_temp <= 37:
+            bath_msg = bath_msg.replace("37-38°C", f"{max_temp}°C")
+            bath_msg = bath_msg.replace("37°C, 15 мин", f"{max_temp}°C, 15 мин")
+
+        # Бонус-рекомендация белых ванн при сухости
+        if safety.get('white_bath_bonus'):
+            bath_msg += (
+                "\n\n🤍 *Белые ванны особенно рекомендуются —*\n"
+                "улучшают микроциркуляцию малого таза,\n"
+                "что помогает при вагинальной сухости."
+            )
+
+        # Примечания по безопасности
+        for note in safety.get('notes', []):
+            bath_msg += f"\n\n_{note}_"
+
     return bath_msg, bath_kb
 
 
@@ -48519,6 +50534,13 @@ class EpigeneticsStates(StatesGroup):
     confirming_data = State()
 
 
+# ═══ ПОПРАВКА #169: Планировщик (разгрузка + утренний план) ═══
+class PlannerStates(StatesGroup):
+    waiting_unload_text = State()    # Ввод потока мыслей
+    waiting_unload_more = State()    # "Ещё что-то?"
+    waiting_plan_feedback = State()  # Реакция на утренний план
+
+
 async def recognize_hrv_from_screenshot(file_bytes: bytes) -> dict:
     """
     ПОПРАВКА #126: Распознаёт данные HRV со скриншота через Claude Vision API.
@@ -53577,6 +55599,288 @@ async def free_period_intro_handler(callback: CallbackQuery):
     await callback.answer()
     user = await get_user(callback.from_user.id)
     await show_free_period_intro(callback, user)
+
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #164: ЕЖЕМЕСЯЧНЫЕ ТЕСТЫ ПО ПРОФИЛЯМ
+# ═══════════════════════════════════════════════════════════════
+
+ZBI_SHORT_QUESTIONS = [
+    {'id': 1, 'text': "Чувствуешь ли ты, что у тебя *недостаточно времени для себя*?"},
+    {'id': 2, 'text': "Чувствуешь ли *напряжение между уходом и другими обязанностями*?"},
+    {'id': 3, 'text': "Влияет ли уход на *твоё здоровье*?"},
+    {'id': 4, 'text': "Чувствуешь ли ты, что *не справляешься*?"},
+]
+
+ZBI_OPTIONS = [
+    ("0 — Никогда", 0),
+    ("1 — Редко", 1),
+    ("2 — Иногда", 2),
+    ("3 — Часто", 3),
+    ("4 — Почти всегда", 4),
+]
+
+
+async def save_monthly_test(telegram_id: int, test_type: str, scores: dict, total: int):
+    """Сохранение результата ежемесячного теста"""
+    previous = None
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT total_score FROM profile_monthly_tests "
+            "WHERE telegram_id = ? AND test_type = ? ORDER BY date DESC LIMIT 1",
+            (telegram_id, test_type)
+        )
+        row = await cursor.fetchone()
+        if row:
+            previous = row[0]
+
+    if previous is not None:
+        diff = total - previous
+        trend = 'improving' if diff <= -2 else ('worsening' if diff >= 4 else 'stable')
+    else:
+        trend = 'stable'
+
+    red_flag = 0
+    if test_type == 'pcl_short' and total > 12:
+        red_flag = 1
+    elif test_type == 'zbi_short' and total > 12:
+        red_flag = 1
+    elif test_type == 'mrs_short' and total > 15:
+        red_flag = 1
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO profile_monthly_tests "
+            "(telegram_id, test_type, date, q1, q2, q3, q4, q5, total_score, previous_score, trend, red_flag) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (telegram_id, test_type, date.today().isoformat(),
+             scores.get('q1'), scores.get('q2'), scores.get('q3'),
+             scores.get('q4'), scores.get('q5'),
+             total, previous, trend, red_flag)
+        )
+        await db.commit()
+
+    field_map = {
+        'pcl_short': ('pcl_last_date', 'ptsd_screen_score'),
+        'zbi_short': ('zbi_last_date', 'zbi_short_score'),
+        'mrs_short': ('mrs_last_date', 'mrs_short_score'),
+    }
+    if test_type in field_map:
+        date_f, score_f = field_map[test_type]
+        await save_user(telegram_id, {date_f: date.today().isoformat(), score_f: total})
+
+    # ═══ ПОПРАВКА #167: Обновляем симптомы MRS при ежемесячном тесте ═══
+    if test_type == 'mrs_short':
+        await save_user(telegram_id, {
+            'mrs_hot_flashes': scores.get('q1', 0),
+            'mrs_sleep_issues': scores.get('q2', 0),
+            'mrs_anxiety': scores.get('q3', 0),
+            'mrs_exhaustion': scores.get('q4', 0),
+            'mrs_dryness': scores.get('q5', 0),
+        })
+
+    return {'trend': trend, 'red_flag': red_flag, 'previous': previous, 'total': total}
+
+
+@router.callback_query(F.data == "monthly_tests_start")
+async def monthly_tests_start_handler(callback: CallbackQuery, state: FSMContext):
+    """Начало ежемесячных тестов"""
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    profile = user.get('profile_type', 'base') if user else 'base'
+    
+    tests_queue = []
+    if profile in ('caregiver', 'cg_meno', 'cg_ptsd', 'cg_andro', 'triple'):
+        last_zbi = user.get('zbi_last_date') if user else None
+        if not last_zbi or (date.today() - date.fromisoformat(last_zbi)).days >= 28:
+            tests_queue.append('zbi_short')
+    if profile in ('menopause', 'cg_meno', 'meno_ptsd', 'triple'):
+        last_mrs = user.get('mrs_last_date') if user else None
+        if not last_mrs or (date.today() - date.fromisoformat(last_mrs)).days >= 28:
+            tests_queue.append('mrs_short')
+    if profile in ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd', 'triple'):
+        last_pcl = user.get('pcl_last_date') if user else None
+        if not last_pcl or (date.today() - date.fromisoformat(last_pcl)).days >= 28:
+            tests_queue.append('pcl_short')
+    
+    if not tests_queue:
+        await callback.message.edit_text(
+            "✅ Все тесты актуальны! Следующая проверка через месяц 💚",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+            ])
+        )
+        return
+    
+    await state.update_data(monthly_tests_queue=tests_queue, monthly_test_idx=0)
+    await run_next_monthly_test(callback.message, state, callback.from_user.id)
+
+
+async def run_next_monthly_test(message, state: FSMContext, telegram_id: int):
+    """Запуск следующего теста из очереди"""
+    data = await state.get_data()
+    queue = data.get('monthly_tests_queue', [])
+    idx = data.get('monthly_test_idx', 0)
+    
+    if idx >= len(queue):
+        # Все тесты пройдены
+        user = await get_user(telegram_id)
+        name = user.get("name", "друг") if user else "друг"
+        await message.edit_text(
+            f"✅ *{name}, все тесты пройдены!*\n\n"
+            f"Результаты сохранены. Динамику покажу в отчёте 💚",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
+            ])
+        )
+        return
+    
+    test_type = queue[idx]
+    await state.update_data(current_monthly_test=test_type, monthly_q_num=1)
+    
+    if test_type == 'zbi_short':
+        await monthly_zbi_question(message, state, 1)
+    elif test_type == 'mrs_short':
+        await profile_mrs_question(message, state, 1)
+    elif test_type == 'pcl_short':
+        await profile_pcl_question(message, state, 1)
+
+
+async def monthly_zbi_question(message, state: FSMContext, q_num: int):
+    """Показать вопрос ZBI-short"""
+    if q_num > 4:
+        data = await state.get_data()
+        total = sum(data.get(f"zbi_q{i}", 0) for i in range(1, 5))
+        scores = {f"q{i}": data.get(f"zbi_q{i}", 0) for i in range(1, 5)}
+        
+        tid = message.chat.id if hasattr(message, 'chat') else 0
+        result = await save_monthly_test(tid, 'zbi_short', scores, total)
+        
+        user = await get_user(tid)
+        name = user.get("name", "друг") if user else "друг"
+        
+        trend_emoji = {"improving": "📈", "stable": "➡️", "worsening": "📉"}.get(result['trend'], "➡️")
+        
+        if total <= 8:
+            interp = "Нагрузка в норме. Продолжай заботиться и о себе 💚"
+        elif total <= 12:
+            interp = "Нагрузка повышена. Аврора усилит напоминания о самозаботе."
+        else:
+            interp = "Нагрузка высокая. Подумай о психологе для СЕБЯ. Это не слабость."
+        
+        prev_text = f"\nПредыдущий: {result['previous']}" if result['previous'] is not None else ""
+        
+        await message.edit_text(
+            f"📊 *ZBI — нагрузка ухаживающего*\n\n"
+            f"Балл: {total}/16 {trend_emoji}{prev_text}\n\n"
+            f"{interp}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="▶️ Дальше", callback_data="monthly_test_next")]
+            ])
+        )
+        return
+
+    q = ZBI_SHORT_QUESTIONS[q_num - 1]
+    keyboard = [[InlineKeyboardButton(text=t, callback_data=f"mtest_zbi_{q_num}_{s}")] for t, s in ZBI_OPTIONS]
+
+    await message.edit_text(
+        f"📋 *Нагрузка ухаживающего — вопрос {q_num}/4:*\n\n{q['text']}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+
+
+@router.callback_query(F.data.startswith("mtest_zbi_"))
+async def monthly_zbi_answer(callback: CallbackQuery, state: FSMContext):
+    """Ответ на ZBI-short вопрос"""
+    await callback.answer()
+    parts = callback.data.split("_")
+    q_num = int(parts[2])
+    score = int(parts[3])
+    await state.update_data(**{f"zbi_q{q_num}": score})
+    await monthly_zbi_question(callback.message, state, q_num + 1)
+
+
+@router.callback_query(F.data == "monthly_test_next")
+async def monthly_test_next_handler(callback: CallbackQuery, state: FSMContext):
+    """Переход к следующему тесту в очереди"""
+    await callback.answer()
+    data = await state.get_data()
+    idx = data.get('monthly_test_idx', 0) + 1
+    await state.update_data(monthly_test_idx=idx)
+    await run_next_monthly_test(callback.message, state, callback.from_user.id)
+
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #164: НАПРАВЛЕНИЕ К СПЕЦИАЛИСТУ
+# ═══════════════════════════════════════════════════════════════
+
+async def check_specialist_referral(telegram_id: int) -> list:
+    """Проверяет нужно ли направить к специалисту"""
+    user = await get_user(telegram_id)
+    if not user:
+        return []
+
+    name = user.get("name", "друг")
+    referrals = []
+
+    pcl = user.get('ptsd_screen_score', 0)
+    if pcl and pcl > 12:
+        referrals.append(
+            f"🕊 {name}, я замечаю высокий уровень стресса.\n"
+            f"Психотерапевт (особенно травмафокусированный) может помочь.\n"
+            f"Это не слабость — это инструмент."
+        )
+
+    zbi = user.get('zbi_short_score', 0)
+    if zbi and zbi > 12:
+        referrals.append(
+            f"💚 {name}, нагрузка высокая.\n"
+            f"Психолог для ТЕБЯ — не роскошь, а необходимость.\n"
+            f"Ты не можешь заботиться о других из пустого стакана."
+        )
+
+    mrs = user.get('mrs_short_score', 0)
+    if mrs and mrs > 15:
+        referrals.append(
+            f"🌸 {name}, симптомы менопаузы выраженные.\n"
+            f"Гинеколог/эндокринолог поможет подобрать поддержку."
+        )
+
+    if user.get('dissociation_risk'):
+        referrals.append(
+            f"🕊 {name}, ощущение «я не здесь» — важный сигнал.\n"
+            f"Психиатр поможет разобраться. Это не страшно."
+        )
+
+    # ═══ ПОПРАВКА #167: Направление при вагинальной сухости ═══
+    mrs_dryness = user.get('mrs_dryness', 0)
+    if mrs_dryness >= 3:
+        referrals.append(
+            f"🌸 {name}, выраженная вагинальная сухость — это лечится.\n"
+            f"Гинеколог поможет подобрать локальную терапию.\n"
+            f"Локальный эстриол значительно улучшает качество жизни."
+        )
+
+    # ═══ ПОПРАВКА #168: Андропауза → эндокринолог ═══
+    adam = user.get('adam_short_score', 0)
+    if adam > 10:
+        referrals.append(
+            f"💪 {name}, рекомендую проверить тестостерон у эндокринолога.\n"
+            f"Анализы: тестостерон общий + свободный, ГСПГ, ЛГ.\n"
+            f"{'⚠️ Перед любой терапией — обязательно ПСА!' if adam > 14 else ''}"
+        )
+
+    # ═══ ПОПРАВКА #168: Алкоголь + ПТСР ═══
+    if user.get('alcohol_risk_flag'):
+        referrals.append(
+            get_gendered_text('referral_psychologist', user.get('gender', 'male'))
+            + "\n⚠️ Алкоголь + стресс — опасная комбинация."
+        )
+
+    return referrals
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -63545,9 +65849,17 @@ async def morning_checkin_start(callback: CallbackQuery, state: FSMContext):
     await state.update_data(checkin_type="morning", checkin_day=checkin_day)
     await state.set_state(CheckinStates.waiting_wake_time)
     
-    text = f"""☀️ *Доброе утро, {name}!*
-
-Это Аврора 💚
+    # ═══ ПОПРАВКА #164: Адаптация утреннего приветствия под профиль ═══
+    profile = user.get("profile_type", "base") if user else "base"
+    
+    if profile in ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd', 'triple'):
+        greeting = f"☀️ *Доброе утро, {name}.* Ты в безопасности 💚"
+    elif profile in ('caregiver', 'cg_meno'):
+        greeting = f"☀️ *Доброе утро, {name}!*\nКак ТЫ сегодня? 💚"
+    else:
+        greeting = f"☀️ *Доброе утро, {name}!*\n\nЭто Аврора 💚"
+    
+    text = f"""{greeting}
 День {checkin_day} из 3.
 
 Во сколько ты проснулась сегодня?"""
@@ -63660,7 +65972,31 @@ async def evening_checkin_start(callback: CallbackQuery, state: FSMContext):
     await state.update_data(checkin_type="evening", checkin_day=checkin_day)
     await state.set_state(CheckinStates.waiting_work_day)
     
-    text = f"""🌙 *Добрый вечер, {name}!*
+    # ═══ ПОПРАВКА #164: Адаптация вечернего приветствия под профиль ═══
+    profile = user.get("profile_type", "base") if user else "base"
+    
+    if profile in ('caregiver', 'cg_meno', 'cg_ptsd', 'cg_andro'):
+        is_prof = user.get('caregiver_is_professional', 0) if user else 0
+        if is_prof:
+            text = f"""🌙 *Добрый вечер, {name}!*
+
+Это Аврора 💚
+
+Как прошла смена? И — было ли сегодня что-то для тебя лично?"""
+        else:
+            text = f"""🌙 *Добрый вечер, {name}!*
+
+Это Аврора 💚
+
+Как прошёл день? И — было ли сегодня что-то для тебя лично?"""
+    elif profile in ('ptsd', 'meno_ptsd', 'andro_ptsd', 'triple'):
+        text = f"""🌙 *Добрый вечер, {name}.*
+
+Аврора 💚
+
+Как прошёл день?"""
+    else:
+        text = f"""🌙 *Добрый вечер, {name}!*
 
 Это Аврора 💚
 
@@ -72036,34 +74372,119 @@ async def get_bgs_protocol(telegram_id: int) -> dict:
     return None
 
 
-def generate_vitamin_schema(bgs_protocol: str, heredity_modifiers: list, 
-                           ptsd_score: int, motherhood_score: int) -> dict:
-    """Генерирует персональную схему витаминов"""
-    
+def generate_vitamin_schema(bgs_protocol: str, heredity_modifiers: list,
+                           ptsd_score: int, motherhood_score: int,
+                           profile_type: str = 'base',
+                           ptsd_screen_score: int = 0,
+                           dissociation_risk: int = 0) -> dict:
+    """Генерирует персональную схему витаминов.
+    ПОПРАВКА #165: Добавлена адаптация под профиль.
+    """
+
     protocol = bgs_protocol.upper() if bgs_protocol else 'C'
     if protocol not in VITAMIN_BASE_DOSAGES:
         protocol = 'C'
-    
+
+    # ═══ ПОПРАВКА #165: Triple — особый случай ═══
+    if profile_type == 'triple':
+        return {
+            'morning': {'vitamin_d': 2000, 'l_theanine': 200},
+            'evening': {'magnesium': 400, 'glycine': 3000},
+            'active_modifiers': ['profile_triple'],
+            'ptsd_active': False,
+            'motherhood_active': False,
+            'protocol': protocol,
+            'profile_type': profile_type,
+            'safety_notes': [
+                "⚠️ Тройная нагрузка — минимальный набор добавок.",
+                "Только самое безопасное и доказанное.",
+                "Добавлять новое — ТОЛЬКО после консультации с врачом."
+            ],
+        }
+
     schema = VITAMIN_BASE_DOSAGES[protocol].copy()
     active_modifiers = []
-    
-    # Наследственность
+    safety_notes = []
+
+    # Наследственность (как раньше)
     for mod in heredity_modifiers:
         if mod in VITAMIN_MODIFIERS:
             active_modifiers.append(mod)
-    
-    # ПТСР (порог 9 баллов)
+
+    # ПТСР из витаминного опросника (как раньше)
     ptsd_active = ptsd_score >= 9
     if ptsd_active:
         active_modifiers.append('ptsd')
         if ptsd_score >= 12:
             active_modifiers.append('ptsd_high')
-    
-    # Мамочка (порог 9 баллов)
+
+    # Мамочка (как раньше)
     motherhood_active = motherhood_score >= 9
     if motherhood_active:
         active_modifiers.append('motherhood')
-    
+
+    # ═══ ПОПРАВКА #165: Профильные модификаторы ═══
+    if profile_type == 'caregiver':
+        active_modifiers.append('profile_caregiver')
+        safety_notes.append(
+            "💚 Ашваганда курсом 6 месяцев, потом перерыв 2 месяца."
+        )
+
+    elif profile_type == 'menopause':
+        active_modifiers.append('profile_menopause')
+        safety_notes.append(
+            "🌸 Фитоэстрогены: обсуди с гинекологом, если есть "
+            "миома, эндометриоз или гормонозависимые заболевания."
+        )
+
+    elif profile_type == 'ptsd':
+        active_modifiers.append('profile_ptsd')
+        if ptsd_screen_score > 12:
+            active_modifiers.append('profile_ptsd_high')
+        safety_notes.append(
+            "🕊 NAC 2400мг — начни с 600мг, увеличивай по 600мг в неделю."
+        )
+
+    elif profile_type == 'cg_meno':
+        active_modifiers.append('profile_cg_meno')
+        safety_notes.append(
+            "💚🌸 Двойная нагрузка — мелатонин обязателен для сна."
+        )
+
+    elif profile_type == 'cg_ptsd':
+        active_modifiers.append('profile_caregiver')
+        active_modifiers.append('profile_ptsd')
+        safety_notes.append(
+            "🕊 Стабилизация первые 4-12 недель, потом — полный протокол."
+        )
+
+    elif profile_type == 'meno_ptsd':
+        active_modifiers.append('profile_menopause')
+        active_modifiers.append('profile_ptsd')
+        safety_notes.append(
+            "🕊🌸 Осторожно с фитоэстрогенами — hot flashes могут "
+            "вызывать телесные воспоминания."
+        )
+
+    # ═══ ПОПРАВКА #168: Андропауза ═══
+    elif profile_type == 'andropause':
+        active_modifiers.append('profile_andropause')
+        safety_notes.append(
+            "💪 Ашваганда 600мг — курсом 3 месяца, потом перерыв."
+        )
+    elif profile_type == 'cg_andro':
+        active_modifiers.append('profile_caregiver')
+        active_modifiers.append('profile_andropause')
+        safety_notes.append(
+            "💪 Цинк утром с едой. Ашваганда — курс 3 месяца."
+        )
+    elif profile_type == 'andro_ptsd':
+        active_modifiers.append('profile_andropause')
+        active_modifiers.append('profile_ptsd')
+        safety_notes.append(
+            "🕊💪 Ашваганда 300мг при ПТСР — снижаем дозу осторожно."
+        )
+
     # Применяем модификаторы (берём MAX)
     for mod_name in active_modifiers:
         mod = VITAMIN_MODIFIERS.get(mod_name, {})
@@ -72076,24 +74497,46 @@ def generate_vitamin_schema(bgs_protocol: str, heredity_modifiers: list,
                     schema[vitamin] = value
             else:
                 schema[vitamin] = value
-    
+
+    # ═══ ПОПРАВКА #165: Фильтр безопасности ашваганды для ПТСР ═══
+    if profile_type in ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd'):
+        if dissociation_risk:
+            if 'ashwagandha' in schema:
+                del schema['ashwagandha']
+            safety_notes.append(
+                "⚠️ Ашваганда убрана — риск диссоциации. "
+                "Обсуди с психиатром перед добавлением."
+            )
+        else:
+            if 'ashwagandha' in schema:
+                schema['ashwagandha'] = 125
+                safety_notes.append(
+                    "⚠️ Ашваганда снижена до 125мг — "
+                    "наблюдай за состоянием. При дискомфорте — убрать."
+                )
+
     # Разделяем на утро/вечер
     morning = {}
     evening = {}
-    
+
     for vitamin, dosage in schema.items():
-        if vitamin in VITAMIN_TIMING['morning_empty'] + VITAMIN_TIMING['morning_food']:
-            morning[vitamin] = dosage
-        elif vitamin in VITAMIN_TIMING['evening_2h'] + VITAMIN_TIMING['evening_30m'] + VITAMIN_TIMING['bedtime']:
+        placed = False
+        for timing, vitamins in VITAMIN_TIMING.items():
+            if vitamin in vitamins:
+                if timing.startswith('morning'):
+                    morning[vitamin] = dosage
+                else:
+                    evening[vitamin] = dosage
+                placed = True
+                break
+        if not placed:
             evening[vitamin] = dosage
-        elif vitamin in ['omega3']:
-            morning[vitamin] = dosage
-            evening[vitamin] = dosage
-        elif vitamin in ['ashwagandha']:
-            evening[vitamin] = dosage
-        else:
-            morning[vitamin] = dosage
-    
+
+    # Omega-3 — утром И вечером (если есть)
+    if 'omega3' in schema:
+        morning['omega3'] = schema['omega3']
+        evening['omega3'] = schema['omega3']
+
     return {
         'morning': morning,
         'evening': evening,
@@ -72101,17 +74544,32 @@ def generate_vitamin_schema(bgs_protocol: str, heredity_modifiers: list,
         'ptsd_active': ptsd_active,
         'motherhood_active': motherhood_active,
         'protocol': protocol,
+        'profile_type': profile_type,
+        'safety_notes': safety_notes,
     }
 
 
 def format_vitamin_schema(schema: dict, user_name: str = None) -> str:
-    """Форматирует схему витаминов в текст"""
+    """Форматирует схему витаминов в текст. ПОПРАВКА #165: заголовок по профилю."""
     
     lines = []
     modifiers = schema.get('active_modifiers', [])
-    
-    # Заголовок
-    if 'ptsd' in modifiers and 'motherhood' in modifiers:
+    profile = schema.get('profile_type', 'base')
+
+    # ═══ ПОПРАВКА #165: Заголовок по профилю ═══
+    profile_headers = {
+        'caregiver': "💚 *ПРОТОКОЛ ДЛЯ УХАЖИВАЮЩИХ*",
+        'menopause': "🌸 *ПРОТОКОЛ МЕНОПАУЗА*",
+        'ptsd': "🕊 *БЕЗОПАСНЫЙ ПРОТОКОЛ НС*",
+        'cg_meno': "💚🌸 *ПРОТОКОЛ УХОД + МЕНОПАУЗА*",
+        'cg_ptsd': "💚🕊 *ПРОТОКОЛ СТАБИЛИЗАЦИЯ*",
+        'meno_ptsd': "🌸🕊 *ПРОТОКОЛ ДВОЙНАЯ ЧУВСТВИТЕЛЬНОСТЬ*",
+        'triple': "🕊 *МИНИМАЛЬНЫЙ БЕЗОПАСНЫЙ ПРОТОКОЛ*",
+    }
+
+    if profile in profile_headers:
+        lines.append(profile_headers[profile])
+    elif 'ptsd' in modifiers and 'motherhood' in modifiers:
         lines.append("🧬🎖️👩‍👧‍👦 *МАКСИМАЛЬНАЯ ПОДДЕРЖКА*")
     elif 'ptsd' in modifiers:
         lines.append("🎖️ *ПОДДЕРЖКА НЕРВНОЙ СИСТЕМЫ*")
@@ -72220,6 +74678,16 @@ def format_vitamin_schema(schema: dict, user_name: str = None) -> str:
     else:
         lines.append("📋 *Анализы:* через 8 недель")
     
+    # Дисклеймер витамина D
+    morning_schema = schema.get('morning', {})
+    if 'vitamin_d' in morning_schema:
+        lines.append("")
+        lines.append(
+            "☀️ *Витамин D 2000 МЕ* — безопасная базовая доза без анализа.\n"
+            "Точная доза зависит от твоего уровня 25(OH)D.\n"
+            "Анализ — один раз, ~1000₽. По результату скорректирую дозу под тебя."
+        )
+
     # Дисклеймер
     lines.append("")
     lines.append("─────────────────")
@@ -72279,7 +74747,7 @@ async def save_user_analysis(telegram_id: int, data: dict):
 
 
 async def get_vitamin_reminder_for_checkin(telegram_id: int, time_of_day: str) -> str:
-    """Напоминание о витаминах для чекина"""
+    """Напоминание о витаминах для чекина. ПОПРАВКА #165: + профильные напоминания."""
     plan = await get_vitamin_plan(telegram_id)
     if not plan or not plan.get('active'):
         return ""
@@ -72292,7 +74760,36 @@ async def get_vitamin_reminder_for_checkin(telegram_id: int, time_of_day: str) -
     if not schema['morning'] and not schema['evening']:
         return ""
     
-    return format_short_vitamin_reminder(schema, time_of_day)
+    reminder_text = format_short_vitamin_reminder(schema, time_of_day)
+
+    # ═══ ПОПРАВКА #165: Профильное напоминание ═══
+    user = await get_user(telegram_id)
+    profile = user.get('profile_type', 'base') if user else 'base'
+
+    profile_reminders = {
+        'caregiver': {
+            'evening': "💚 Глицин + магний — твоё восстановление. Ты заслуживаешь.",
+        },
+        'menopause': {
+            'morning': "🌸 Фитоэстрогены с завтраком, кальций отдельно от кофе.",
+            'evening': "🌸 Шалфей перед сном — для спокойной ночи.",
+        },
+        'ptsd': {
+            'morning': "🕊 NAC — начинай день с защиты нервной системы.",
+            'evening': "🕊 Глицин 3г — для спокойного сна без кошмаров.",
+        },
+        'triple': {
+            'evening': "🕊 Только три помощника: магний + теанин + глицин. Этого достаточно.",
+        },
+    }
+
+    reminder_extra = profile_reminders.get(profile, {}).get(time_of_day, '')
+    if reminder_extra and reminder_text:
+        reminder_text += f"\n\n{reminder_extra}"
+    elif reminder_extra:
+        reminder_text = reminder_extra
+
+    return reminder_text
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -72472,28 +74969,72 @@ async def handle_motherhood_answer(callback: CallbackQuery, state: FSMContext):
 
 
 async def generate_and_show_schema(message, state: FSMContext, telegram_id: int):
-    """Генерирует и показывает схему"""
+    """Генерирует и показывает схему. ПОПРАВКА #165: + профиль."""
     data = await state.get_data()
-    
+
+    # ═══ ПОПРАВКА #165: Получаем профиль ═══
+    user = await get_user(telegram_id)
+    profile_type = user.get('profile_type', 'base') if user else 'base'
+    ptsd_screen_score = user.get('ptsd_screen_score', 0) if user else 0
+    dissociation_risk = user.get('dissociation_risk', 0) if user else 0
+
     schema = generate_vitamin_schema(
         bgs_protocol=data.get('bgs_protocol', 'C'),
         heredity_modifiers=data.get('heredity_modifiers', []),
         ptsd_score=data.get('ptsd_score', 0),
         motherhood_score=data.get('motherhood_score', 0),
+        profile_type=profile_type,
+        ptsd_screen_score=ptsd_screen_score,
+        dissociation_risk=dissociation_risk,
     )
-    
+
+    # ═══ ПОПРАВКА #165: Показываем результаты профиля ═══
+    profile_messages = {
+        'caregiver': "💚 *Протокол адаптирован для ухаживающих:*\n"
+                     "добавлены родиола (энергия) и глицин (сон).",
+        'menopause': "🌸 *Протокол адаптирован под менопаузу:*\n"
+                     "добавлены фитоэстрогены, шалфей, кальций.",
+        'ptsd': "🕊 *Протокол адаптирован — максимальная безопасность:*\n"
+                "NAC для нейрозащиты, глицин для сна, ашваганда осторожно.",
+        'cg_meno': "💚🌸 *Двойной протокол — уход + менопауза:*\n"
+                   "магний повышен, мелатонин обязателен.",
+        'cg_ptsd': "💚🕊 *Протокол: стабилизация + поддержка:*\n"
+                   "сначала стабилизация НС, потом полный набор.",
+        'meno_ptsd': "🌸🕊 *Протокол: двойная чувствительность:*\n"
+                     "менопауза + НС, максимальная осторожность.",
+        'triple': "🕊 *Минимальный протокол:*\n"
+                  "только магний + L-теанин + глицин.\n"
+                  "Никаких экспериментов на истощённом организме.",
+    }
+
+    if profile_type in profile_messages:
+        await message.answer(profile_messages[profile_type], parse_mode="Markdown")
+
     # Показываем результаты модификаторов
     if schema.get('ptsd_active'):
         await message.answer(VITAMIN_TEXTS['ptsd_result_active'], parse_mode="Markdown")
-    
+
     if schema.get('motherhood_active'):
         await message.answer(VITAMIN_TEXTS['motherhood_result_active'], parse_mode="Markdown")
-    
+
+    # ═══ ПОПРАВКА #165: Safety notes ═══
+    safety_notes = schema.get('safety_notes', [])
+    if safety_notes:
+        notes_text = "\n".join(safety_notes)
+        await message.answer(
+            f"📋 *Важные примечания:*\n\n{notes_text}",
+            parse_mode="Markdown"
+        )
+
     # Сохраняем план
     modifiers = schema.get('active_modifiers', [])
-    reminder_weeks = 6 if any(m.startswith('heredity_') for m in modifiers) or 'ptsd' in modifiers or 'motherhood' in modifiers else 8
+    has_heavy_profile = profile_type in ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd', 'triple')
+    reminder_weeks = 4 if has_heavy_profile else (
+        6 if any(m.startswith('heredity_') for m in modifiers)
+             or 'ptsd' in modifiers or 'motherhood' in modifiers else 8
+    )
     next_reminder = (datetime.now() + timedelta(weeks=reminder_weeks)).isoformat()
-    
+
     plan_data = {
         'bgs_protocol': data.get('bgs_protocol', 'C'),
         'ptsd_score': data.get('ptsd_score', 0),
@@ -72504,12 +75045,14 @@ async def generate_and_show_schema(message, state: FSMContext, telegram_id: int)
         'morning_vitamins': schema.get('morning', {}),
         'evening_vitamins': schema.get('evening', {}),
         'next_analysis_reminder': next_reminder,
+        'profile_type': profile_type,      # ПОПРАВКА #165
+        'safety_notes': safety_notes,       # ПОПРАВКА #165
     }
-    
+
     await save_vitamin_plan(telegram_id, plan_data)
-    
+
     schema_text = format_vitamin_schema(schema)
-    
+
     await message.answer(
         schema_text,
         parse_mode="Markdown",
@@ -72519,7 +75062,7 @@ async def generate_and_show_schema(message, state: FSMContext, telegram_id: int)
             [InlineKeyboardButton(text="📋 В меню", callback_data="vitamin_plan_menu")],
         ])
     )
-    
+
     await state.clear()
 
 
@@ -72539,7 +75082,26 @@ async def show_vitamin_schema(callback: CallbackQuery):
             ])
         )
         return
-    
+
+    # ═══ ПОПРАВКА #165: Проверка актуальности плана ═══
+    user = await get_user(callback.from_user.id)
+    if user and user.get('vitamin_plan_needs_rebuild'):
+        await callback.message.edit_text(
+            "🔄 *Твой профиль обновился!*\n\n"
+            "Витаминный план нужно пересобрать\n"
+            "с учётом новых данных.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Пересобрать", callback_data="rebuild_vitamin_schema")],
+                [InlineKeyboardButton(text="👀 Показать старый", callback_data="show_old_vitamin_schema")],
+            ])
+        )
+        await save_user(callback.from_user.id, {'vitamin_plan_needs_rebuild': 0})
+        return
+
+    # ═══ ПОПРАВКА #165: Получаем профиль ═══
+    profile = user.get('profile_type', 'base') if user else 'base'
+
     schema = {
         'morning': json.loads(plan.get('morning_vitamins', '{}')),
         'evening': json.loads(plan.get('evening_vitamins', '{}')),
@@ -72547,6 +75109,7 @@ async def show_vitamin_schema(callback: CallbackQuery):
         'ptsd_active': plan.get('ptsd_active', 0) == 1,
         'motherhood_active': plan.get('motherhood_active', 0) == 1,
         'protocol': plan.get('bgs_protocol', 'C'),
+        'profile_type': profile,   # ПОПРАВКА #165
     }
     
     if schema['ptsd_active']:
@@ -72572,7 +75135,40 @@ async def rebuild_vitamin_schema(callback: CallbackQuery, state: FSMContext):
     await build_vitamin_schema(callback, state)
 
 
-@router.callback_query(F.data == "vitamin_rules")
+@router.callback_query(F.data == "show_old_vitamin_schema")
+async def show_old_vitamin_schema(callback: CallbackQuery):
+    """Показать старый план без проверки rebuild. ПОПРАВКА #165."""
+    await callback.answer()
+    plan = await get_vitamin_plan(callback.from_user.id)
+    if not plan:
+        await callback.message.edit_text("❌ Схема не найдена.")
+        return
+    user = await get_user(callback.from_user.id)
+    profile = user.get('profile_type', 'base') if user else 'base'
+    schema = {
+        'morning': json.loads(plan.get('morning_vitamins', '{}')),
+        'evening': json.loads(plan.get('evening_vitamins', '{}')),
+        'active_modifiers': json.loads(plan.get('heredity_modifiers', '[]')),
+        'ptsd_active': plan.get('ptsd_active', 0) == 1,
+        'motherhood_active': plan.get('motherhood_active', 0) == 1,
+        'protocol': plan.get('bgs_protocol', 'C'),
+        'profile_type': profile,
+    }
+    if schema['ptsd_active']:
+        schema['active_modifiers'].append('ptsd')
+    if schema['motherhood_active']:
+        schema['active_modifiers'].append('motherhood')
+    await callback.message.edit_text(
+        format_vitamin_schema(schema),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Пересоставить", callback_data="rebuild_vitamin_schema")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="vitamin_plan_menu")],
+        ])
+    )
+
+
+
 async def show_vitamin_rules(callback: CallbackQuery):
     """Правила приёма"""
     await callback.answer()
@@ -72600,6 +75196,323 @@ _Перед сном:_ Мелатонин
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Назад", callback_data="vitamin_plan_menu")],
+        ])
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #166: АНТИКОРТИЗОЛОВОЕ ПИТАНИЕ — ХЭНДЛЕРЫ
+# ═══════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "nutrition_menu")
+async def nutrition_menu(callback: CallbackQuery):
+    """Главное меню модуля питания. ПОПРАВКА #166."""
+    await callback.answer()
+
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    profile = user.get("profile_type", "base") if user else "base"
+
+    plan = await get_vitamin_plan(callback.from_user.id)
+    bgs = plan.get('bgs_protocol', 'C') if plan else 'C'
+
+    stage_names = {'A': 'восстановление', 'B': 'поддержка', 'C': 'профилактика'}
+    stage_emoji = {'A': '🔴', 'B': '🟡', 'C': '🟢'}
+
+    text = (
+        f"🥩 *АНТИКОРТИЗОЛОВОЕ ПИТАНИЕ*\n\n"
+        f"Стадия: {stage_emoji.get(bgs, '🟢')} {stage_names.get(bgs, 'профилактика').upper()}\n"
+        f"Профиль: {profile}\n\n"
+        f"{name}, выбирай что нужно:"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton(text="🍳 Что на завтрак?", callback_data="nutrition_breakfast")],
+        [InlineKeyboardButton(text="✅ Что есть / ❌ Чего избегать", callback_data="nutrition_foods")],
+        [InlineKeyboardButton(text="🔄 Умные замены (тяга)", callback_data="nutrition_swaps")],
+        [InlineKeyboardButton(text="🛒 Список покупок на неделю", callback_data="nutrition_shopping")],
+    ]
+
+    if profile in PROFILE_FOOD_MODS:
+        keyboard.append([
+            InlineKeyboardButton(text="🌿 Мои продукты (профиль)", callback_data="nutrition_profile_foods")
+        ])
+
+    keyboard.append([InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")])
+
+    await callback.message.edit_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+
+
+@router.callback_query(F.data == "nutrition_breakfast")
+async def nutrition_breakfast(callback: CallbackQuery):
+    """Рекомендации по завтраку под стадию. ПОПРАВКА #166."""
+    await callback.answer()
+
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    profile = user.get("profile_type", "base") if user else "base"
+
+    plan = await get_vitamin_plan(callback.from_user.id)
+    bgs = plan.get('bgs_protocol', 'C') if plan else 'C'
+
+    foods = CORTISOL_FOODS.get(bgs, CORTISOL_FOODS['C'])
+    breakfast = foods['breakfast']
+
+    text = f"🍳 *ЗАВТРАК — стадия {bgs}*\n\n"
+    text += f"💡 _{breakfast['tip']}_\n\n"
+    text += "*Обязательно:*\n" + "\n".join(breakfast['must']) + "\n\n"
+    text += "*Хорошо добавить:*\n" + "\n".join(breakfast['good']) + "\n\n"
+    text += "*Избегать:*\n" + "\n".join(breakfast['avoid'])
+
+    if profile in PROFILE_FOOD_MODS:
+        mod = PROFILE_FOOD_MODS[profile]
+        if mod.get('note'):
+            text += f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n{mod['note']}"
+
+    await callback.message.edit_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Список покупок", callback_data="nutrition_shopping")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="nutrition_menu")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "nutrition_foods")
+async def nutrition_foods(callback: CallbackQuery):
+    """Полный список: есть / избегать. ПОПРАВКА #166."""
+    await callback.answer()
+
+    user = await get_user(callback.from_user.id)
+    profile = user.get("profile_type", "base") if user else "base"
+
+    plan = await get_vitamin_plan(callback.from_user.id)
+    bgs = plan.get('bgs_protocol', 'C') if plan else 'C'
+
+    foods = CORTISOL_FOODS.get(bgs, CORTISOL_FOODS['C'])
+
+    text = f"✅ *ЧТО ЕСТЬ (стадия {bgs}):*\n\n"
+    text += "\n".join(foods['general_must'])
+    text += f"\n\n❌ *ЧЕГО ИЗБЕГАТЬ:*\n\n"
+    text += "\n".join(foods['general_avoid'])
+    text += f"\n\n⏰ *Режим:* {foods['meal_timing']}"
+
+    if profile in PROFILE_FOOD_MODS:
+        mod = PROFILE_FOOD_MODS[profile]
+        if mod.get('add'):
+            text += f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n*Дополнительно для тебя:*\n"
+            text += "\n".join(mod['add'])
+        if mod.get('avoid_extra'):
+            text += "\n\n" + "\n".join(mod['avoid_extra'])
+
+    await callback.message.edit_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Умные замены", callback_data="nutrition_swaps")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="nutrition_menu")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "nutrition_swaps")
+async def nutrition_swaps_menu(callback: CallbackQuery):
+    """Меню умных замен. ПОПРАВКА #166."""
+    await callback.answer()
+
+    await callback.message.edit_text(
+        "🔄 *УМНЫЕ ЗАМЕНЫ*\n\nНа что тянет прямо сейчас?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🍫 Сладкое", callback_data="swap_sugar")],
+            [InlineKeyboardButton(text="🧂 Солёное", callback_data="swap_salt")],
+            [InlineKeyboardButton(text="☕ Ещё кофе", callback_data="swap_caffeine")],
+            [InlineKeyboardButton(text="🍞 Хлеб / макароны", callback_data="swap_carbs")],
+            [InlineKeyboardButton(text="😌 Ни на что, просто смотрю", callback_data="nutrition_menu")],
+        ])
+    )
+
+
+@router.callback_query(F.data.startswith("swap_"))
+async def nutrition_swap_show(callback: CallbackQuery):
+    """Показать замены для тяги. ПОПРАВКА #166."""
+    await callback.answer()
+
+    craving_type = callback.data.replace("swap_", "")
+    swap = FOOD_SWAPS.get(craving_type)
+    if not swap:
+        await callback.message.edit_text(
+            "Не нашла замены.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="nutrition_swaps")]
+            ])
+        )
+        return
+
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+
+    text = f"🔄 *{swap['craving_text']}*\n\n_{swap['why']}_\n\n"
+    for s in swap['swaps']:
+        text += f"*Вместо:* {s['instead']}\n"
+        text += f"*Попробуй:* {s['try']}\n"
+        text += f"_({s['why']})_\n\n"
+
+    text += f"💚 {name}, это не запрет — это выбор.\nДаже если съешь «не то» — ничего страшного."
+
+    await callback.message.edit_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Другая тяга", callback_data="nutrition_swaps")],
+            [InlineKeyboardButton(text="🛒 Список покупок", callback_data="nutrition_shopping")],
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="nutrition_menu")],
+        ])
+    )
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO food_log (telegram_id, date, craving_type, craving_managed) "
+                "VALUES (?, ?, ?, 'swap')",
+                (callback.from_user.id, date.today().isoformat(), craving_type)
+            )
+            await db.commit()
+    except:
+        pass
+
+
+@router.callback_query(F.data == "nutrition_shopping")
+async def nutrition_shopping(callback: CallbackQuery):
+    """Список покупок на неделю. ПОПРАВКА #166."""
+    await callback.answer()
+
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    profile = user.get("profile_type", "base") if user else "base"
+
+    plan = await get_vitamin_plan(callback.from_user.id)
+    bgs = plan.get('bgs_protocol', 'C') if plan else 'C'
+
+    shopping = SHOPPING_LISTS.get(bgs, SHOPPING_LISTS['C'])
+
+    text = f"🛒 *СПИСОК ПОКУПОК НА НЕДЕЛЮ*\n"
+    text += f"Стадия {bgs} | ~{shopping['estimated_cost']}\n\n"
+
+    sections = [
+        ('🥩 Белок', 'protein'), ('🫒 Жиры', 'fats'),
+        ('🥬 Овощи', 'vegetables'), ('🫐 Фрукты/ягоды', 'fruits_berries'),
+        ('🛒 Другое', 'other'),
+    ]
+
+    for title, key in sections:
+        text += f"*{title}:*\n"
+        text += "\n".join(f"  □ {item}" for item in shopping[key]) + "\n\n"
+
+    profile_shopping = {
+        'menopause': ("🌸 Менопауза — добавить:", [
+            "Тофу / соевое молоко", "Льняное семя молотое",
+            "Кунжут", "Шалфей (чай)"
+        ]),
+        'ptsd': ("🕊 НС-поддержка — добавить:", [
+            "Индейка (триптофан)", "Шпинат (магний)", "Бананы (7+ шт)"
+        ]),
+        'caregiver': ("💚 Для ухаживающих — добавить:", [
+            "Имбирь свежий", "Арахисовая паста",
+            "Бананы (10 шт, для быстрых перекусов)"
+        ]),
+    }
+
+    if profile in profile_shopping:
+        title, items = profile_shopping[profile]
+        text += f"*{title}*\n"
+        text += "\n".join(f"  □ {item}" for item in items)
+
+    # ═══ ПОПРАВКА #168: Андропауза ═══
+    if profile in SHOPPING_LISTS_MALE_EXTRAS:
+        extras = SHOPPING_LISTS_MALE_EXTRAS[profile]
+        text += "\n\n*💪 Андропауза — добавить:*\n"
+        text += "\n".join(f"  □ {item}" for item in extras)
+
+    await callback.message.edit_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Скопировать список", callback_data="nutrition_shopping_copy")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="nutrition_menu")],
+        ])
+    )
+
+    await save_user(callback.from_user.id, {
+        'last_food_tip_date': date.today().isoformat()
+    })
+
+
+@router.callback_query(F.data == "nutrition_shopping_copy")
+async def nutrition_shopping_copy(callback: CallbackQuery):
+    """Отправить список текстом для копирования. ПОПРАВКА #166."""
+    await callback.answer("Список отправлен ✅")
+
+    plan = await get_vitamin_plan(callback.from_user.id)
+    bgs = plan.get('bgs_protocol', 'C') if plan else 'C'
+    shopping = SHOPPING_LISTS.get(bgs, SHOPPING_LISTS['C'])
+
+    lines = ["СПИСОК ПОКУПОК НА НЕДЕЛЮ", ""]
+    sections = [
+        ('БЕЛОК', 'protein'), ('ЖИРЫ', 'fats'),
+        ('ОВОЩИ', 'vegetables'), ('ФРУКТЫ/ЯГОДЫ', 'fruits_berries'),
+        ('ДРУГОЕ', 'other'),
+    ]
+    for title, key in sections:
+        lines.append(f"{title}:")
+        lines.extend(f"□ {item}" for item in shopping[key])
+        lines.append("")
+
+    await callback.message.answer("\n".join(lines))
+
+
+@router.callback_query(F.data == "nutrition_profile_foods")
+async def nutrition_profile_foods(callback: CallbackQuery):
+    """Продукты специфичные для профиля. ПОПРАВКА #166."""
+    await callback.answer()
+
+    user = await get_user(callback.from_user.id)
+    profile = user.get("profile_type", "base") if user else "base"
+
+    mod = PROFILE_FOOD_MODS.get(profile)
+    if not mod:
+        await callback.message.edit_text(
+            "У тебя базовый профиль — специальных дополнений нет.\n"
+            "Следуй общим рекомендациям по стадии 💚",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="nutrition_menu")]
+            ])
+        )
+        return
+
+    profile_titles = {
+        'caregiver': '💚 ПРОДУКТЫ ДЛЯ УХАЖИВАЮЩИХ',
+        'menopause': '🌸 ПРОДУКТЫ ПРИ МЕНОПАУЗЕ',
+        'ptsd': '🕊 ПРОДУКТЫ ДЛЯ НЕРВНОЙ СИСТЕМЫ',
+        'cg_meno': '💚🌸 УХОД + МЕНОПАУЗА',
+        'cg_ptsd': '💚🕊 УХОД + НС',
+        'meno_ptsd': '🌸🕊 МЕНОПАУЗА + НС',
+        'triple': '🕊 МИНИМАЛЬНЫЙ НАБОР',
+    }
+
+    text = f"*{profile_titles.get(profile, 'ДОПОЛНИТЕЛЬНЫЕ ПРОДУКТЫ')}*\n\n"
+    text += "*Добавить в рацион:*\n" + "\n".join(mod.get('add', [])) + "\n"
+
+    if mod.get('avoid_extra'):
+        text += "\n*Ограничить:*\n" + "\n".join(mod['avoid_extra']) + "\n"
+    if mod.get('note'):
+        text += f"\n━━━━━━━━━━━━━━━━━━━━━━\n\n{mod['note']}"
+
+    await callback.message.edit_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Список покупок", callback_data="nutrition_shopping")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="nutrition_menu")],
         ])
     )
 
@@ -84193,6 +87106,2821 @@ async def hrv_deferred_dismiss(callback: CallbackQuery):
     await callback.answer()
     try:
         await callback.message.edit_text("Ок, ничего страшного! Завтра измерим 💚")
+    except:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ПОПРАВКА #164: ПРОФИЛЬНАЯ СИСТЕМА — СКРИНИНГ + АДАПТАЦИЯ + GROUNDING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Константы ────────────────────────────────────────────────
+
+MRS_SHORT_QUESTIONS = [
+    {'id': 1, 'text': "🌡 *Приливы, потливость* за последний месяц:", 'symptom': 'hot_flashes'},
+    {'id': 2, 'text': "😴 *Нарушения сна* за последний месяц:", 'symptom': 'sleep'},
+    {'id': 3, 'text': "😰 *Тревожность, раздражительность* за последний месяц:", 'symptom': 'anxiety'},
+    {'id': 4, 'text': "🔋 *Физическое/умственное истощение* за последний месяц:", 'symptom': 'exhaustion'},
+    {'id': 5, 'text': "🩺 *Вагинальная сухость, дискомфорт* за последний месяц:", 'symptom': 'dryness'},
+]
+
+MRS_OPTIONS = [
+    ("0 — Нет", 0), ("1 — Лёгкие", 1), ("2 — Средние", 2),
+    ("3 — Тяжёлые", 3), ("4 — Невыносимые", 4),
+]
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #168: ADAM-short + мужские адаптации
+# ═══════════════════════════════════════════════════════════════
+
+ADAM_SHORT_QUESTIONS = [
+    {'id': 1, 'text': "⚡ *Снижение энергии / выносливости* за последние месяцы:",
+     'symptom': 'energy'},
+    {'id': 2, 'text': "❤️‍🔥 *Снижение сексуального влечения:*",
+     'symptom': 'libido'},
+    {'id': 3, 'text': "🧠 *Труднее сосредоточиться, забывчивость:*",
+     'symptom': 'focus'},
+    {'id': 4, 'text': "⚖️ *Набор веса, особенно в области живота:*",
+     'symptom': 'weight'},
+    {'id': 5, 'text': "😴 *Ухудшение сна / пробуждения среди ночи:*",
+     'symptom': 'sleep'},
+]
+
+ADAM_OPTIONS = [
+    ("0 — Нет", 0), ("1 — Немного", 1), ("2 — Заметно", 2),
+    ("3 — Значительно", 3), ("4 — Сильно", 4),
+]
+
+PCL_SHORT_QUESTIONS_MALE = [
+    {'id': 1, 'text': "За последний месяц, как часто тебя беспокоили\n"
+                      "*воспоминания, которые возвращаются сами — хочешь ты этого или нет?*"},
+    {'id': 2, 'text': "Как часто ты *избегал мыслей, ситуаций или людей*,\n"
+                      "напоминающих о тяжёлом опыте?"},
+    {'id': 3, 'text': "Как часто ты был *постоянно начеку*,\n"
+                      "трудно расслабиться даже в безопасной обстановке?"},
+    {'id': 4, 'text': "Как часто ты чувствовал, что *«выключил эмоции»*,\n"
+                      "трудно что-то чувствовать?"},
+]
+
+PTSD_ALCOHOL_QUESTION = {
+    'text': "Бывает ли, что *выпиваешь чтобы расслабиться или забыться*?",
+    'options': [
+        ("Нет", 0), ("Иногда", 1),
+        ("Регулярно (2-3 раза/нед)", 2), ("Часто", 3),
+    ],
+}
+
+PCL_SHORT_QUESTIONS = [
+    {'id': 1, 'text': "За последний месяц, как часто тебя беспокоили\n*повторяющиеся неприятные воспоминания?*"},
+    {'id': 2, 'text': "Как часто ты *избегала мыслей или ситуаций*,\nнапоминающих о тяжёлом опыте?"},
+    {'id': 3, 'text': "Как часто ты была *«на взводе»*, вздрагивала,\nне могла расслабиться?"},
+    {'id': 4, 'text': "Как часто ты чувствовала *отстранённость от окружающих*,\nэмоциональное онемение?"},
+]
+
+PCL_OPTIONS = [
+    ("0 — Совсем нет", 0), ("1 — Немного", 1), ("2 — Умеренно", 2),
+    ("3 — Сильно", 3), ("4 — Крайне сильно", 4),
+]
+
+ZBI_SHORT_QUESTIONS = [
+    {'id': 1, 'text': "Чувствуешь ли ты, что у тебя *недостаточно времени для себя*?"},
+    {'id': 2, 'text': "Чувствуешь ли *напряжение между уходом и другими обязанностями*?"},
+    {'id': 3, 'text': "Влияет ли уход на *твоё здоровье*?"},
+    {'id': 4, 'text': "Чувствуешь ли ты, что *не справляешься*?"},
+]
+
+ZBI_OPTIONS = [
+    ("0 — Никогда", 0), ("1 — Редко", 1), ("2 — Иногда", 2),
+    ("3 — Часто", 3), ("4 — Почти всегда", 4),
+]
+
+# Заблокированные практики для ПТСР
+BLOCKED_FOR_PTSD = [
+    'brain_dump', 'free_writing', 'journaling_emotions',
+    'body_scan', 'progressive_relaxation',
+    'visualization_calm',
+]
+
+REPLACE_FOR_PTSD = {
+    'meditation': 'grounding_5_4_3_2_1',
+    'mindfulness': 'grounding_5_4_3_2_1',
+    'deep_breathing_free': 'breathing_4_7_8',
+}
+
+
+# ─── Утилиты профиля ─────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #168: Тексты адаптированные по полу
+# ═══════════════════════════════════════════════════════════════
+
+GENDERED_TEXTS = {
+    'grounding_final': {
+        'female': "Ты здесь. Ты в безопасности.",
+        'male': "Ты здесь. Ты контролируешь ситуацию.",
+    },
+    'caregiver_reminder_red': {
+        'female': "💚 *{name}, напоминаю:* ты заботишься о других — "
+                  "но сегодня позаботься о СЕБЕ.\n"
+                  "Даже 10 минут тишины — это уже забота.",
+        'male': "💪 *{name}, ты тащишь на себе многое.*\n"
+                "10 минут восстановления — это не слабость, а стратегия.",
+    },
+    'caregiver_profile_msg': {
+        'female': "💚 *{name}, ты заботишься о других.*\n\n"
+                  "Аврора будет напоминать: ты тоже важна.\n"
+                  "Рекомендации адаптированы под твою нагрузку.",
+        'male': "💪 *{name}, ты заботишься о других.*\n\n"
+                "Аврора будет напоминать: ресурс не бесконечный.\n"
+                "Рекомендации адаптированы под твою нагрузку.",
+    },
+    'ptsd_breathing': {
+        'female': "🕊 Дыши со мной. 4-7-8. Ты в безопасности.",
+        'male': "🕊 Дыши. 4-7-8. Ты здесь. Ты управляешь.",
+    },
+    'evening_caregiver': {
+        'female': "Было ли сегодня что-то для тебя лично?",
+        'male': "Что сегодня было для тебя? Не для работы, не для семьи — для себя.",
+    },
+    'referral_psychologist': {
+        'female': "Рекомендую поговорить с психотерапевтом 💚",
+        'male': "Рекомендую обратиться к специалисту по стрессу.",
+    },
+    'morning_energy_low': {
+        'female': "Мягкое утро. Не торопись.",
+        'male': "Тяжёлое утро. Один шаг за раз.",
+    },
+    'bath_ptsd_note': {
+        'female': "🕊 Если чувствуешь дискомфорт — выходи. Это нормально.",
+        'male': "🕊 Ты контролируешь процедуру. Можешь прекратить в любой момент.",
+    },
+}
+
+
+def get_gendered_text(key: str, gender: str = 'female', **kwargs) -> str:
+    """ПОПРАВКА #168: Возвращает текст адаптированный по полу."""
+    text_dict = GENDERED_TEXTS.get(key, {})
+    text = text_dict.get(gender, text_dict.get('female', ''))
+    if kwargs:
+        try:
+            text = text.format(**kwargs)
+        except:
+            pass
+    return text
+
+
+def determine_profile_type(data: dict) -> str:
+    """Определить профиль по результатам скрининга. ПОПРАВКА #168: + мужские профили."""
+    flags = []
+
+    if data.get('caregiver_active') or data.get('profile_caregiver') in ('long', 'recent', 'prof', 'past'):
+        flags.append('caregiver')
+
+    # Гормональный — по полу
+    if data.get('menopause_status') in ('peri', 'post', 'surgical'):
+        flags.append('menopause')
+    elif data.get('andropause_probable'):
+        flags.append('andropause')
+
+    if data.get('ptsd_probable'):
+        flags.append('ptsd')
+
+    if len(flags) == 0:
+        return 'base'
+    elif len(flags) == 1:
+        return flags[0]
+    elif set(flags) == {'caregiver', 'menopause'}:
+        return 'cg_meno'
+    elif set(flags) == {'caregiver', 'andropause'}:
+        return 'cg_andro'
+    elif set(flags) == {'caregiver', 'ptsd'}:
+        return 'cg_ptsd'
+    elif set(flags) == {'menopause', 'ptsd'}:
+        return 'meno_ptsd'
+    elif set(flags) == {'andropause', 'ptsd'}:
+        return 'andro_ptsd'
+    elif len(flags) == 3:
+        return 'triple'
+    return 'base'
+
+
+def filter_recommendations_for_ptsd(recommendations: list, profile: str) -> list:
+    """Фильтрует опасные рекомендации для ПТСР-профиля"""
+    if profile not in ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd', 'triple'):
+        return recommendations
+    filtered = []
+    for rec in recommendations:
+        rec_id = rec.get('id', '') if isinstance(rec, dict) else str(rec)
+        if rec_id in BLOCKED_FOR_PTSD:
+            continue
+        if rec_id in REPLACE_FOR_PTSD:
+            if isinstance(rec, dict):
+                rec['id'] = REPLACE_FOR_PTSD[rec_id]
+                rec['name'] = 'Заземление 5-4-3-2-1' if 'grounding' in REPLACE_FOR_PTSD[rec_id] else 'Дыхание 4-7-8'
+            filtered.append(rec)
+        else:
+            filtered.append(rec)
+    return filtered
+
+
+# ─── B2: Точка входа в скрининг ──────────────────────────────
+
+@router.callback_query(F.data == "profile_screen_start")
+async def profile_screen_caregiver(callback: CallbackQuery, state: FSMContext):
+    """Q1: Ухаживаешь ли за кем-то?"""
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+
+    await callback.message.edit_text(
+        f"👥 *{name}, ты ухаживаешь за кем-то?*\n"
+        f"(как родственник или как сиделка/помощник)",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👩‍⚕️ Да, за родственником (год+)", callback_data="pscr_cg_long")],
+            [InlineKeyboardButton(text="💼 Да, я сиделка / помощник", callback_data="pscr_cg_prof")],
+            [InlineKeyboardButton(text="📅 Да, недавно начала", callback_data="pscr_cg_recent")],
+            [InlineKeyboardButton(text="🕊️ Было раньше, сейчас нет", callback_data="pscr_cg_past")],
+            [InlineKeyboardButton(text="✅ Нет", callback_data="pscr_cg_no")]
+        ])
+    )
+    await state.set_state(OnboardingStates.waiting_profile_caregiver)
+
+
+# ─── B3: Caregiver ────────────────────────────────────────────
+
+@router.callback_query(OnboardingStates.waiting_profile_caregiver, F.data.startswith("pscr_cg_"))
+async def profile_caregiver_answer(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    answer = callback.data.replace("pscr_cg_", "")
+    await state.update_data(profile_caregiver=answer)
+
+    if answer in ("long", "recent", "prof"):
+        await state.update_data(caregiver_active=1)
+        if answer == "prof":
+            await state.update_data(caregiver_is_professional=1)
+        await callback.message.edit_text(
+            "⏳ *Примерно сколько лет ты этим занимаешься?*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="1-2 года", callback_data="pscr_cgd_1-2y")],
+                [InlineKeyboardButton(text="3-5 лет", callback_data="pscr_cgd_3-5y")],
+                [InlineKeyboardButton(text="5+ лет", callback_data="pscr_cgd_5plus")]
+            ])
+        )
+        await state.set_state(OnboardingStates.waiting_profile_caregiver_duration)
+    else:
+        await state.update_data(caregiver_active=0)
+        await profile_go_to_menopause(callback.message, state, callback.from_user.id)
+
+
+@router.callback_query(OnboardingStates.waiting_profile_caregiver_duration, F.data.startswith("pscr_cgd_"))
+async def profile_caregiver_duration(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    duration = callback.data.replace("pscr_cgd_", "")
+    await state.update_data(caregiver_duration=duration)
+    await profile_go_to_menopause(callback.message, state, callback.from_user.id)
+
+
+# ─── B4: Менопауза ───────────────────────────────────────────
+
+async def profile_go_to_menopause(message, state: FSMContext, telegram_id: int):
+    """Обёртка для совместимости — вызывает новую функцию. ПОПРАВКА #168."""
+    await profile_go_to_menopause_or_andropause(message, state, telegram_id)
+
+
+async def profile_go_to_menopause_or_andropause(message, state: FSMContext, telegram_id: int):
+    """ПОПРАВКА #168: Маршрутизация по полу — MRS или ADAM."""
+    user = await get_user(telegram_id)
+    gender = user.get("gender", "female") if user else "female"
+    age_group = user.get("age_group", "") if user else ""
+    exact_age = user.get("exact_age", 0) if user else 0
+    name = user.get("name", "друг") if user else "друг"
+
+    is_age_relevant = age_group in ("40-49", "50-59", "60-69", "70+") or (exact_age and int(exact_age or 0) >= 40)
+
+    if gender == "female" and is_age_relevant:
+        # Женщина 40+ → MRS
+        await message.edit_text(
+            f"🌸 *{name}, у тебя есть приливы, нарушения цикла*\n"
+            f"*или другие признаки менопаузы?*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🌡 Да, сейчас активно", callback_data="pscr_meno_peri")],
+                [InlineKeyboardButton(text="📅 Менопауза уже наступила", callback_data="pscr_meno_post")],
+                [InlineKeyboardButton(text="🏥 Хирургическая менопауза", callback_data="pscr_meno_surgical")],
+                [InlineKeyboardButton(text="✅ Нет / не актуально", callback_data="pscr_meno_none")]
+            ])
+        )
+        await state.set_state(OnboardingStates.waiting_profile_menopause)
+
+    elif gender == "male" and is_age_relevant:
+        # Мужчина 40+ → ADAM
+        await message.edit_text(
+            f"💪 *{name}, несколько вопросов о самочувствии.*\n\n"
+            f"После 40 у мужчин меняется гормональный фон —\n"
+            f"это нормально, но важно отслеживать.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👍 Понял, поехали", callback_data="pscr_adam_start")],
+                [InlineKeyboardButton(text="⏭ Пропустить", callback_data="pscr_adam_skip")],
+            ])
+        )
+        await state.set_state(OnboardingStates.waiting_profile_adam_q1)
+
+    else:
+        # Молодой или пол не указан → пропуск
+        await state.update_data(menopause_status="na", andropause_status="na")
+        await profile_go_to_ptsd(message, state, telegram_id)
+
+
+@router.callback_query(F.data == "pscr_adam_start")
+async def profile_adam_start(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #168: Старт ADAM-скрининга."""
+    await callback.answer()
+    await profile_adam_question(callback.message, state, 1)
+
+
+@router.callback_query(F.data == "pscr_adam_skip")
+async def profile_adam_skip(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #168: Пропуск ADAM-скрининга."""
+    await callback.answer()
+    await state.update_data(andropause_status="skipped", adam_short_score=0)
+    await profile_go_to_ptsd(callback.message, state, callback.from_user.id)
+
+
+async def profile_adam_question(message, state: FSMContext, q_num: int):
+    """ПОПРАВКА #168: Показать вопрос ADAM."""
+    if q_num > 5:
+        data = await state.get_data()
+        total = sum(data.get(f"adam_q{i}", 0) for i in range(1, 6))
+        andropause_probable = 1 if total > 10 else 0
+        await state.update_data(
+            adam_short_score=total,
+            andropause_probable=andropause_probable,
+            andropause_status="active" if andropause_probable else "none",
+        )
+        tid = message.chat.id if hasattr(message, 'chat') else 0
+        await profile_go_to_ptsd(message, state, tid)
+        return
+
+    q = ADAM_SHORT_QUESTIONS[q_num - 1]
+    keyboard = [
+        [InlineKeyboardButton(text=t, callback_data=f"pscr_adam_{q_num}_{s}")]
+        for t, s in ADAM_OPTIONS
+    ]
+    await message.edit_text(
+        f"📋 *Самочувствие — вопрос {q_num}/5:*\n\n{q['text']}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+    state_name = f"waiting_profile_adam_q{q_num}"
+    await state.set_state(getattr(OnboardingStates, state_name))
+
+
+@router.callback_query(F.data.startswith("pscr_adam_") & ~F.data.in_({"pscr_adam_start", "pscr_adam_skip"}))
+async def profile_adam_answer(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #168: Ответ на вопрос ADAM."""
+    await callback.answer()
+    parts = callback.data.split("_")
+    q_num = int(parts[2])
+    score = int(parts[3])
+    await state.update_data(**{f"adam_q{q_num}": score})
+    await profile_adam_question(callback.message, state, q_num + 1)
+
+
+@router.callback_query(OnboardingStates.waiting_profile_menopause, F.data.startswith("pscr_meno_"))
+async def profile_menopause_answer(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    status = callback.data.replace("pscr_meno_", "")
+    await state.update_data(menopause_status=status)
+
+    if status in ("peri", "post", "surgical"):
+        peri_val = 1 if status == "peri" else 0
+        await save_user(callback.from_user.id, {"perimenopause": peri_val})
+        await profile_mrs_question(callback.message, state, 1)
+    else:
+        await profile_go_to_ptsd(callback.message, state, callback.from_user.id)
+
+
+async def profile_mrs_question(message, state: FSMContext, q_num: int):
+    if q_num > 5:
+        data = await state.get_data()
+        total = sum(data.get(f"mrs_q{i}", 0) for i in range(1, 6))
+        await state.update_data(mrs_short_score=total)
+        tid = message.chat.id if hasattr(message, 'chat') else 0
+        await profile_go_to_ptsd(message, state, tid)
+        return
+
+    q = MRS_SHORT_QUESTIONS[q_num - 1]
+    keyboard = [[InlineKeyboardButton(text=t, callback_data=f"pscr_mrs_{q_num}_{s}")] for t, s in MRS_OPTIONS]
+    state_name = f"waiting_profile_mrs_q{q_num}"
+    await message.edit_text(
+        f"📋 *Менопауза — вопрос {q_num}/5:*\n\n{q['text']}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+    await state.set_state(getattr(OnboardingStates, state_name))
+
+
+@router.callback_query(F.data.startswith("pscr_mrs_"))
+async def profile_mrs_answer(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    parts = callback.data.split("_")
+    q_num = int(parts[2])
+    score = int(parts[3])
+    await state.update_data(**{f"mrs_q{q_num}": score})
+    await profile_mrs_question(callback.message, state, q_num + 1)
+
+
+# ─── B5: ПТСР (PCL-short) ────────────────────────────────────
+
+async def profile_go_to_ptsd(message, state: FSMContext, telegram_id: int):
+    user = await get_user(telegram_id)
+    name = user.get("name", "друг") if user else "друг"
+    # ═══ ПОПРАВКА #168: Сохраняем пол для PCL вопросов ═══
+    gender = user.get("gender", "female") if user else "female"
+    await state.update_data(pcl_questions=gender)
+
+    await message.edit_text(
+        f"🕊 *{name}, иногда тяжёлые события оставляют след.*\n\n"
+        f"Это нормально. Ответь честно — это только для тебя.\n"
+        f"Помогает подобрать безопасные практики.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Продолжить", callback_data="pscr_ptsd_start")],
+            [InlineKeyboardButton(text="⏭ Пропустить", callback_data="pscr_ptsd_skip")]
+        ])
+    )
+    await state.set_state(OnboardingStates.waiting_profile_ptsd_intro)
+
+
+@router.callback_query(OnboardingStates.waiting_profile_ptsd_intro, F.data.in_({"pscr_ptsd_start", "pscr_ptsd_skip"}))
+async def profile_ptsd_intro(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.data == "pscr_ptsd_skip":
+        await state.update_data(ptsd_screen_score=0)
+        await profile_screening_finish(callback.message, state, callback.from_user.id)
+        return
+    await profile_pcl_question(callback.message, state, 1)
+
+
+async def profile_pcl_question(message, state: FSMContext, q_num: int):
+    if q_num > 4:
+        data = await state.get_data()
+        total = sum(data.get(f"pcl_q{i}", 0) for i in range(1, 5))
+        q4_score = data.get("pcl_q4", 0)
+        await state.update_data(
+            ptsd_screen_score=total,
+            ptsd_probable=1 if total > 8 else 0,
+            dissociation_risk=1 if q4_score >= 3 else 0
+        )
+        tid = message.chat.id if hasattr(message, 'chat') else 0
+
+        # ═══ ПОПРАВКА #168: Вопрос про алкоголь для мужчин с ПТСР ═══
+        data = await state.get_data()
+        gender_pcl = data.get('pcl_questions', 'female')
+        ptsd_score = data.get('ptsd_screen_score', 0)
+        if gender_pcl == 'male' and ptsd_score >= 5:
+            await message.edit_text(
+                f"🍺 *Ещё один важный вопрос:*\n\n{PTSD_ALCOHOL_QUESTION['text']}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=t, callback_data=f"pscr_alc_{s}")]
+                    for t, s in PTSD_ALCOHOL_QUESTION['options']
+                ])
+            )
+            await state.set_state(OnboardingStates.waiting_profile_ptsd_alcohol)
+            return
+
+        await profile_screening_finish(message, state, tid)
+        return
+
+    # ═══ ПОПРАВКА #168: Вопросы по полу ═══
+    data = await state.get_data()
+    gender_pcl = data.get('pcl_questions', 'female')
+    questions = PCL_SHORT_QUESTIONS_MALE if gender_pcl == 'male' else PCL_SHORT_QUESTIONS
+    q = questions[q_num - 1]
+
+    keyboard = [[InlineKeyboardButton(text=t, callback_data=f"pscr_pcl_{q_num}_{s}")] for t, s in PCL_OPTIONS]
+    state_name = f"waiting_profile_ptsd_q{q_num}"
+    await message.edit_text(
+        f"🕊 *Вопрос {q_num}/4:*\n\n{q['text']}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+    await state.set_state(getattr(OnboardingStates, state_name))
+
+
+@router.callback_query(F.data.startswith("pscr_pcl_"))
+async def profile_pcl_answer(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    parts = callback.data.split("_")
+    q_num = int(parts[2])
+    score = int(parts[3])
+    await state.update_data(**{f"pcl_q{q_num}": score})
+    await profile_pcl_question(callback.message, state, q_num + 1)
+
+
+@router.callback_query(OnboardingStates.waiting_profile_ptsd_alcohol, F.data.startswith("pscr_alc_"))
+async def profile_alcohol_answer(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #168: Ответ на вопрос про алкоголь."""
+    await callback.answer()
+    score = int(callback.data.replace("pscr_alc_", ""))
+    alcohol_risk = 1 if score >= 2 else 0
+    await state.update_data(alcohol_risk_flag=alcohol_risk)
+    await profile_screening_finish(callback.message, state, callback.from_user.id)
+
+
+# ═══════════════════════════════════════════════════════════════
+# ПОПРАВКА #167а: Post-bath мониторинг
+# ═══════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "bath_done_today")
+async def bath_done_checkin(callback: CallbackQuery, state: FSMContext):
+    """Пользователь отметил что ванна пройдена. Запускаем мониторинг."""
+    await callback.answer()
+    tid = callback.from_user.id
+    user = await get_user(tid)
+    name = user.get('name', 'друг') if user else 'друг'
+
+    # Сохраняем тип ванны из курса
+    course = await get_active_bath_course(tid)
+    if course:
+        await state.update_data(current_bath_type=course.get('course_type', 'unknown'))
+
+    await callback.message.answer(
+        f"🛁 Отлично, {name}! Ванна пройдена.\n\n"
+        f"Проверим реакцию организма — это важно для адаптации курса.\n\n"
+        f"💉 *Давление* (верхнее/нижнее)?\n"
+        f"Напиши цифрами: 120/80\n"
+        f"Или нажми 'Пропустить'",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить давление", callback_data="bath_bp_skip")]
+        ])
+    )
+    await state.set_state(BathStates.waiting_bp)
+
+
+@router.callback_query(BathStates.waiting_bp, F.data == "bath_bp_skip")
+async def bath_bp_skipped(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.update_data(bp_systolic=None, bp_diastolic=None)
+    await _ask_bath_dermo(callback.message)
+    await state.set_state(BathStates.waiting_dermo)
+
+
+@router.message(BathStates.waiting_bp)
+async def bath_bp_received(message: Message, state: FSMContext):
+    """Получили давление. Проверяем."""
+    bp = parse_blood_pressure(message.text.strip())
+    if not bp:
+        await message.answer("Напиши давление цифрами, например: 120/80")
+        return
+
+    systolic, diastolic = bp
+    await state.update_data(bp_systolic=systolic, bp_diastolic=diastolic)
+
+    warning = ""
+    if systolic > 160 or diastolic > 100:
+        warning = (
+            "⚠️ *Давление высокое!*\n\n"
+            "Полежи 15 минут. Измерь ещё раз.\n"
+            "Если повторяется — к врачу.\n\n"
+        )
+    elif systolic < 90 or diastolic < 60:
+        warning = (
+            "⚠️ *Давление понижено.*\n\n"
+            "Полежи 15 минут. Тёплый чай.\n"
+            "Следующая ванна — ножная.\n\n"
+        )
+
+    if warning:
+        await message.answer(warning, parse_mode="Markdown")
+
+    await _ask_bath_dermo(message)
+    await state.set_state(BathStates.waiting_dermo)
+
+
+async def _ask_bath_dermo(message):
+    await message.answer(
+        "🔴 *Дермографизм* — проведи ногтём по внутренней стороне предплечья.\n"
+        "Какая полоса через 30 секунд?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬜ Белая (бледная)", callback_data="dermo_white")],
+            [InlineKeyboardButton(text="🩷 Розовая (1-2 мин)", callback_data="dermo_pink")],
+            [InlineKeyboardButton(text="🔴 Красная (>5 мин)", callback_data="dermo_red")],
+            [InlineKeyboardButton(text="⏭ Пропустить", callback_data="dermo_skip")],
+        ])
+    )
+
+
+@router.callback_query(BathStates.waiting_dermo, F.data.startswith("dermo_"))
+async def bath_dermo_received(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    dermo = callback.data.replace("dermo_", "")
+    await state.update_data(dermographism=dermo)
+
+    if dermo == 'white':
+        await callback.message.answer(
+            "🔵 Спазм капилляров. Следующая ванна: доза ↓, температура ↓ на 1°C."
+        )
+    elif dermo == 'red':
+        await callback.message.answer(
+            "🔴 Гиперреакция. Пауза 3-5 дней. Потом ножная."
+        )
+    elif dermo == 'pink':
+        await callback.message.answer("✅ Отлично — капилляры в норме!")
+
+    await callback.message.answer(
+        "😴 *Сонливость?*\n1 = бодрость 💥, 10 = засыпаю 😴",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="1-3 💥", callback_data="sleepy_low"),
+                InlineKeyboardButton(text="4-6 😌", callback_data="sleepy_mid"),
+                InlineKeyboardButton(text="7-10 😴", callback_data="sleepy_high"),
+            ],
+        ])
+    )
+    await state.set_state(BathStates.waiting_sleepiness)
+
+
+@router.callback_query(BathStates.waiting_sleepiness, F.data.startswith("sleepy_"))
+async def bath_sleepiness_received(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    level = callback.data.replace("sleepy_", "")
+    sleepiness_map = {'low': 2, 'mid': 5, 'high': 8}
+    sleepiness = sleepiness_map.get(level, 5)
+    await state.update_data(sleepiness=sleepiness)
+
+    if sleepiness >= 7:
+        await callback.message.answer(
+            "💡 Сильная сонливость — гиперпарасимпатика.\n"
+            "Следующая ванна: доза ↓50%, ножная.\n"
+            "Сейчас: ходьба 5-10 мин, яркий свет."
+        )
+
+    await callback.message.answer(
+        "🤢 *Тошнота?*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Нет", callback_data="nausea_0"),
+                InlineKeyboardButton(text="Лёгкая", callback_data="nausea_2"),
+                InlineKeyboardButton(text="Сильная", callback_data="nausea_4"),
+            ],
+        ])
+    )
+    await state.set_state(BathStates.waiting_nausea)
+
+
+@router.callback_query(BathStates.waiting_nausea, F.data.startswith("nausea_"))
+async def bath_nausea_received(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    nausea = int(callback.data.replace("nausea_", ""))
+    await state.update_data(nausea=nausea)
+
+    if nausea >= 3:
+        await callback.message.answer(
+            "⚠️ Тошнота — пауза курса. Пей воду 0.5л.\n"
+            "Если повторится — замена типа ванны или к врачу."
+        )
+
+    await callback.message.answer(
+        "⚡ *Общее состояние?* 1 = плохо, 10 = отлично",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="1-3 😟", callback_data="state_low"),
+                InlineKeyboardButton(text="4-6 😐", callback_data="state_mid"),
+                InlineKeyboardButton(text="7-10 😊", callback_data="state_high"),
+            ],
+        ])
+    )
+    await state.set_state(BathStates.waiting_general_state)
+
+
+@router.callback_query(BathStates.waiting_general_state, F.data.startswith("state_"))
+async def bath_state_received(callback: CallbackQuery, state: FSMContext):
+    """Завершение post-bath чекина. Сохраняем всё."""
+    await callback.answer()
+    level = callback.data.replace("state_", "")
+    state_map = {'low': 2, 'mid': 5, 'high': 8}
+    general_state = state_map.get(level, 5)
+
+    tid = callback.from_user.id
+    data = await state.get_data()
+
+    await save_bath_session(
+        telegram_id=tid,
+        bath_type=data.get('current_bath_type', 'unknown'),
+        bp_systolic=data.get('bp_systolic'),
+        bp_diastolic=data.get('bp_diastolic'),
+        dermographism=data.get('dermographism'),
+        sleepiness=data.get('sleepiness'),
+        nausea=data.get('nausea'),
+        general_state=general_state,
+    )
+
+    course = await get_active_bath_course(tid)
+    if course:
+        new_count = course['baths_completed'] + 1
+        await update_bath_course_count(course['id'], new_count)
+
+        remaining = course['baths_planned'] - new_count
+        if remaining > 0:
+            progress_text = f"✅ Ванна {new_count} из {course['baths_planned']}. Осталось: {remaining}."
+        else:
+            progress_text = (
+                f"🎉 Курс завершён! {new_count} ванн пройдено.\n"
+                f"Пауза ~60 дней. Во время паузы — мягкие ванны доступны."
+            )
+            await complete_bath_course(course['id'])
+            await save_user(tid, {'hydro_course_active': 0})
+    else:
+        progress_text = "✅ Ванна записана."
+
+    await callback.message.answer(f"{progress_text}\n\nДоброй ночи 💚")
+    await state.clear()
+
+
+@router.callback_query(F.data == "bath_skipped")
+async def bath_skipped_handler(callback: CallbackQuery, state: FSMContext):
+    """Пользователь пропустил ванну сегодня."""
+    await callback.answer()
+    await callback.message.answer(
+        "Хорошо. Перенесём на завтра 💚"
+    )
+
+
+# ─── B6: Финализация скрининга ────────────────────────────────
+
+async def profile_screening_finish(message, state: FSMContext, telegram_id: int):
+    data = await state.get_data()
+    user = await get_user(telegram_id)
+    name = user.get("name", "друг") if user else "друг"
+
+    profile_type = determine_profile_type(data)
+
+    save_data = {
+        'profile_type': profile_type,
+        'caregiver_active': data.get('caregiver_active', 0),
+        'caregiver_is_professional': data.get('caregiver_is_professional', 0),
+        'caregiver_duration': data.get('caregiver_duration'),
+        'menopause_status': data.get('menopause_status', 'none'),
+        'mrs_short_score': data.get('mrs_short_score'),
+        'mrs_last_date': date.today().isoformat() if data.get('mrs_short_score') is not None else None,
+        'ptsd_screen_score': data.get('ptsd_screen_score', 0),
+        'ptsd_probable': data.get('ptsd_probable', 0),
+        'dissociation_risk': data.get('dissociation_risk', 0),
+        'pcl_last_date': date.today().isoformat() if data.get('ptsd_screen_score', 0) > 0 else None,
+        'profile_screening_done': 1,
+        'profile_screening_date': date.today().isoformat(),
+        # ═══ ПОПРАВКА #167: Отдельные симптомы MRS ═══
+        'mrs_hot_flashes': data.get('mrs_q1', 0),
+        'mrs_sleep_issues': data.get('mrs_q2', 0),
+        'mrs_anxiety': data.get('mrs_q3', 0),
+        'mrs_exhaustion': data.get('mrs_q4', 0),
+        'mrs_dryness': data.get('mrs_q5', 0),
+        # ═══ ПОПРАВКА #168: ADAM данные ═══
+        'adam_short_score': data.get('adam_short_score', 0),
+        'adam_last_date': date.today().isoformat() if data.get('adam_short_score') else None,
+        'adam_energy': data.get('adam_q1', 0),
+        'adam_libido': data.get('adam_q2', 0),
+        'adam_focus': data.get('adam_q3', 0),
+        'adam_weight': data.get('adam_q4', 0),
+        'adam_sleep': data.get('adam_q5', 0),
+        'andropause_probable': data.get('andropause_probable', 0),
+        'alcohol_risk_flag': data.get('alcohol_risk_flag', 0),
+    }
+    await save_user(telegram_id, save_data)
+
+    # ═══ ПОПРАВКА #165: Пересобрать витаминный план если есть ═══
+    existing_plan = await get_vitamin_plan(telegram_id)
+    if existing_plan:
+        await save_user(telegram_id, {'vitamin_plan_needs_rebuild': 1})
+
+    # Синхронизация с существующими полями
+    if data.get('menopause_status') in ('peri', 'post', 'surgical'):
+        peri = 1 if data.get('menopause_status') == 'peri' else 0
+        await save_user(telegram_id, {'perimenopause': peri})
+    if data.get('ptsd_probable'):
+        await save_user(telegram_id, {'has_war_trauma': 1})
+    if data.get('caregiver_active'):
+        cg_map = {'long': 'long_time', 'recent': 'recent', 'prof': 'long_time', 'past': 'was_before'}
+        cg_status = cg_map.get(data.get('profile_caregiver'), 'no')
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE life_events SET caregiver_status = ? WHERE telegram_id = ?",
+                    (cg_status, telegram_id)
+                )
+                await db.commit()
+        except:
+            pass
+
+    gender_user = user.get('gender', 'female') if user else 'female'
+    profile_messages = {
+        'base': f"✅ *{name}, спасибо!*\n\nТвой профиль настроен. Аврора готова к работе 💚",
+        'caregiver': get_gendered_text('caregiver_profile_msg', gender_user, name=name),
+        'menopause': f"🌸 *{name}, менопауза — переходный период, не болезнь.*\n\nАврора будет отслеживать приливы, fog, сон.\nРекомендации адаптированы под твоё состояние.",
+        'andropause': f"💪 *{name}, гормональный фон меняется — это нормально.*\n\nАврора поможет отслеживать энергию, сон, фокус.\nРекомендации адаптированы под твоё состояние.",
+        'ptsd': f"🕊 *{name}, я буду осторожна.*\n\nНикаких резких практик. Grounding вместо brain dump.\nЕсли будет тяжело — скажи, я помогу.",
+        'cg_meno': f"💚 *{name}, двойная нагрузка — уход + менопауза.*\n\nАврора учтёт и то, и другое.\nТы делаешь невозможное. И ты тоже заслуживаешь заботу.",
+        'cg_andro': f"💪 *{name}, уход за близкими + собственный гормональный переход.*\n\nАврора учтёт обе нагрузки. Держишься — молодец.",
+        'cg_ptsd': f"🕊 *{name}, я буду бережной.*\n\nУход за другими + тяжёлый опыт — это много.\nАврора адаптирована: безопасно и мягко.",
+        'meno_ptsd': f"🕊 *{name}, двойная чувствительность.*\n\nМенопауза + травматический опыт.\nАврора будет максимально бережной.",
+        'andro_ptsd': f"🕊 *{name}, стресс + гормональный переход — непростое сочетание.*\n\nАврора учтёт оба фактора. Безопасно и по делу.",
+        'triple': f"🕊 *{name}, у тебя сейчас тройная нагрузка.*\n\nАврора переходит в мягкий режим.\nТолько самое безопасное. Только поддержка.",
+    }
+
+    red_flags = []
+    mrs = data.get('mrs_short_score')
+    pcl = data.get('ptsd_screen_score', 0)
+    if mrs and mrs > 15:
+        red_flags.append(
+            "\n\n⚠️ *Важно:* Симптомы менопаузы выраженные (MRS > 15).\n"
+            "Рекомендую обсудить с гинекологом/эндокринологом."
+        )
+    if pcl > 12:
+        red_flags.append(
+            "\n\n⚠️ *Важно:* Я заметила высокий уровень стресса.\n"
+            "Подумай о консультации с психологом или психотерапевтом.\n"
+            "Это не слабость — это инструмент."
+        )
+    if data.get('dissociation_risk'):
+        red_flags.append(
+            "\n\n🕊 Если бывает ощущение «я не здесь» — "
+            "это стоит обсудить со специалистом."
+        )
+
+    profile_msg = profile_messages.get(profile_type, profile_messages['base'])
+    profile_msg += "".join(red_flags)
+
+    await message.edit_text(
+        profile_msg,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💚 Спасибо! Продолжить", callback_data="profile_screen_done")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "profile_screen_done")
+async def profile_screen_complete(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    phase = user.get("onboarding_phase", 1) if user else 1
+    profile = user.get("profile_type", "base") if user else "base"
+
+    await callback.message.edit_text(
+        f"🎉 *{name}, всё готово!*\n\n"
+        f"Аврора настроена под тебя.\n"
+        f"Жду тебя на утреннем чекине! 💚",
+        parse_mode="Markdown",
+        reply_markup=get_menu_keyboard(onboarding_phase=phase, profile_type=profile)
+    )
+
+
+@router.callback_query(F.data == "profile_screen_skip")
+async def profile_screen_skip(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    await save_user(callback.from_user.id, {
+        "profile_type": "base",
+        "profile_screening_done": 1,
+        "profile_screening_date": date.today().isoformat(),
+    })
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    phase = user.get("onboarding_phase", 1) if user else 1
+
+    await callback.message.edit_text(
+        f"✅ *{name}, профиль настроен (базовый).*\n\n"
+        f"Можно пройти расширенный скрининг позже в настройках.\n"
+        f"Аврора готова! 💚",
+        parse_mode="Markdown",
+        reply_markup=get_menu_keyboard(onboarding_phase=phase, profile_type="base")
+    )
+
+
+# ─── E: Grounding 5-4-3-2-1 ──────────────────────────────────
+
+@router.callback_query(F.data == "grounding_now")
+async def grounding_start(callback: CallbackQuery):
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    await callback.message.edit_text(
+        f"🌿 *{name}, заземление 5-4-3-2-1*\n\n"
+        f"Не торопись. Просто замечай.\n\n"
+        f"👀 *5 вещей*, которые ты ВИДИШЬ прямо сейчас\n"
+        f"_Опиши мысленно: цвет, форму..._\n\n"
+        f"Когда готова — нажми ▶️",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Дальше", callback_data="grounding_step2")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "grounding_step2")
+async def grounding_step2(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "🌿 *Хорошо.*\n\n"
+        "✋ *4 вещи*, которые ты ЧУВСТВУЕШЬ на ощупь\n"
+        "_Стул под собой, ткань одежды, тепло рук..._\n\n"
+        "Когда готова — ▶️",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Дальше", callback_data="grounding_step3")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "grounding_step3")
+async def grounding_step3(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "🌿 *Отлично.*\n\n"
+        "👂 *3 звука*, которые ты СЛЫШИШЬ\n"
+        "_Тикание часов, шум за окном, своё дыхание..._\n\n"
+        "Когда готова — ▶️",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Дальше", callback_data="grounding_step4")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "grounding_step4")
+async def grounding_step4(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "🌿 *Почти.*\n\n"
+        "👃 *2 запаха*, которые ты ЧУВСТВУЕШЬ\n"
+        "_Кофе, свежий воздух, крем..._\n\n"
+        "Когда готова — ▶️",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Дальше", callback_data="grounding_step5")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "grounding_step5")
+async def grounding_step5(callback: CallbackQuery):
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    await callback.message.edit_text(
+        "🌿 *Последний шаг.*\n\n"
+        "👅 *1 вкус* — что ты чувствуешь?\n"
+        "_Можно просто отпить воды и заметить вкус._\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🌿 *{name}, ты здесь. Ты в безопасности.*\n\n"
+        "Ноги на полу. Тело дышит.\n"
+        "Ты справляешься. 💚",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💚 Спасибо", callback_data="back_to_menu")],
+            [InlineKeyboardButton(text="🫁 + Дыхание 4-7-8", callback_data="breathing_478_start")]
+        ])
+    )
+
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# КОНЕЦ ПОПРАВКИ #164
+# ═══════════════════════════════════════════════════════════════
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  ПОПРАВКА #170: МОНЕТИЗАЦИЯ — Четыре глубины понимания себя      ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ A: СТРУКТУРА ТАРИФОВ
+# ──────────────────────────────────────────────
+
+FREE_PERIOD_DAYS = 30
+
+FREE_FEATURES = {
+    'onboarding': True,
+    'all_tests': True,
+    'checkins_morning': True,
+    'checkins_evening': True,
+    'bioage_point_a': True,
+    'basic_recommendations': True,
+    'sos_plans': True,
+    'grounding': True,
+    'specialist_referral': True,
+    'emotional_support': True,   # 💭 Эмоции — ВСЕГДА (этика!)
+    # Только первый месяц:
+    'education_why': True,
+    'unload_tasks_1x': True,
+    'morning_plan_basic': True,
+}
+
+MAX_HINTS_PER_WEEK = 3
+MIN_DAYS_BETWEEN_SAME_HINT = 7
+MAX_UPGRADE_DECLINES = 3
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ D1: ПОДСКАЗКИ О ПРЕИМУЩЕСТВАХ
+# ──────────────────────────────────────────────
+
+UPGRADE_HINTS = {
+    # ── Уровень 2 ──
+    'detective': {
+        'target': 2,
+        'trigger': 'after_emotion_unload',
+        'text': (
+            "💡 На Уровне 2 я бы проверила: ванна, сон, кофе, "
+            "вампиры — и показала бы *ТВОЮ* цепочку тревоги."
+        ),
+    },
+    'nutraceutics_personal': {
+        'target': 2,
+        'trigger': 'after_education_vitamin_d',
+        'text': (
+            "💡 Сейчас — стандартные 2000 МЕ. Но я могу точнее: "
+            "введи анализ 25(OH)D — и пересчитаю именно под тебя. Уровень 3."
+        ),
+    },
+    'bioage_monthly': {
+        'target': 2,
+        'trigger': 'after_bioage_point_a',
+        'text': (
+            "💡 Точка А записана. Хочешь увидеть тренд через месяц? "
+            "На Уровне 2 — ежемесячный замер + что влияет на *ТВОЙ* биовозраст."
+        ),
+    },
+    'bath_monitoring': {
+        'target': 2,
+        'trigger': 'after_bath_education',
+        'text': (
+            "💡 Ванна — это мощно. Но без мониторинга — вслепую. "
+            "На Уровне 2: давление, капилляры, адаптация дозы. Каждую процедуру."
+        ),
+    },
+    'sleep_analysis': {
+        'target': 2,
+        'trigger': 'after_bad_sleep_3days',
+        'text': (
+            "💡 Третий день плохой сон. На Уровне 2 я бы показала: "
+            "режим, вампиры, связь с кофе — и конкретный план."
+        ),
+    },
+    'food_swaps': {
+        'target': 2,
+        'trigger': 'after_craving_mention',
+        'text': (
+            "💡 Тянет на сладкое? На Уровне 2 — умные замены: "
+            "что съесть вместо, почему это работает, и список покупок."
+        ),
+    },
+    'emotion_protocol': {
+        'target': 2,
+        'trigger': 'after_anxiety_emotion',
+        'text': (
+            "💡 Тревога. На Уровне 2 я бы проверила: "
+            "ванна давно? магний пропустила? кофе после обеда? сон хаотичный? "
+            "И показала бы *ТВОЮ* цепочку."
+        ),
+    },
+    # ── Уровень 3 ──
+    'genetics_stress': {
+        'target': 3,
+        'trigger': 'after_high_stress_persistent',
+        'text': (
+            "💡 Стресс держится долго. На Уровне 3 я бы проверила: "
+            "твой COMT — возможно, стресс-гормоны выводятся медленнее "
+            "чем у других. И настроила бы ВСЁ под твою генетику."
+        ),
+    },
+    'genetics_coffee': {
+        'target': 3,
+        'trigger': 'after_coffee_anxiety_link',
+        'text': (
+            "💡 Кофе → тревога. Но *СКОЛЬКО* тебе можно — "
+            "зависит от гена CYP1A2. На Уровне 3 — точный лимит: "
+            "не средний, а ТВОЙ."
+        ),
+    },
+    'genetics_sleep': {
+        'target': 3,
+        'trigger': 'after_chaotic_sleep_pattern',
+        'text': (
+            "💡 Хаотичный сон. А может дело в хронотипе? "
+            "Ген PER3 определяет: ты сова или жаворонок. "
+            "На Уровне 3 — *ТВОЁ* окно сна, не среднее."
+        ),
+    },
+    'genetics_folate': {
+        'target': 3,
+        'trigger': 'after_b_vitamin_recommendation',
+        'text': (
+            "💡 Фолиевая кислота назначена. Но знала ли ты: "
+            "у 40% людей ген MTHFR не даёт её усваивать. "
+            "На Уровне 3 — проверим и заменим на метилфолат если нужно."
+        ),
+    },
+    'genetics_dementia': {
+        'target': 3,
+        'trigger': 'after_heredity_dementia',
+        'text': (
+            "💡 Деменция в семье. На Уровне 3 — ген APOE покажет "
+            "твой точный риск. И персональная нейропрофилактика: "
+            "не общие советы, а под *ТВОЙ* генотип."
+        ),
+    },
+    'genetics_bath_rotation': {
+        'target': 3,
+        'trigger': 'after_bath_course_complete',
+        'text': (
+            "💡 Курс ванн завершён. На Уровне 3 — ротация под генотип: "
+            "COMT worrier → больше Mg-ванн. BDNF Met → нагрузка после ванны. "
+            "Персонально."
+        ),
+    },
+}
+
+DECLINE_RESPONSES = {
+    1: "Хорошо, напомню позже 💚",
+    2: "Понимаю. Если передумаешь — я здесь.",
+    3: "Принято. Больше не буду предлагать. Твой уровень работает отлично. 💚",
+}
+
+
+def get_upgrade_hint(feature: str, target_level: int) -> str:
+    """Получить подсказку о преимуществе следующего уровня."""
+    hint = UPGRADE_HINTS.get(feature)
+    if hint and hint['target'] == target_level:
+        return hint['text']
+    if target_level == 2:
+        return (
+            "💡 На Уровне 2 — персональные протоколы, "
+            "детектив связей и ежемесячный прогресс.\n"
+            "33₽/день."
+        )
+    elif target_level == 3:
+        return (
+            "💡 На Уровне 3 — анализы + точные дозы + домашний санаторий.\n"
+            "50₽/день."
+        )
+    return ""
+
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ C: ПРОВЕРКА ДОСТУПА
+# ──────────────────────────────────────────────
+
+async def check_feature_access(telegram_id: int, feature: str) -> dict:
+    """
+    ПОПРАВКА #170: Проверяет доступ к функции по уровню подписки.
+    Возвращает: allowed, reason, upgrade_hint
+    """
+    user = await get_user(telegram_id)
+    if not user:
+        return {'allowed': True}  # Новый пользователь — не блокируем
+
+    level = user.get('subscription_level', 0)
+    sub_status = user.get('subscription_status', 'free')
+
+    # Считаем дни с регистрации
+    reg_date = user.get('created_at') or user.get('registration_date')
+    is_free_period = True
+    if reg_date:
+        try:
+            reg_dt = date.fromisoformat(str(reg_date)[:10])
+            is_free_period = (date.today() - reg_dt).days <= FREE_PERIOD_DAYS
+        except:
+            pass
+
+    # ── FREE навсегда ──
+    always_free = [
+        'onboarding', 'all_tests', 'checkins_morning', 'checkins_evening',
+        'bioage_point_a', 'basic_recommendations', 'sos_plans',
+        'grounding', 'specialist_referral', 'emotional_support',
+    ]
+    if feature in always_free:
+        return {'allowed': True}
+
+    # ── FREE только первый месяц ──
+    free_trial_only = ['education_why', 'unload_tasks_1x', 'morning_plan_basic']
+    if feature in free_trial_only:
+        if is_free_period:
+            return {'allowed': True}
+        return {
+            'allowed': False,
+            'reason': 'trial_expired',
+            'upgrade_hint': get_upgrade_hint(feature, target_level=2),
+        }
+
+    # ── Уровень 2 ──
+    level_2_features = [
+        'detective', 'cascade_availability', 'vampires_tracking',
+        'sleep_analysis_7d', 'nutraceutics_personal', 'cortisol_food',
+        'food_swaps', 'shopping_lists', 'baths_personal',
+        'bath_monitoring', 'bath_course_tracking', 'unload_unlimited',
+        'morning_plan_adaptive', 'emotion_protocol_link',
+        'bioage_monthly', 'protocol_correction', 'education_about_self',
+    ]
+    if feature in level_2_features:
+        if level >= 2 and sub_status == 'active':
+            return {'allowed': True}
+        return {
+            'allowed': False,
+            'reason': 'level_2_required',
+            'upgrade_hint': get_upgrade_hint(feature, target_level=2),
+        }
+
+    # ── Уровень 3 ──
+    level_3_features = [
+        'blood_test_input', 'precise_dosages', 'monthly_recheck',
+        'blood_trend_tracking', 'dosage_auto_adjust', 'analysis_interpretation',
+        'bath_full_monitoring', 'bath_rotation', 'home_sanatorium',
+    ]
+    if feature in level_3_features:
+        if level >= 3 and sub_status == 'active':
+            return {'allowed': True}
+        return {
+            'allowed': False,
+            'reason': 'level_3_required',
+            'upgrade_hint': get_upgrade_hint(feature, target_level=3),
+        }
+
+    # ── Уровень 4 ──
+    level_4_features = [
+        'genetics_19_genes', 'genetics_recalibrates_all',
+        'bath_rotation_genetic', 'chronotherapy',
+        'hereditary_prevention', 'genetic_shopping_lists',
+        'caffeine_exact_limit', 'daily_genetic_practices',
+    ]
+    if feature in level_4_features:
+        if level >= 4 and sub_status == 'active':
+            return {'allowed': True}
+        return {
+            'allowed': False,
+            'reason': 'level_4_required',
+            'upgrade_hint': get_upgrade_hint(feature, target_level=3),
+        }
+
+    return {'allowed': True}
+
+
+async def check_unload_access(telegram_id: int, mode: str) -> dict:
+    """ПОПРАВКА #170: Проверка доступа к разгрузке по уровню."""
+    # 💭 Эмоции — ВСЕГДА бесплатно (этика!)
+    if mode == 'emotions':
+        return {'allowed': True}
+
+    user = await get_user(telegram_id)
+    if not user:
+        return {'allowed': True}
+
+    level = user.get('subscription_level', 0)
+
+    if level >= 2:
+        return {'allowed': True}  # Безлимит
+
+    # FREE / trial — 1 раз в день
+    last = user.get('last_unload_date')
+    if last == date.today().isoformat():
+        return {
+            'allowed': False,
+            'reason': 'daily_limit',
+            'message': (
+                "📋 Разгрузка задач — раз в день на бесплатном уровне.\n\n"
+                "💭 Эмоциональная разгрузка — без ограничений, всегда.\n\n"
+                "💡 На Уровне 2 — разгрузка без лимита + детектив, "
+                "который покажет твои связи.\n"
+                "_33₽/день. Дешевле кофе, который крадёт сон._"
+            ),
+        }
+    return {'allowed': True}
+
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ D2: ЛОГИКА ПОКАЗА ПОДСКАЗОК
+# ──────────────────────────────────────────────
+
+async def should_show_upgrade_hint(telegram_id: int, hint_type: str) -> bool:
+    """ПОПРАВКА #170: Проверяет можно ли показать подсказку."""
+    user = await get_user(telegram_id)
+    if not user:
+        return False
+
+    hint_data = UPGRADE_HINTS.get(hint_type)
+    if not hint_data:
+        return False
+
+    target = hint_data['target']
+
+    # Человек уже отказался 3 раза → СТОП навсегда
+    if user.get(f'upgrade_{target}_stopped', 0):
+        return False
+
+    # Человек уже на этом уровне или выше
+    level = user.get('subscription_level', 0)
+    if level >= target:
+        return False
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Не более 3 подсказок в неделю
+            week_ago = (date.today() - timedelta(days=7)).isoformat()
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM upgrade_hints "
+                "WHERE telegram_id = ? AND shown_at >= ?",
+                (telegram_id, week_ago)
+            )
+            count = (await cursor.fetchone())[0]
+            if count >= MAX_HINTS_PER_WEEK:
+                return False
+
+            # Эта конкретная подсказка — не чаще раза в неделю
+            cursor = await db.execute(
+                "SELECT MAX(shown_at) FROM upgrade_hints "
+                "WHERE telegram_id = ? AND hint_type = ?",
+                (telegram_id, hint_type)
+            )
+            last = await cursor.fetchone()
+            if last and last[0]:
+                try:
+                    last_dt = date.fromisoformat(str(last[0])[:10])
+                    if (date.today() - last_dt).days < MIN_DAYS_BETWEEN_SAME_HINT:
+                        return False
+                except:
+                    pass
+    except:
+        pass
+
+    return True
+
+
+async def show_upgrade_hint(telegram_id: int, hint_type: str, bot_instance, chat_id: int):
+    """ПОПРАВКА #170: Показывает подсказку о преимуществе следующего уровня."""
+    if not await should_show_upgrade_hint(telegram_id, hint_type):
+        return
+
+    user = await get_user(telegram_id)
+    level = user.get('subscription_level', 0) if user else 0
+
+    hint_data = UPGRADE_HINTS.get(hint_type)
+    if not hint_data:
+        return
+
+    if level >= hint_data['target']:
+        return
+
+    text = hint_data['text']
+    target = hint_data['target']
+
+    if target == 2:
+        button_text = "Узнать про Уровень 2 →"
+        cb = "upgrade_info_2"
+    elif target == 3:
+        button_text = "Узнать про Уровень 3 →"
+        cb = "upgrade_info_3"
+    else:
+        button_text = "Узнать про Уровень 4 →"
+        cb = "upgrade_info_4"
+
+    try:
+        await bot_instance.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=button_text, callback_data=cb)],
+                [InlineKeyboardButton(text="Пока нет", callback_data="upgrade_later")],
+            ])
+        )
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO upgrade_hints (telegram_id, hint_type) VALUES (?, ?)",
+                (telegram_id, hint_type)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"show_upgrade_hint error: {e}")
+
+
+async def handle_upgrade_decline(telegram_id: int, target_level: int) -> str:
+    """ПОПРАВКА #170: Человек сказал 'пока нет'. Считаем и уважаем."""
+    user = await get_user(telegram_id)
+    if not user:
+        return "💚"
+    decline_key = f'upgrade_{target_level}_declines'
+    stopped_key = f'upgrade_{target_level}_stopped'
+    declines = (user.get(decline_key, 0) or 0) + 1
+    updates = {decline_key: declines}
+    if declines >= MAX_UPGRADE_DECLINES:
+        updates[stopped_key] = 1
+    await save_user(telegram_id, updates)
+    return DECLINE_RESPONSES.get(min(declines, 3), "💚")
+
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ E: ЭКРАНЫ ТАРИФОВ
+# ──────────────────────────────────────────────
+
+LEVEL_2_DESCRIPTION = """
+🔷 *Уровень 2 — Знание о СЕБЕ*
+
+Всё что было + персонально под тебя:
+
+🔍 *Детектив связей:* тревога → а ванна была? а кофе? а сон?
+   Бот видит то, что ты не замечаешь.
+
+💊 *Персональная нутрицевтика:* точные дозировки под ТВОЙ профиль
+   и стадию истощения. Не "попей витаминки" — а конкретно.
+
+🍳 *Антикортизоловое питание:* что есть, что заменить при тяге,
+   списки покупок с ценами.
+
+🛁 *Ванны с мониторингом:* персональный тип, давление после ванны,
+   капилляры, адаптация дозы. Счётчик курса.
+
+📊 *Биовозраст — тренд:* каждый месяц замер + что повлияло.
+   Не "мне кажется лучше" — а цифры.
+
+📋 *Разгрузка без лимита:* задачи и эмоции — когда нужно.
+
+🌙 *Умный план:* адаптируется под сон, стресс, энергию.
+
+💰 *3000₽ за 3 месяца = 33₽/день*
+_Дешевле кофе, который крадёт твой сон._
+"""
+
+LEVEL_3_DESCRIPTION = """
+🔷 *Уровень 3 — Точное знание*
+
+Всё что на Уровне 2 + я могу ТОЧНЕЕ:
+
+💉 *Введи анализы — я пересчитаю ВСЁ:*
+   25(OH)D, магний, B12, ферритин, ТТГ, Т4, тестостерон/эстрадиол
+   → Точные дозировки под *ТВОИ* цифры, не средние
+
+📈 *Ежемесячный тренд:*
+   "D был 18 → стал 32 за 2 месяца → работает!"
+   Пересдала → я автоматически корректирую дозы
+
+🏠 *Домашний санаторий:*
+   Полное сопровождение ванн: ротация курсов,
+   post-bath мониторинг, давление, капилляры.
+
+Это разница между «примерно подходит» и «точно под тебя».
+
+💰 *4500₽ за 3 месяца = 50₽/день*
+"""
+
+LEVEL_4_DESCRIPTION = """
+🔶 *Уровень 4 — Почему ты такая*
+
+Всё что на Уровне 3 + генетика: КАЖДЫЙ ДЕНЬ новая практика под генотип.
+
+🧬 *19 генов → живая программа:*
+
+Понедельник: COMT worrier → медитация + магний 600мг
+Вторник: BDNF Met → 20 мин быстрая ходьба
+Среда: CYP1A2 медленный → матча вместо кофе
+Четверг: PER3 сова → тренировка после 17:00
+Пятница: 5-HTTLPR → удлинённое дыхание
+
+Это не PDF с результатами. Это *живая программа* —
+каждый день разная, каждый день именно под твою генетику.
+
+☕ Точный лимит кофеина (ТВОЙ, не средний)
+😴 Точное окно сна (по генам)
+💊 Метилфолат вместо фолиевой (если MTHFR)
+🛡 Нейропрофилактика (APOE)
+🛁 Ротация ванн под генотип
+"""
+
+VITAMIN_D_EDUCATION = """
+☀️ *Витамин D: 2000 МЕ* — безопасная доза для всех.
+
+Но я могу ТОЧНЕЕ.
+
+Витамин D — это не просто витамин. Это гормон:
+• Настроение (дефицит = депрессия ↑)
+• Сон (дефицит = бессонница)
+• Иммунитет (дефицит = болеешь чаще)
+• Кости и суставы
+• Биовозраст (дефицит = ускоренное старение)
+
+У 80% людей в северных широтах — дефицит.
+У тебя может быть и 15, и 45 — без анализа не узнаю.
+
+💉 *Анализ 25(OH)D* — один раз, любая лаборатория, ~1000₽.
+Введи результат — и я пересчитаю дозу *ТОЧНО* под тебя.
+"""
+
+LIFESTYLE_MESSAGES = {
+    'month_1_end': (
+        "Месяц позади. Ты узнала больше о своём организме "
+        "чем за предыдущие годы.\n\n"
+        "Но это только начало. Реальные изменения — через 3 месяца. "
+        "Биовозраст — через 6. Образ жизни — через 12.\n\n"
+        "Как чистить зубы — не ждёшь результат за неделю. "
+        "Просто делаешь каждый день — и зубы здоровы.\n\n"
+        "Дворяне ездили на воды каждый год. "
+        "Не потому что болели — потому что заботились."
+    ),
+    'month_3_results': (
+        "3 месяца. Первый замер тренда.\n\n"
+        "Посмотри на цифры: биовозраст, HRV, сон, стресс.\n"
+        "Видишь движение? Это не случайность — "
+        "это система, которая работает каждый день.\n\n"
+        "Следующие 3 месяца — закрепление."
+    ),
+    'month_6_milestone': (
+        "Полгода. Биовозраст: минус {bioage_diff} лет.\n\n"
+        "Главное — ты научилась управлять собой.\n"
+        "Тревога → проверяешь кофе, ванну, вампиров.\n"
+        "Тяга к сладкому → берёшь тёмный шоколад.\n\n"
+        "Это не я. Это ТЫ. Я только показала связи.\n\n"
+        "Продолжаем?"
+    ),
+}
+
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ E4: ОБРАБОТЧИКИ ТАРИФОВ
+# ──────────────────────────────────────────────
+
+@router.callback_query(F.data == "upgrade_info_2")
+async def upgrade_info_2(callback: CallbackQuery):
+    """ПОПРАВКА #170: Показать информацию об Уровне 2."""
+    await callback.answer()
+    await callback.message.answer(
+        LEVEL_2_DESCRIPTION,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Начать — Уровень 2 →", callback_data="upgrade_start_2")],
+            [InlineKeyboardButton(text="Пока нет", callback_data="upgrade_later")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "upgrade_info_3")
+async def upgrade_info_3_handler(callback: CallbackQuery):
+    """ПОПРАВКА #170: Показать информацию об Уровне 3."""
+    await callback.answer()
+    await callback.message.answer(
+        LEVEL_3_DESCRIPTION,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Перейти на Уровень 3 →", callback_data="upgrade_start_3")],
+            [InlineKeyboardButton(text="Пока нет", callback_data="upgrade_later")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "upgrade_info_4")
+async def upgrade_info_4_handler(callback: CallbackQuery):
+    """ПОПРАВКА #170: Показать информацию об Уровне 4."""
+    await callback.answer()
+    await callback.message.answer(
+        LEVEL_4_DESCRIPTION,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Узнать свою генетику →", callback_data="upgrade_start_4")],
+            [InlineKeyboardButton(text="Пока нет", callback_data="upgrade_later")],
+        ])
+    )
+
+
+@router.callback_query(F.data == "upgrade_later")
+async def upgrade_later(callback: CallbackQuery):
+    """ПОПРАВКА #170: Человек отказался. Считаем и уважаем."""
+    msg = callback.message.text or ""
+    if "Уровень 4" in msg or "генетик" in msg.lower():
+        target = 4
+    elif "Уровень 3" in msg or "анализ" in msg.lower():
+        target = 3
+    else:
+        target = 2
+
+    response = await handle_upgrade_decline(callback.from_user.id, target)
+    await callback.answer(response, show_alert=False)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
+
+@router.callback_query(F.data.startswith("upgrade_start_"))
+async def upgrade_start(callback: CallbackQuery):
+    """ПОПРАВКА #170: Начало процесса оплаты (MVP: через support)."""
+    level = callback.data.replace("upgrade_start_", "")
+    await callback.answer()
+    prices = {'2': '3000', '3': '4500', '4': 'уточняется'}
+    price = prices.get(level, 'уточняется')
+    level_names = {
+        '2': 'Уровень 2 — Знание о себе',
+        '3': 'Уровень 3 — Точное знание',
+        '4': 'Уровень 4 — Почему ты такая',
+    }
+    lname = level_names.get(level, f'Уровень {level}')
+    await callback.message.answer(
+        f"💳 *{lname}*\n\n"
+        f"Стоимость: *{price}₽* за 3 месяца\n\n"
+        f"Для оплаты напиши: @aurora\\_support\n\n"
+        f"_Автоматическая оплата появится в ближайшее время._",
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "subscription_menu")
+async def subscription_menu(callback: CallbackQuery):
+    """ПОПРАВКА #170: Меню подписки."""
+    await callback.answer()
+    tid = callback.from_user.id
+    user = await get_user(tid)
+    level = user.get('subscription_level', 0) if user else 0
+    status = user.get('subscription_status', 'free') if user else 'free'
+
+    level_names = {0: 'FREE', 2: 'Уровень 2', 3: 'Уровень 3', 4: 'Уровень 4'}
+    lname = level_names.get(level, f'Уровень {level}')
+
+    paid_until = user.get('paid_until', '') if user else ''
+    paid_info = f"\nОплачено до: {paid_until}" if paid_until else ""
+
+    text = (
+        f"💎 *Твой уровень: {lname}*\n"
+        f"Статус: {status}{paid_info}\n\n"
+        f"Аврора работает с тобой на любом уровне.\n"
+        f"Каждый следующий — глубже, но не обязательно."
+    )
+
+    buttons = []
+    if level < 2:
+        buttons.append([InlineKeyboardButton(text="🔷 Узнать про Уровень 2", callback_data="upgrade_info_2")])
+    if level < 3:
+        buttons.append([InlineKeyboardButton(text="🔷 Узнать про Уровень 3", callback_data="upgrade_info_3")])
+    if level < 4:
+        buttons.append([InlineKeyboardButton(text="🔶 Узнать про Уровень 4", callback_data="upgrade_info_4")])
+    buttons.append([InlineKeyboardButton(text="✅ Закрыть", callback_data="back_to_menu")])
+
+    await callback.message.answer(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  ПОПРАВКА #169: ПЛАНИРОВЩИК MVP                                  ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ B: AI-ПРОМТЫ
+# ──────────────────────────────────────────────
+
+UNLOAD_TASKS_SYSTEM_PROMPT = """
+Ты — помощник бота Аврора. Человек скидывает задачи и дела перед сном.
+Твоя задача — рассортировать. Цель: все дела записаны, голова пустая.
+
+ПРАВИЛА:
+1. Отвечай на русском
+2. Тон: деловой, короткий, дружелюбный
+3. Не спрашивай уточнений — додумывай из контекста
+4. НЕ копайся в эмоциях — сортируй только дела
+5. Если в потоке мелькают эмоции — коротко: "Услышала" и дальше к делам
+6. Категории:
+   🔴 СРОЧНОЕ — завтра обязательно (дедлайн, запись, оплата)
+   📋 ЗАДАЧИ — сделать, но не горит (позвонить, купить, написать)
+   💊 ЗДОРОВЬЕ — симптомы, приём к врачу, самочувствие
+   💡 ИДЕИ — не потерять (запись, мысль, хотелка)
+   🗑 МУСОР — навязчивое, rumination, "а вдруг" → "отпускай"
+
+7. Формат ответа — СТРОГО JSON:
+{
+  "tasks": [
+    {"category": "urgent", "text": "...", "priority": 2, "context": "phone"},
+    {"category": "todo", "text": "...", "priority": 0, "context": null},
+    {"category": "health", "text": "...", "ai_note": "трекаю"},
+    {"category": "idea", "text": "...", "ai_note": "в копилку"}
+  ],
+  "response": "Короткий итог (1-2 предложения)",
+  "red_flag": false,
+  "summary": "Одно предложение: что завтра главное"
+}
+
+8. Мусор НЕ сохраняется как задача. Упоминается: "Остальное — отпускай."
+"""
+
+UNLOAD_EMOTIONS_SYSTEM_PROMPT = """
+Ты — помощник бота Аврора. Человек пришёл выговориться перед сном.
+Твоя задача — принять, назвать эмоцию, отпустить. НЕ сортировать дела. НЕ давать советов.
+
+ФОРМУЛА: Принять → Назвать → Отпустить.
+- Принять: "Я слышу тебя."
+- Назвать: "Это усталость / тревога / обида / вина — и это нормально."
+- Отпустить: мягкое завершение → сон.
+
+СТРОГИЕ ПРАВИЛА:
+1. Отвечай на русском, тепло, 3-5 предложений максимум
+2. НЕ спрашивай "расскажи подробнее" или "что ты чувствуешь"
+3. НЕ давай советов ("поговори с мужем", "попробуй медитацию")
+4. НЕ анализируй ("возможно это потому что...")
+5. НЕ мотивируй ("ты сильная", "ты справишься")
+6. НЕ обесценивай ("другим хуже", "это пройдёт")
+7. Если в тексте мелькают конкретные задачи — НЕ сортируй.
+   Скажи: "Если хочешь — завтра разложим дела. А сейчас — спи."
+
+Формат ответа — СТРОГО JSON:
+{
+  "response": "Тёплый поддерживающий ответ (3-5 предложений)",
+  "emotion_tags": ["усталость", "одиночество"],
+  "intensity": "medium",
+  "red_flag": false,
+  "needs_specialist": false
+}
+
+intensity: "light" (вентиляция, не тяжело), "medium" (устала, обидно),
+           "heavy" (отчаяние, вина, безнадёжность)
+
+needs_specialist: true если 3+ тяжёлых тем (вина+безнадёжность+одиночество)
+"""
+
+UNLOAD_PROFILE_PROMPTS = {
+    'caregiver': {
+        'tasks': """
+ПРОФИЛЬ: Ухаживает за больным/пожилым.
+- Отделяй "забота о другом" от "забота о себе"
+- Если ВСЕ задачи про другого — мягко: "А что-то для тебя на завтра?"
+""",
+        'emotions': """
+ПРОФИЛЬ: Ухаживает за больным/пожилым.
+- "Устала от ухода", "мама не благодарит", "я плохая дочь"
+  → Валидируй: "Ты делаешь больше чем достаточно. Это тяжело."
+- НЕ говори "зато мама жива" или "другим хуже"
+- "Я невидимка", "никто не замечает" → "Я замечаю. Ты не невидимка."
+""",
+    },
+    'menopause': {
+        'tasks': """
+ПРОФИЛЬ: Менопауза.
+- "Забыла", "не могу вспомнить" → fog, досортируй сама, не проси уточнений
+- Короткие/путаные фразы — OK
+""",
+        'emotions': """
+ПРОФИЛЬ: Менопауза.
+- "Схожу с ума", "тупею" → "Это fog. Это физиология, не ты."
+- НЕ говори "это гормоны, пройдёт". Говори "это реально. И это управляемо."
+- Приливы ночью → "Знаю, это выматывает. Это не навсегда."
+""",
+    },
+    'ptsd': {
+        'tasks': """
+ПРОФИЛЬ: Возможный ПТСР.
+🔴 СТРОГО: НЕ спрашивай "что тревожит". Сортируй только ЗАДАЧИ.
+- Травматическое содержание → НЕ развивай. Переведи к конкретным делам.
+- Кошмары, flashback → red_flag: true
+""",
+        'emotions': """
+ПРОФИЛЬ: Возможный ПТСР.
+🔴 СТРОГИЕ ПРАВИЛА:
+- НЕ спрашивай "что случилось", "расскажи подробнее"
+- НЕ развивай тему травмы. Вообще.
+- "Я слышу тебя. Ты здесь. Ты в безопасности."
+- Кошмары, flashback, диссоциация → red_flag: true,
+  response: "Давай заземлимся. 5 вещей которые ты видишь прямо сейчас."
+- Всё остальное → "Принято. Отпускай. Доброй ночи."
+""",
+    },
+    'andropause': {
+        'tasks': """
+ПРОФИЛЬ: Мужчина, возможная андропауза.
+- Тон: конкретный. "Записал" вместо "услышала".
+""",
+        'emotions': """
+ПРОФИЛЬ: Мужчина.
+- Тон: без жалости. "Это реально тяжело" вместо "бедненький".
+- "Не справляюсь", "устал" → "Это не слабость. Ресурс конечен."
+- НЕ говори "поплачь" или "выпусти эмоции". Говори "принято, отпускай".
+""",
+    },
+    'triple': {
+        'tasks': """
+ПРОФИЛЬ: Тройная нагрузка.
+МИНИМАЛЬНЫЙ РЕЖИМ: сортируй ТОЛЬКО 🔴 Срочное + 📋 Задачи.
+Всё остальное → "Принято. Завтра разберём. Доброй ночи."
+""",
+        'emotions': """
+ПРОФИЛЬ: Тройная нагрузка.
+МИНИМАЛЬНЫЙ РЕЖИМ:
+- Максимально коротко и мягко.
+- "Услышала. Ты несёшь очень много. Отпускай на сегодня. Приятных снов."
+- Любой red flag → grounding + направление к специалисту.
+""",
+    },
+}
+
+HEAVY_SESSIONS_THRESHOLD = 3  # 3 тяжёлых подряд → мягко предложить специалиста
+
+
+def build_unload_system_prompt(user: dict, mode: str = 'tasks') -> str:
+    """ПОПРАВКА #169: Собирает системный промт с учётом режима и профиля."""
+    if mode == 'tasks':
+        prompt = UNLOAD_TASKS_SYSTEM_PROMPT
+    else:
+        prompt = UNLOAD_EMOTIONS_SYSTEM_PROMPT
+
+    profile = user.get('profile_type', 'base')
+
+    def add_profile(key):
+        if key in UNLOAD_PROFILE_PROMPTS:
+            return UNLOAD_PROFILE_PROMPTS[key].get(mode, '')
+        return ''
+
+    if profile in UNLOAD_PROFILE_PROMPTS:
+        prompt += add_profile(profile)
+    elif profile == 'cg_meno':
+        prompt += add_profile('caregiver')
+        prompt += add_profile('menopause')
+    elif profile == 'cg_ptsd':
+        prompt += add_profile('ptsd')
+        prompt += add_profile('caregiver')
+    elif profile == 'meno_ptsd':
+        prompt += add_profile('ptsd')
+        prompt += add_profile('menopause')
+    elif profile == 'cg_andro':
+        prompt += add_profile('caregiver')
+        prompt += add_profile('andropause')
+    elif profile == 'andro_ptsd':
+        prompt += add_profile('ptsd')
+        prompt += add_profile('andropause')
+
+    gender = user.get('gender', 'female')
+    if gender == 'male':
+        prompt += "\nТон: конкретный, без жалости. 'Записал/принято' вместо 'услышала'."
+    else:
+        prompt += "\nТон: тёплый, поддерживающий."
+
+    return prompt
+
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ C: ВЫЗОВ CLAUDE API
+# ──────────────────────────────────────────────
+
+async def ai_unload_sort(user_text: str, user: dict, mode: str = 'tasks') -> dict:
+    """
+    ПОПРАВКА #169: Отправляет текст в Claude API.
+    mode='tasks' → сортировка по категориям.
+    mode='emotions' → поддержка (принять → назвать → отпустить).
+    """
+    system_prompt = build_unload_system_prompt(user, mode=mode)
+
+    if not ANTHROPIC_API_KEY:
+        return {
+            "tasks": [],
+            "response": "Принято. Доброй ночи 💚",
+            "red_flag": False,
+            "emotion_tags": [],
+            "summary": "",
+            "error_no_key": True,
+        }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "content-type": "application/json",
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                },
+                json={
+                    "model": "claude-3-5-haiku-20241022",
+                    "max_tokens": 1500,
+                    "system": system_prompt,
+                    "messages": [
+                        {"role": "user", "content": user_text}
+                    ],
+                },
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status != 200:
+                    return {"error": f"API error: {resp.status}"}
+
+                data = await resp.json()
+                ai_text = data["content"][0]["text"]
+
+                clean = ai_text.strip()
+                if clean.startswith("```"):
+                    clean = clean.split("\n", 1)[1]
+                    clean = clean.rsplit("```", 1)[0]
+                clean = clean.strip()
+
+                result = json.loads(clean)
+                return result
+
+    except json.JSONDecodeError:
+        return {
+            "tasks": [],
+            "response": "Принято. Доброй ночи 💚",
+            "red_flag": False,
+            "emotion_tags": [],
+            "summary": ""
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ G: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ БД
+# ──────────────────────────────────────────────
+
+async def save_planner_task(telegram_id, category, text, priority=0,
+                             context=None, ai_note=None, scheduled_date=None):
+    """ПОПРАВКА #169: Сохранить задачу планировщика в БД."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO planner_tasks "
+            "(telegram_id, category, text, priority, context, ai_note, scheduled_date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (telegram_id, category, text, priority, context, ai_note, scheduled_date)
+        )
+        await db.commit()
+
+
+async def get_active_planner_tasks(telegram_id):
+    """ПОПРАВКА #169: Получить активные задачи планировщика."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM planner_tasks "
+            "WHERE telegram_id = ? AND status = 'active' "
+            "ORDER BY priority DESC, created_at ASC",
+            (telegram_id,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def save_unload_session_db(telegram_id, raw_text, result, mode='tasks',
+                                  tasks_created=0, red_flag=0,
+                                  emotion_tags=None, consecutive_heavy=0):
+    """ПОПРАВКА #169: Сохранить сессию разгрузки."""
+    user = await get_user(telegram_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO unload_sessions "
+            "(telegram_id, date, mode, raw_text, ai_response, tasks_created, "
+            "emotion_tags, red_flag, consecutive_heavy, profile_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                telegram_id,
+                date.today().isoformat(),
+                mode,
+                raw_text if mode == 'tasks' else None,  # Эмоц. текст не сохраняем
+                json.dumps(result, ensure_ascii=False),
+                tasks_created,
+                json.dumps(emotion_tags or result.get("emotion_tags", []),
+                           ensure_ascii=False),
+                red_flag,
+                consecutive_heavy,
+                user.get('profile_type', 'base') if user else 'base',
+            )
+        )
+        await db.commit()
+
+
+async def get_consecutive_heavy_sessions(telegram_id) -> int:
+    """ПОПРАВКА #169: Сколько тяжёлых эмоц. сессий подряд."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT consecutive_heavy FROM unload_sessions "
+            "WHERE telegram_id = ? AND mode = 'emotions' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (telegram_id,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def save_morning_plan_db(telegram_id, plan_text, tasks_planned, adapted_reason):
+    """ПОПРАВКА #169: Сохранить утренний план."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO morning_plans "
+            "(telegram_id, date, plan_text, tasks_planned, adapted_reason) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (telegram_id, date.today().isoformat(), plan_text, tasks_planned, adapted_reason)
+        )
+        await db.commit()
+
+
+async def get_sleep_stats_7days_planner(telegram_id) -> dict:
+    """ПОПРАВКА #169: Статистика сна за 7 дней."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        week_ago = (date.today() - timedelta(days=7)).isoformat()
+        cursor = await db.execute(
+            "SELECT sleep_quality, sleep_hours, wake_ups, bedtime "
+            "FROM morning_checkins "
+            "WHERE telegram_id = ? AND date >= ? "
+            "ORDER BY date DESC",
+            (telegram_id, week_ago)
+        )
+        rows = await cursor.fetchall()
+        if not rows or len(rows) < 3:
+            return None
+
+        qualities = [r[0] for r in rows if r[0]]
+        hours = [r[1] for r in rows if r[1]]
+        wakeups = [r[2] for r in rows if r[2] is not None]
+        bedtimes = []
+        for r in rows:
+            if r[3]:
+                try:
+                    h, m = map(int, str(r[3]).split(':'))
+                    bedtimes.append(h * 60 + m)
+                except:
+                    pass
+
+        result = {
+            'avg_quality': sum(qualities) / len(qualities) if qualities else 5,
+            'avg_hours': sum(hours) / len(hours) if hours else 7,
+            'avg_wake_ups': sum(wakeups) / len(wakeups) if wakeups else 0,
+            'bedtime_variance_minutes': 0,
+        }
+        if len(bedtimes) >= 3:
+            avg_bt = sum(bedtimes) / len(bedtimes)
+            variance = (sum((bt - avg_bt) ** 2 for bt in bedtimes) / len(bedtimes)) ** 0.5
+            result['bedtime_variance_minutes'] = round(variance)
+
+        return result
+
+
+async def check_task_streak_planner(telegram_id, task_id: str, days: int = 7):
+    """ПОПРАВКА #169: Проверяет выполнение задания за N дней."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT is_active FROM user_tasks "
+            "WHERE telegram_id = ? AND task_id = ?",
+            (telegram_id, task_id)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+
+        period_start = (date.today() - timedelta(days=days)).isoformat()
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM task_tracking "
+            "WHERE telegram_id = ? AND task_id = ? AND done = 1 AND date >= ?",
+            (telegram_id, task_id, period_start)
+        )
+        count = await cursor.fetchone()
+        return count[0] if count else 0
+
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ F: УТРЕННИЙ ПЛАН
+# ──────────────────────────────────────────────
+
+async def generate_morning_task_plan(telegram_id: int) -> str:
+    """
+    ПОПРАВКА #169: Генерирует утренний план из вчерашней разгрузки.
+    Адаптирует под состояние и профиль.
+    """
+    user = await get_user(telegram_id)
+    name = user.get("name", "друг") if user else "друг"
+    profile = user.get("profile_type", "base") if user else "base"
+    gender = user.get("gender", "female") if user else "female"
+
+    tasks = await get_active_planner_tasks(telegram_id)
+    if not tasks:
+        return None
+
+    urgent = [t for t in tasks if t['category'] == 'urgent']
+    todos = [t for t in tasks if t['category'] == 'todo']
+    health = [t for t in tasks if t['category'] == 'health']
+
+    # Последний чекин
+    last_morning = None
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM morning_checkins WHERE telegram_id = ? "
+                "ORDER BY date DESC LIMIT 1",
+                (telegram_id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                last_morning = dict(row)
+    except:
+        pass
+
+    sleep_quality = last_morning.get('sleep_quality', 5) if last_morning else 5
+    energy = last_morning.get('morning_energy', 5) if last_morning else 5
+
+    is_sick = user.get('is_sick', 0) if user else 0
+
+    if is_sick:
+        max_tasks = 0
+        intro = "🤒 Здоровье важнее задач. Сегодня — только отдых."
+        adapted = 'sick'
+    elif sleep_quality <= 3:
+        max_tasks = 1
+        intro = "Ночь была тяжёлой. Сегодня — только самое главное."
+        adapted = 'bad_sleep'
+    elif energy <= 3:
+        max_tasks = 2
+        intro = f"{name}, силы на исходе. Выбираем главное:"
+        adapted = 'low_energy'
+    else:
+        max_tasks = 5
+        intro = f"Доброе утро, {name}! Вот план:"
+        adapted = 'normal'
+
+    # Профиль
+    if profile in ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd'):
+        nightmares = last_morning.get('nightmares', 0) if last_morning else 0
+        if nightmares:
+            grounding = get_gendered_text('grounding_final', gender)
+            intro = f"🌿 {grounding}\n\nСначала — заземлись. Потом план."
+            max_tasks = min(max_tasks, 1)
+    elif profile in ('triple',):
+        max_tasks = min(max_tasks, 1)
+        intro = f"{name}, сегодня одно дело. Только одно."
+
+    plan_text = f"📅 *ПЛАН НА СЕГОДНЯ*\n\n{intro}\n\n"
+    shown = 0
+
+    if urgent and max_tasks > 0:
+        plan_text += "🔴 *Обязательно:*\n"
+        for t in urgent[:max_tasks]:
+            plan_text += f"  → {t['text']}\n"
+            shown += 1
+        plan_text += "\n"
+
+    remaining = max_tasks - shown
+    if todos and remaining > 0:
+        plan_text += "📋 *Если будут силы:*\n"
+        for t in todos[:remaining]:
+            plan_text += f"  → {t['text']}\n"
+            shown += 1
+        plan_text += "\n"
+
+    if health:
+        plan_text += "💊 *Здоровье:*\n"
+        for t in health[:2]:
+            note = f" _({t.get('ai_note', '')})_" if t.get('ai_note') else ""
+            plan_text += f"  → {t['text']}{note}\n"
+        plan_text += "\n"
+
+    if max_tasks == 0:
+        plan_text += "_Задачи на паузе. Сначала — восстановление._\n"
+
+    await save_morning_plan_db(telegram_id, plan_text, shown, adapted)
+    return plan_text
+
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ I: ОБРАТНАЯ СВЯЗЬ ЭМОЦИИ → ПРОТОКОЛ
+# ──────────────────────────────────────────────
+
+async def check_emotion_protocol_link(telegram_id: int, emotion_tags: list) -> str:
+    """
+    ПОПРАВКА #169: После эмоциональной разгрузки —
+    проверяем протокол и даём мягкую подсказку.
+    """
+    if not emotion_tags:
+        return None
+
+    user = await get_user(telegram_id)
+    hints = []
+
+    # ── Тревога ──
+    if any(t in emotion_tags for t in ['тревога', 'беспокойство', 'паника', 'страх']):
+        try:
+            hydro = await get_hydro_profile(telegram_id)
+            has_bath = hydro.get('has_bathtub', 'none') if hydro else 'none'
+            last_bath = await get_last_bath_date(telegram_id)
+            no_bath_recently = not last_bath or (date.today() - date.fromisoformat(last_bath)).days >= 5
+
+            if has_bath in ('full', 'partial') and no_bath_recently:
+                try:
+                    bath_rec = recommend_bath(user, context='stress')
+                    bath_name = bath_rec.get('bath', {}).get('name', 'расслабляющая ванна')
+                except:
+                    bath_name = 'расслабляющая ванна'
+                hints.append(
+                    f"🛁 Ванны не было 5 дней, а тревога растёт. "
+                    f"Для тебя подойдёт: {bath_name}. "
+                    f"Запланировать на завтра?"
+                )
+            elif has_bath == 'none':
+                hints.append(
+                    "💧 Ванны нет — но есть варианты:\n"
+                    "🦶 Ножная ванна (тазик + тёплая вода) — 15 мин\n"
+                    "🧊 Холодная вода на руки и лицо — 30 сек, активирует блуждающий нерв, тревога ↓"
+                )
+        except:
+            pass
+
+        # Магний
+        try:
+            plan = await get_vitamin_plan(telegram_id)
+            if plan and 'magnesium' in plan.get('schema', {}):
+                hints.append(
+                    "💊 Магний — первый помощник при тревоге. "
+                    "Если пропустила сегодня — прими перед сном."
+                )
+        except:
+            pass
+
+        # Кофе после 14:00
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT caffeine_after_14 FROM evening_checkins "
+                    "WHERE telegram_id = ? ORDER BY date DESC LIMIT 1",
+                    (telegram_id,)
+                )
+                row = await cursor.fetchone()
+                had_late_coffee = dict(row).get('caffeine_after_14', 0) if row else 0
+            if had_late_coffee:
+                hints.append(
+                    "☕ Кофе после обеда держит кортизол высоким 6-8 часов — как раз к вечеру тревога.\n"
+                    "Попробуй завтра после обеда: 🌿 чай с мятой и мелиссой."
+                )
+        except:
+            pass
+
+        # Сон за 7 дней
+        try:
+            sleep_data = await get_sleep_stats_7days_planner(telegram_id)
+            if sleep_data:
+                sleep_issues = []
+                if sleep_data.get('bedtime_variance_minutes', 0) > 90:
+                    sleep_issues.append("разброс времени отбоя больше 1.5 часов — мозг не знает когда спать")
+                if sleep_data.get('avg_hours', 7) < 6.5:
+                    avg_h = sleep_data['avg_hours']
+                    sleep_issues.append(f"в среднем {avg_h:.1f} ч — организму не хватает для восстановления")
+                if sleep_data.get('avg_wake_ups', 0) > 2:
+                    sleep_issues.append("частые пробуждения — сон не восстанавливает")
+                if sleep_issues:
+                    issues_text = "; ".join(sleep_issues)
+                    hints.append(
+                        f"😴 За последнюю неделю: {issues_text}. "
+                        f"Недосып → кортизол ↑ → тревога ↑ → снова плохой сон. "
+                        f"Замкнутый круг. Начнём с режима отбоя."
+                    )
+        except:
+            pass
+
+        # Вампиры сил
+        try:
+            vampires = []
+            daylight_done = await check_task_streak_planner(telegram_id, 'daylight', days=7)
+            if daylight_done is not None and daylight_done < 3:
+                vampires.append(
+                    "☀️ Утренний свет — без него мелатонин не останавливается, "
+                    "весь день в режиме выживания. Завтра: 10 мин у окна после пробуждения"
+                )
+            blue_filter_done = await check_task_streak_planner(telegram_id, 'blue_filter', days=7)
+            if blue_filter_done is not None and blue_filter_done < 3:
+                vampires.append("📱 Экраны без фильтра вечером — синий свет блокирует мелатонин")
+            blackout_done = await check_task_streak_planner(telegram_id, 'blackout', days=7)
+            if blackout_done is not None and blackout_done < 3:
+                vampires.append("💡 Свет в спальне — мозг думает что день, кортизол не снижается")
+            noise_done = await check_task_streak_planner(telegram_id, 'mask_sound', days=7)
+            if noise_done is not None and noise_done < 3:
+                vampires.append("🔊 Шум — мозг не переходит в глубокий сон")
+            if vampires:
+                vamp_text = "\n  ".join(vampires)
+                hints.append(f"🧛 Вампиры твоих сил:\n  {vamp_text}\n\nУбери хотя бы одного — почувствуешь разницу.")
+        except:
+            pass
+
+        # Дыхание — ВСЕГДА
+        hints.append(
+            "🌬 Дыхание 4-7-8 — твой аварийный резерв. "
+            "3 цикла прямо сейчас — кортизол ↓ за 2 минуты."
+        )
+
+    # ── Бессонница ──
+    elif any(t in emotion_tags for t in ['бессонница', 'не могу уснуть', 'сон']):
+        try:
+            hydro = await get_hydro_profile(telegram_id)
+            has_bath = hydro.get('has_bathtub', 'none') if hydro else 'none'
+            last_bath = await get_last_bath_date(telegram_id)
+            no_bath_recently = not last_bath or (date.today() - date.fromisoformat(last_bath)).days >= 3
+            if has_bath in ('full', 'partial') and no_bath_recently:
+                hints.append("🛁 Ванна за 1.5 часа до сна — лучшее снотворное без побочек.")
+            else:
+                hints.append(
+                    "🦶 Ножная ванна перед сном (тазик + тёплая вода, 15 мин) — расслабляет не хуже полной.\n"
+                    "🌬 И дыхание 4-7-8 уже в кровати — твой резерв."
+                )
+        except:
+            hints.append("🌬 Дыхание 4-7-8 в кровати — помогает уснуть.")
+
+    # ── Усталость, апатия ──
+    elif any(t in emotion_tags for t in ['усталость', 'апатия', 'нет сил', 'истощение']):
+        try:
+            plan = await get_vitamin_plan(telegram_id)
+            if plan:
+                bgs = plan.get('bgs_protocol', 'C')
+                if bgs in ('A', 'B'):
+                    hints.append(
+                        "💊 Твоя стадия истощения говорит: "
+                        "отдых сейчас важнее продуктивности. "
+                        "Добавки работают — но им нужно время."
+                    )
+        except:
+            pass
+
+    # ── Вина, самокритика ──
+    elif any(t in emotion_tags for t in ['вина', 'самокритика', 'я плохая']):
+        profile = user.get('profile_type', 'base') if user else 'base'
+        if profile in ('caregiver', 'cg_meno', 'cg_ptsd', 'cg_andro'):
+            hints.append(
+                "💚 Вина — частый спутник тех, кто ухаживает. "
+                "Это не правда о тебе. Это кортизол + усталость."
+            )
+
+    # ── Раздражительность ──
+    elif any(t in emotion_tags for t in ['раздражительность', 'злость', 'срывы']):
+        hints.append(
+            "💊 Раздражительность часто = дефицит магния + недосып. "
+            "Магний перед сном + ванна = лучшая комбинация."
+        )
+
+    # Горе / одиночество — не лезем в протокол
+    if not hints:
+        return None
+
+    # Разделяем дыхание и остальное
+    breathing_hint = None
+    other_hints = []
+    for h in hints:
+        if "4-7-8" in h or "Дыхание" in h:
+            breathing_hint = h
+        else:
+            other_hints.append(h)
+
+    selected = other_hints[:2]
+    if breathing_hint:
+        selected.append(breathing_hint)
+
+    return "\n\n".join(selected)
+
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ E: ОБРАБОТЧИКИ — ВЕЧЕРНЯЯ РАЗГРУЗКА
+# ──────────────────────────────────────────────
+
+@router.callback_query(F.data == "unload_start_tasks")
+async def unload_start_tasks(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #169: Начало режима ЗАДАЧИ."""
+    await callback.answer()
+
+    # ═══ ПОПРАВКА #170: Проверка лимита для FREE ═══
+    access = await check_unload_access(callback.from_user.id, mode='tasks')
+    if not access.get('allowed'):
+        await callback.message.answer(
+            access.get('message', 'Лимит исчерпан.'),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔷 Узнать про Уровень 2", callback_data="upgrade_info_2")],
+                [InlineKeyboardButton(text="💭 Выговориться (бесплатно)", callback_data="unload_start_emotions")],
+            ])
+        )
+        return
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    profile = user.get("profile_type", "base") if user else "base"
+
+    if profile in ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd'):
+        intro = (
+            f"📋 *{name}, пиши что нужно сделать.*\n\n"
+            f"Только задачи и конкретика.\n"
+            f"Я рассортирую и покажу план на завтра."
+        )
+    elif profile in ('triple',):
+        intro = (
+            f"📋 *{name}, коротко — что на завтра?*\n\n"
+            f"Я возьму самое важное. Остальное подождёт."
+        )
+    elif profile in ('menopause', 'cg_meno', 'meno_ptsd'):
+        intro = (
+            f"📋 *{name}, пиши как есть — даже обрывками.*\n\n"
+            f"Если туман и мысли путаются — это нормально.\n"
+            f"Я разберу и рассортирую."
+        )
+    elif profile in ('caregiver', 'cg_meno', 'cg_ptsd', 'cg_andro'):
+        intro = (
+            f"📋 *{name}, что нужно сделать?*\n\n"
+            f"Задачи, покупки, звонки — скидывай.\n"
+            f"И — есть ли что-то для ТЕБЯ на завтра?"
+        )
+    else:
+        intro = (
+            f"📋 *{name}, скинь все дела что крутятся в голове.*\n\n"
+            f"Задачи, покупки, звонки, планы — всё подряд.\n"
+            f"Я разложу по полочкам и покажу план на утро."
+        )
+
+    await callback.message.answer(
+        intro,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="unload_cancel")]
+        ])
+    )
+    await state.set_state(PlannerStates.waiting_unload_text)
+    await state.update_data(
+        unload_mode='tasks',
+        unload_start_time=datetime.now().isoformat()
+    )
+
+
+@router.callback_query(F.data == "unload_start_emotions")
+async def unload_start_emotions(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #169: Начало режима ЭМОЦИИ."""
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+    profile = user.get("profile_type", "base") if user else "base"
+    gender = user.get("gender", "female") if user else "female"
+
+    if profile in ('ptsd', 'cg_ptsd', 'meno_ptsd', 'andro_ptsd'):
+        intro = (
+            f"💭 *{name}, я рядом.*\n\n"
+            f"Пиши что чувствуешь. Не нужно объяснять.\n"
+            f"Не буду расспрашивать. Просто приму."
+        )
+    elif profile in ('triple',):
+        intro = (
+            f"💭 *{name}, пиши.*\n\n"
+            f"Что угодно. Я просто рядом."
+        )
+    elif profile in ('caregiver', 'cg_meno', 'cg_ptsd', 'cg_andro'):
+        intro = (
+            f"💭 *{name}, здесь можно про себя.*\n\n"
+            f"Не про маму, не про работу — про тебя.\n"
+            f"Что чувствуешь? Что накопилось?"
+        )
+    else:
+        if gender == 'male':
+            intro = (
+                f"💭 *{name}, здесь без оценок.*\n\n"
+                f"Что накопилось — скинь. Не буду давать советов.\n"
+                f"Просто приму."
+            )
+        else:
+            intro = (
+                f"💭 *{name}, это безопасное пространство.*\n\n"
+                f"Пиши что чувствуешь — усталость, обиду, тревогу, что угодно.\n"
+                f"Не буду анализировать и советовать. Просто услышу."
+            )
+
+    await callback.message.answer(
+        intro,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Не сейчас", callback_data="unload_cancel")]
+        ])
+    )
+    await state.set_state(PlannerStates.waiting_unload_text)
+    await state.update_data(
+        unload_mode='emotions',
+        unload_start_time=datetime.now().isoformat()
+    )
+
+
+@router.callback_query(F.data == "unload_skip")
+async def unload_skip(callback: CallbackQuery):
+    await callback.answer("Доброй ночи 💚")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
+
+@router.callback_query(F.data == "unload_cancel")
+async def unload_cancel(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    await callback.message.answer("Хорошо, без разгрузки. Доброй ночи 💚")
+
+
+@router.message(PlannerStates.waiting_unload_text)
+async def unload_receive_text(message: Message, state: FSMContext):
+    """ПОПРАВКА #169: Принимает текст, отправляет в Claude, обрабатывает по режиму."""
+    user_text = message.text
+    if not user_text or len(user_text.strip()) < 3:
+        await message.answer("Напиши хотя бы пару слов — я услышу.")
+        return
+
+    tid = message.from_user.id
+    user = await get_user(tid)
+    name = user.get("name", "друг") if user else "друг"
+    fsm_data = await state.get_data()
+    mode = fsm_data.get('unload_mode', 'tasks')
+
+    if mode == 'tasks':
+        thinking_msg = await message.answer("📋 Раскладываю по полочкам...")
+    else:
+        thinking_msg = await message.answer("💭 Слушаю...")
+
+    result = await ai_unload_sort(user_text, user, mode=mode)
+
+    try:
+        await thinking_msg.delete()
+    except:
+        pass
+
+    if "error" in result and "error_no_key" not in result:
+        await message.answer(
+            "Не получилось обработать. Попробуй ещё раз или напиши короче.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Ещё раз", callback_data=f"unload_start_{mode}")],
+                [InlineKeyboardButton(text="😌 Ладно, спать", callback_data="unload_skip")],
+            ])
+        )
+        return
+
+    # ── Red flag (оба режима) ──
+    if result.get("red_flag"):
+        gender = user.get('gender', 'female') if user else 'female'
+        try:
+            grounding = get_gendered_text('grounding_final', gender)
+        except:
+            grounding = "Ты здесь. Ты в безопасности."
+        await message.answer(
+            f"🌿 *{name}, я рядом.*\n\n"
+            f"{grounding}\n\n"
+            f"Если сейчас очень тяжело: 8-800-2000-122 (бесплатно, круглосуточно)\n\n"
+            f"_{result.get('response', '')}_",
+            parse_mode="Markdown"
+        )
+        await save_unload_session_db(tid, user_text, result, mode=mode, red_flag=1)
+        await state.clear()
+        return
+
+    # ══════════════════════════════════════════
+    # РЕЖИМ ЗАДАЧИ
+    # ══════════════════════════════════════════
+    if mode == 'tasks':
+        tasks = result.get("tasks", [])
+        tasks_saved = 0
+        for task in tasks:
+            if task.get("category") == "trash":
+                continue
+            await save_planner_task(
+                tid,
+                category=task.get("category", "todo"),
+                text=task.get("text", ""),
+                priority=task.get("priority", 0),
+                context=task.get("context"),
+                ai_note=task.get("ai_note"),
+                scheduled_date=date.today().isoformat() if task.get("category") == "urgent" else None,
+            )
+            tasks_saved += 1
+
+        response_text = "✅ *Разложила:*\n\n"
+
+        urgent_t = [t for t in tasks if t.get("category") == "urgent"]
+        todos_t = [t for t in tasks if t.get("category") == "todo"]
+        health_t = [t for t in tasks if t.get("category") == "health"]
+        ideas_t = [t for t in tasks if t.get("category") == "idea"]
+
+        if urgent_t:
+            response_text += "🔴 *Завтра обязательно:*\n"
+            for t in urgent_t:
+                response_text += f"  → {t['text']}\n"
+            response_text += "\n"
+        if todos_t:
+            response_text += "📋 *Задачи (не горит):*\n"
+            for t in todos_t:
+                response_text += f"  → {t['text']}\n"
+            response_text += "\n"
+        if health_t:
+            response_text += "💊 *Здоровье:*\n"
+            for t in health_t:
+                note = f" _({t['ai_note']})_" if t.get('ai_note') else ""
+                response_text += f"  → {t['text']}{note}\n"
+            response_text += "\n"
+        if ideas_t:
+            response_text += "💡 *Идеи (в копилку):*\n"
+            for t in ideas_t:
+                response_text += f"  → {t['text']}\n"
+            response_text += "\n"
+
+        ai_response = result.get("response", "")
+        if ai_response:
+            response_text += f"━━━━━━━━━━━━━━━━━━━━━━\n\n{ai_response}"
+
+        summary = result.get("summary", "")
+        if summary:
+            response_text += f"\n\n🌅 *Завтра главное:* {summary}"
+
+        await message.answer(
+            response_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Ещё дела", callback_data="unload_more")],
+                [InlineKeyboardButton(text="💭 Теперь эмоции", callback_data="unload_start_emotions")],
+                [InlineKeyboardButton(text="💚 Спасибо, спать", callback_data="unload_done")],
+            ])
+        )
+        await save_unload_session_db(tid, user_text, result, mode='tasks', tasks_created=tasks_saved)
+
+    # ══════════════════════════════════════════
+    # РЕЖИМ ЭМОЦИИ
+    # ══════════════════════════════════════════
+    else:
+        ai_response = result.get("response", "Услышала тебя. Приятных снов 💚")
+        emotion_tags = result.get("emotion_tags", [])
+        intensity = result.get("intensity", "light")
+
+        await message.answer(
+            f"💭 {ai_response}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💭 Ещё что-то", callback_data="unload_more")],
+                [InlineKeyboardButton(text="📋 А теперь дела", callback_data="unload_start_tasks")],
+                [InlineKeyboardButton(text="💚 Спасибо, спать", callback_data="unload_done")],
+            ])
+        )
+
+        consecutive = await get_consecutive_heavy_sessions(tid)
+        if intensity == "heavy":
+            consecutive += 1
+
+        if consecutive >= HEAVY_SESSIONS_THRESHOLD:
+            gender = user.get('gender', 'female') if user else 'female'
+            try:
+                referral = get_gendered_text('referral_psychologist', gender)
+            except:
+                referral = "Специалист поможет разобраться."
+            await message.answer(
+                f"💚 {name}, последние дни были тяжёлыми.\n\n"
+                f"Живой разговор со специалистом может помочь больше чем я.\n\n"
+                f"{referral}\n\n"
+                f"_Это не слабость — это забота о себе._",
+                parse_mode="Markdown"
+            )
+
+        await save_unload_session_db(
+            tid, user_text, result, mode='emotions',
+            emotion_tags=emotion_tags, consecutive_heavy=consecutive
+        )
+
+        # Обратная связь эмоции → протокол (через 3 сек)
+        if emotion_tags:
+            await asyncio.sleep(3)
+            try:
+                # ═══ ПОПРАВКА #170: детектив только для Уровня 2+ ═══
+                access_det = await check_feature_access(tid, 'emotion_protocol_link')
+                if access_det.get('allowed'):
+                    hint = await check_emotion_protocol_link(tid, emotion_tags)
+                    if hint:
+                        kb_rows = []
+                        if "ванн" in hint:
+                            kb_rows.append([InlineKeyboardButton(
+                                text="🛁 Да, запланируй ванну",
+                                callback_data="schedule_bath_tomorrow"
+                            )])
+                        kb_rows.append([InlineKeyboardButton(
+                            text="💚 Спасибо, спать",
+                            callback_data="unload_done"
+                        )])
+                        await message.answer(
+                            f"💡 _{hint}_",
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
+                        )
+                else:
+                    # FREE: показываем что мог бы увидеть
+                    any_anxiety = any(t in emotion_tags for t in ['тревога', 'беспокойство', 'паника'])
+                    if any_anxiety:
+                        await show_upgrade_hint(tid, 'emotion_protocol', bot, tid)
+            except Exception as e:
+                logger.error(f"check_emotion_protocol_link error: {e}")
+
+    await state.set_state(PlannerStates.waiting_unload_more)
+
+
+@router.callback_query(F.data == "unload_more")
+async def unload_more(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer("📝 Пиши ещё — добавлю к сегодняшнему.")
+    await state.set_state(PlannerStates.waiting_unload_text)
+
+
+@router.callback_query(F.data == "unload_done")
+async def unload_done(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+
+    await save_user(callback.from_user.id, {
+        'last_unload_date': date.today().isoformat(),
+        'total_unloads': (user.get('total_unloads', 0) or 0) + 1,
+    })
+
+    await callback.message.answer(
+        f"💚 Приятных снов, {name}. Завтра утром покажу план.\n\n"
+        f"_Голова пустая → сон глубже → утро легче._",
+        parse_mode="Markdown"
+    )
+    await state.clear()
+
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ H: ОТМЕТКА ВЫПОЛНЕНИЯ ЗАДАЧ
+# ──────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("planner_task_done_"))
+async def planner_task_done(callback: CallbackQuery):
+    """ПОПРАВКА #169: Отметить задачу планировщика выполненной."""
+    await callback.answer("✅")
+    task_id = int(callback.data.replace("planner_task_done_", ""))
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE planner_tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), task_id)
+        )
+        await db.commit()
+
+
+@router.callback_query(F.data == "planner_tasks_skip_review")
+async def planner_tasks_skip_review(callback: CallbackQuery):
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
+
+# ──────────────────────────────────────────────
+# ЧАСТЬ F2: РЕАКЦИЯ НА УТРЕННИЙ ПЛАН
+# ──────────────────────────────────────────────
+
+@router.callback_query(F.data == "plan_accepted")
+async def plan_accepted(callback: CallbackQuery):
+    await callback.answer("💚 Вперёд!")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
+
+@router.callback_query(F.data == "plan_reduce")
+async def plan_reduce(callback: CallbackQuery):
+    """ПОПРАВКА #169: Сократить план до 1 задачи."""
+    await callback.answer()
+    tid = callback.from_user.id
+    tasks = await get_active_planner_tasks(tid)
+    urgent = [t for t in tasks if t['category'] == 'urgent']
+
+    if urgent:
+        task_text = urgent[0]['text']
+    elif tasks:
+        task_text = tasks[0]['text']
+    else:
+        task_text = "Отдых"
+
+    try:
+        await callback.message.edit_text(
+            f"📅 *Ок, сегодня одно:*\n\n"
+            f"→ {task_text}\n\n"
+            f"_Остальное подождёт. Это нормально._",
+            parse_mode="Markdown"
+        )
+    except:
+        await callback.message.answer(
+            f"📅 *Ок, сегодня одно:*\n\n→ {task_text}\n\n_Остальное подождёт._",
+            parse_mode="Markdown"
+        )
+
+
+@router.callback_query(F.data == "schedule_bath_tomorrow")
+async def schedule_bath_tomorrow_callback(callback: CallbackQuery):
+    """ПОПРАВКА #169: Запланировать ванну на завтра (просто подтверждение)."""
+    await callback.answer("🛁 Запомнила! Напомню завтра вечером.")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
     except:
         pass
 

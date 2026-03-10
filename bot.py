@@ -9834,7 +9834,8 @@ class ChronotypeStates(StatesGroup):
     waiting_q1 = State()  # Время естественного пробуждения
     waiting_q2 = State()  # Время естественного засыпания
     waiting_q3 = State()  # Пик энергии
-    waiting_q4 = State()  # Выходные без будильника
+    waiting_q4 = State()  # Реальное время отбоя (ПОПРАВКА #171)
+    waiting_q5 = State()  # Реальное время подъёма (ПОПРАВКА #174)
     waiting_choice = State()  # Выбор пользователя (остаться/сдвигаться)
 
 
@@ -21347,13 +21348,7 @@ def get_genetic_chronotype_text(result: dict) -> str:
             f"Главное — режим 7 дней/нед!"
         )
     
-    # ПОПРАВКА #139: Глимфатический риск
-    glyph = get_glymphatic_risk(result["chronotype"])
-    risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(glyph["risk"], "⚪")
-    risk_ru = {"low": "НИЗКИЙ РИСК", "medium": "УМЕРЕННЫЙ РИСК", "high": "ВЫСОКИЙ РИСК"}.get(glyph["risk"], glyph["risk"])
-    text += f"\n\n🧠 Глимфатика: {risk_emoji} {risk_ru}"
-    if glyph["risk"] != "low":
-        text += f"\n_{glyph['note']}_"
+    # ПОПРАВКА #174: Глимфатический риск убран (заменён на конкретику в хронотипе)
         text += f"\n✅ {glyph['compensation']}"
     
     return text
@@ -21596,11 +21591,8 @@ def format_glymphatic_chronotype_report(chronotype: str, jetlag: dict = None,
     """
     glyph = get_glymphatic_risk(chronotype)
     
-    risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(glyph["risk"], "⚪")
-    risk_ru = {"low": "НИЗКИЙ РИСК", "medium": "УМЕРЕННЫЙ РИСК", "high": "ВЫСОКИЙ РИСК"}.get(glyph["risk"], glyph["risk"])
-    
+    # ПОПРАВКА #174: Риск убран, оставляем только заголовок
     text = f"🧠 *ГЛИМФАТИКА И ХРОНОТИП:*\n\n"
-    text += f"Риск: {risk_emoji} {risk_ru}\n"
     text += f"_{glyph['note']}_\n\n"
     
     if glyph["risk"] != "low":
@@ -57635,67 +57627,44 @@ async def chronotype_q3(callback: CallbackQuery, state: FSMContext):
         'q3': val,
     }
 
-    # Определяем хронотип
-    chronotype = determine_chronotype(answers)
+    try:
+        chronotype = determine_chronotype(answers)
+        user = await get_user(callback.from_user.id)
+        name = user.get("name", "друг") if user else "друг"
+        await save_chronotype(callback.from_user.id, chronotype)
+    except Exception as e:
+        logger.error(f"Chronotype error: {e}")
+        chronotype = "pigeon"
+        user = await get_user(callback.from_user.id)
+        name = user.get("name", "друг") if user else "друг"
 
-    user = await get_user(callback.from_user.id)
-    name = user.get("name", "друг") if user else "друг"
-
-    # Сохраняем хронотип
-    await save_chronotype(callback.from_user.id, chronotype)
-
-    await state.clear()
-
-    CHRONO_BEDTIMES = {
-        "lark": "22:00", "pigeon": "22:15",
-        "owl": "22:45", "night_owl": "23:30",
+    CHRONO_NAMES = {
+        "lark": ("🐤", "ЖАВОРОНОК"),
+        "pigeon": ("🕊", "ГОЛУБЬ"),
+        "owl": ("🦉", "СОВА"),
+        "night_owl": ("🦉🦉", "ПОЗДНЯЯ СОВА"),
     }
-    target = CHRONO_BEDTIMES.get(chronotype, "22:15")
+    emoji, type_name = CHRONO_NAMES.get(chronotype, ("🕊", "ГОЛУБЬ"))
 
-    chrono_to_glyph = {
-        "lark": "lark", "pigeon": "neutral",
-        "owl": "owl", "night_owl": "extreme_owl",
+    CHRONO_NOTES = {
+        "lark": "Твой организм настроен просыпаться рано — это хорошая база.",
+        "pigeon": "Хорошая новость — твой организм настроен вырабатывать мелатонин вовремя.",
+        "owl": "Твой мозг хочет засыпать позже — это физиология, не лень.",
+        "night_owl": "Сейчас ты ложишься очень поздно и теряешь пик очистки мозга во сне.",
     }
-    glyph = get_glymphatic_risk(chrono_to_glyph.get(chronotype, "neutral"))
-    risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(glyph["risk"], "⚪")
-    risk_ru = {"low": "НИЗКИЙ РИСК", "medium": "УМЕРЕННЫЙ РИСК", "high": "ВЫСОКИЙ РИСК"}.get(glyph["risk"], glyph["risk"])
-
-    if chronotype == 'night_owl':
-        emoji = "🦉🦉"
-        type_name = "ПОЗДНЯЯ СОВА"
-        chrono_note = (
-            "\n\nСейчас ты ложишься очень поздно и теряешь\n"
-            "больше 2 часов из пика очистки мозга во сне.\n\n"
-            f"Целевой отбой: *{target}*.\n"
-            "Будем двигаться по 15 минут в неделю. Не рывком. 💚"
-        )
-    elif chronotype == 'owl':
-        emoji = "🦉"
-        type_name = "СОВА"
-        chrono_note = (
-            "\n\nТвой мозг хочет засыпать поздно, но мозг\n"
-            "очищается от токсинов с 23:00 до 03:00.\n\n"
-            f"Чтобы поймать этот пик — нужно ЛЕЧЬ в *{target}*.\n\n"
-            "Это реально с утренним светом. Я помогу! 💚"
-        )
-    elif chronotype == 'pigeon':
-        emoji = "🕊"
-        type_name = "ГОЛУБЬ"
-        chrono_note = ""
-    else:
-        emoji = "🐤"
-        type_name = "ЖАВОРОНОК"
-        chrono_note = ""
+    chrono_note = CHRONO_NOTES.get(chronotype, "")
 
     text = (
         f"{emoji} {name}, ТВОЙ ХРОНОТИП — *{type_name}*\n\n"
-        f"🌙 Оптимальный отбой: *{target}*\n"
-        f"🧠 Риск нарушений: {risk_emoji} {risk_ru}"
         f"{chrono_note}\n\n"
-        f"А во сколько ты *реально* обычно ложишься?"
+        f"💡 Для точного понимания существуют генетические тесты.\n"
+        f"Если захочешь — обсудим позже.\n\n"
+        f"А сейчас давай посмотрим как ты живёшь.\n"
+        f"Во сколько ты *реально* обычно ложишься?"
     )
 
-    # ПОПРАВКА #171: После хронотипа — спрашиваем реальное время отбоя
+    # ПОПРАВКА #174 БАГФИКС: set_state ПЕРЕД edit_text, state.clear() убран
+    await state.set_state(ChronotypeStates.waiting_q4)
     await callback.message.edit_text(
         text,
         parse_mode="Markdown",
@@ -57706,12 +57675,11 @@ async def chronotype_q3(callback: CallbackQuery, state: FSMContext):
              InlineKeyboardButton(text="После 00:00", callback_data="real_bed_very_late")],
         ])
     )
-    await state.set_state(ChronotypeStates.waiting_q4)
 
 
 @router.callback_query(ChronotypeStates.waiting_q4, F.data.startswith("real_bed_"))
 async def chronotype_real_bedtime(callback: CallbackQuery, state: FSMContext):
-    """ПОПРАВКА #171: Реальное время отбоя → сохранение + продолжение."""
+    """ПОПРАВКА #171: Реальное время отбоя → вопрос про подъём."""
     await callback.answer()
     val = callback.data.replace("real_bed_", "")
 
@@ -57724,37 +57692,104 @@ async def chronotype_real_bedtime(callback: CallbackQuery, state: FSMContext):
     tid = callback.from_user.id
     await save_user(tid, {"real_bedtime": real_bedtime})
 
-    # Оцениваем разрыв
+    # ПОПРАВКА #174: Теперь спрашиваем время подъёма
+    await state.set_state(ChronotypeStates.waiting_q5)
+    await callback.message.edit_text(
+        f"⏰ Отбой: *{real_bedtime}* — записала.\n\n"
+        f"А во сколько ты *реально* обычно встаёшь?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="До 6:00", callback_data="real_wake_early"),
+             InlineKeyboardButton(text="6:00-7:00", callback_data="real_wake_normal")],
+            [InlineKeyboardButton(text="7:00-8:00", callback_data="real_wake_late"),
+             InlineKeyboardButton(text="После 8:00", callback_data="real_wake_very_late")],
+        ])
+    )
+
+
+@router.callback_query(ChronotypeStates.waiting_q5, F.data.startswith("real_wake_"))
+async def chronotype_real_waketime(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #174: Реальное время подъёма → полная картина сна."""
+    await callback.answer()
+    val = callback.data.replace("real_wake_", "")
+
+    wake_map = {
+        "early": "5:30", "normal": "6:30",
+        "late": "7:30", "very_late": "8:30",
+    }
+    real_waketime = wake_map.get(val, "7:00")
+
+    tid = callback.from_user.id
+    await save_user(tid, {"real_waketime": real_waketime})
+
     user = await get_user(tid)
     chronotype = user.get("chronotype", "pigeon")
+    real_bedtime = user.get("real_bedtime", "23:00")
+
     CHRONO_BEDTIMES = {
         "lark": "22:00", "pigeon": "22:15",
         "owl": "22:45", "night_owl": "23:30",
     }
-    target = CHRONO_BEDTIMES.get(chronotype, "22:15")
+    CHRONO_WAKETIMES = {
+        "lark": "6:00", "pigeon": "6:30",
+        "owl": "7:00", "night_owl": "7:30",
+    }
+    target_bed = CHRONO_BEDTIMES.get(chronotype, "22:15")
+    target_wake = CHRONO_WAKETIMES.get(chronotype, "6:30")
 
     def time_to_min(t):
         try:
             h, m = map(int, t.split(":"))
-            return h * 60 + m
+            return h * 60 + (m if h >= 5 else m + 24 * 60)
         except:
             return 22 * 60
 
-    diff = abs(time_to_min(real_bedtime) - time_to_min(target))
+    # Длительность сна
+    bed_min = time_to_min(real_bedtime)
+    wake_min = time_to_min(real_waketime)
+    if wake_min < bed_min:
+        wake_min += 24 * 60
+    sleep_hours = (wake_min - bed_min) / 60
 
-    if diff <= 30:
-        gap_text = "🟢 Отлично — почти совпадает с оптимальным!"
-    elif diff <= 60:
-        gap_text = f"🟡 Разрыв ~{diff} мин. Немного сдвинем."
-    elif diff <= 120:
-        gap_text = f"🟠 Разрыв ~{diff//60}ч — это социальный джетлаг.\nБудем двигаться по 15 мин в неделю."
+    # Разрыв по отбою
+    diff_bed = abs(time_to_min(real_bedtime) - time_to_min(target_bed))
+    if diff_bed <= 30:
+        bed_emoji = "🟢"
+        bed_comment = "почти совпадает с оптимальным"
+    elif diff_bed <= 60:
+        bed_emoji = "🟡"
+        bed_comment = f"сдвиг ~{diff_bed} мин"
+    elif diff_bed <= 120:
+        bed_emoji = "🟠"
+        bed_comment = f"сдвиг ~{diff_bed//60}ч — социальный джетлаг"
     else:
-        gap_text = f"🔴 Разрыв >{diff//60}ч — ритм сбит.\nЯ помогу вернуть постепенно. 💚"
+        bed_emoji = "🔴"
+        bed_comment = f"сдвиг >{diff_bed//60}ч — ритм сбит"
 
+    # Длительность
+    if sleep_hours >= 7.5:
+        dur_emoji = "🟢"
+        dur_comment = "длительность ОК"
+    elif sleep_hours >= 6:
+        dur_emoji = "🟡"
+        dur_comment = "немного мало"
+    else:
+        dur_emoji = "🔴"
+        dur_comment = "дефицит сна"
+
+    text = (
+        f"⏰ Реальный отбой: *{real_bedtime}* (оптимум {target_bed}) {bed_emoji}\n"
+        f"🌅 Реальный подъём: *{real_waketime}* (оптимум {target_wake})\n"
+        f"😴 Сон: ~{sleep_hours:.1f}ч — {dur_comment} {dur_emoji}\n\n"
+        f"{bed_emoji} {bed_comment.capitalize()}.\n"
+    )
+
+    if diff_bed > 30:
+        text += "Будем двигаться по 15 мин в неделю. Не рывком. 💚"
+
+    await state.clear()
     await callback.message.edit_text(
-        f"⏰ Реальный отбой: *{real_bedtime}*\n"
-        f"🎯 Оптимальный: *{target}*\n\n"
-        f"{gap_text}",
+        text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➡️ Продолжить", callback_data="onb_test_pause_1")]
@@ -80232,14 +80267,8 @@ async def genetics_chronotype_handler(callback: CallbackQuery):
     if chrono:
         text = get_genetic_chronotype_text(chrono)
         
-        # Добавляем глимфатику
-        glyph = get_glymphatic_risk(chrono.get("chronotype", "neutral"))
-        risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(glyph["risk"], "⚪")
-        risk_ru = {"low": "НИЗКИЙ РИСК", "medium": "УМЕРЕННЫЙ РИСК", "high": "ВЫСОКИЙ РИСК"}.get(glyph["risk"], glyph["risk"])
-        text += f"\n\n🧠 *Глимфатика:* {risk_emoji} {risk_ru}"
-        if glyph["risk"] != "low":
-            text += f"\n_{glyph['note']}_"
-            text += f"\n✅ {glyph['compensation']}"
+        # ПОПРАВКА #174: Глимфатический риск убран
+        text += f"\n✅ {glyph['compensation']}" if False else ""
         
         # Социальный джетлаг
         jetlag = await detect_social_jetlag(callback.from_user.id)

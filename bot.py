@@ -9891,7 +9891,8 @@ class AHSTestStates(StatesGroup):
     
     # БЛОК 2: Тяга к стимуляторам
     waiting_ahs5 = State()   # Кофе/кофеин
-    waiting_ahs6 = State()   # Тяга к сладкому/солёному
+    waiting_ahs6 = State()   # Тяга к сладкому
+    waiting_ahs6b = State()  # Тяга к солёному (ПОПРАВКА #174)
     waiting_ahs7 = State()   # Зависимость от стимуляторов
     
     # БЛОК 3: Реакция на стресс
@@ -21062,19 +21063,23 @@ CHRONOTYPE_QUESTIONS = {
     1: {
         "text": "Во сколько вы бы ЕСТЕСТВЕННО просыпались, если бы не было обязательств (работа, дети, будильники)?",
         "options": [
-            ("🐤 5:00-7:00", "lark"),
-            ("🕊️ 7:00-9:00", "pigeon"),
-            ("🦉 9:00-11:00", "owl"),
-            ("🦇 После 11:00", "night_owl"),
+            ("🐤 5:00-6:00", "lark"),
+            ("🕊 6:00-7:00", "pigeon"),
+            ("🕊 7:00-8:00", "pigeon"),
+            ("🦉 8:00-9:00", "owl"),
+            ("🦉 9:00-10:00", "owl"),
+            ("🦇 После 10:00", "night_owl"),
         ]
     },
     2: {
         "text": "Во сколько вы бы ЕСТЕСТВЕННО засыпали без обязательств?",
         "options": [
-            ("🐤 20:00-22:00", "lark"),
-            ("🕊️ 22:00-00:00", "pigeon"),
-            ("🦉 00:00-02:00", "owl"),
-            ("🦇 После 02:00", "night_owl"),
+            ("🐤 До 21:00", "lark"),
+            ("🕊 21:00-22:00", "pigeon"),
+            ("🕊 22:00-23:00", "pigeon"),
+            ("🦉 23:00-00:00", "owl"),
+            ("🦉 00:00-01:00", "owl"),
+            ("🦇 После 01:00", "night_owl"),
         ]
     },
     3: {
@@ -34225,7 +34230,7 @@ async def finish_mini_test(callback: CallbackQuery, state: FSMContext, answers: 
     def get_ahs_level(score):
         if score <= 4: return "🟢 Надпочечники в норме"
         elif score <= 8: return "🟡 Лёгкое утомление"
-        elif score <= 12: return "🟠 Умеренное истощение"
+        elif score <= 11: return "🟠 Умеренное истощение"
         else: return "🔴 Сильное истощение"
     
     def get_circ_level(score):
@@ -55377,7 +55382,7 @@ async def onb_step1_complete(callback: CallbackQuery, state: FSMContext):
     def circ_lvl(s):
         if s >= 45: return "🟢 отличный"
         elif s >= 30: return "🟡 умеренный"
-        elif s >= 15: return "🟠 сниженный"
+        elif s >= 20: return "🟠 сниженный"
         else: return "🔴 критический"
     
     # Сообщение 1: Результаты
@@ -57677,7 +57682,7 @@ async def chronotype_q3(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.callback_query(ChronotypeStates.waiting_q4, F.data.startswith("real_bed_"))
+@router.callback_query(F.data.startswith("real_bed_"))
 async def chronotype_real_bedtime(callback: CallbackQuery, state: FSMContext):
     """ПОПРАВКА #171: Реальное время отбоя → вопрос про подъём."""
     await callback.answer()
@@ -57707,7 +57712,7 @@ async def chronotype_real_bedtime(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.callback_query(ChronotypeStates.waiting_q5, F.data.startswith("real_wake_"))
+@router.callback_query(F.data.startswith("real_wake_"))
 async def chronotype_real_waketime(callback: CallbackQuery, state: FSMContext):
     """ПОПРАВКА #174: Реальное время подъёма → полная картина сна."""
     await callback.answer()
@@ -58232,7 +58237,7 @@ async def circadian_answer_universal(callback: CallbackQuery, state: FSMContext)
     elif circ_score >= 30:
         status_emoji = "🟡"
         level = "умеренный"
-    elif circ_score >= 15:
+    elif circ_score >= 20:
         status_emoji = "🟠"
         level = "сниженный"
     else:
@@ -74187,13 +74192,21 @@ def get_ahs_keyboard(question_num: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="☕☕ 3+ чашки, иначе не работаю", callback_data="ahs_q5_3")],
             [InlineKeyboardButton(text="💀 Кофе уже не помогает", callback_data="ahs_q5_4")]
         ]
-    elif question_num == 6:  # Тяга к сладкому — шкала интенсивности
+    elif question_num == 6:  # Тяга к сладкому
         buttons = [
             [InlineKeyboardButton(text="✅ Нет тяги", callback_data="ahs_q6_0")],
             [InlineKeyboardButton(text="🍪 Иногда хочется, легко отказаться", callback_data="ahs_q6_1")],
             [InlineKeyboardButton(text="🍫 Регулярно тянет", callback_data="ahs_q6_2")],
             [InlineKeyboardButton(text="🍫 Каждый день, трудно устоять", callback_data="ahs_q6_3")],
-            [InlineKeyboardButton(text="🍫🍫 Не могу без сладкого/солёного", callback_data="ahs_q6_4")]
+            [InlineKeyboardButton(text="🍫🍫 Не могу без сладкого", callback_data="ahs_q6_4")]
+        ]
+    elif question_num == '6b':  # Тяга к солёному (ПОПРАВКА #174)
+        buttons = [
+            [InlineKeyboardButton(text="✅ Нет тяги к солёному", callback_data="ahs_q6b_0")],
+            [InlineKeyboardButton(text="🧂 Иногда хочется, легко отказаться", callback_data="ahs_q6b_1")],
+            [InlineKeyboardButton(text="🧂 Регулярно тянет на солёное", callback_data="ahs_q6b_2")],
+            [InlineKeyboardButton(text="🧂 Каждый день, трудно устоять", callback_data="ahs_q6b_3")],
+            [InlineKeyboardButton(text="🧂🧂 Не могу без солёного", callback_data="ahs_q6b_4")]
         ]
     elif question_num == 7:  # Зависимость от стимуляторов — градация
         buttons = [
@@ -74268,12 +74281,18 @@ AHS_QUESTIONS = {
         'block': 'stimulants'
     },
     6: {
-        'text': '🍬 *Вопрос 6/12 — БЛОК: СТИМУЛЯТОРЫ*\n\n'
-                'Испытываете ли вы тягу к сладкому или солёному?',
+        'text': '🍬 *Вопрос 6/13 — БЛОК: СТИМУЛЯТОРЫ*\n\n'
+                'Испытываете ли вы тягу к *сладкому*?',
+        'block': 'stimulants'
+    },
+    '6b': {
+        'text': '🧂 *Вопрос 7/13 — БЛОК: СТИМУЛЯТОРЫ*\n\n'
+                'Испытываете ли вы тягу к *солёному*?\n'
+                '_Тяга к солёному — маркер надпочечников (альдостерон ↓)_',
         'block': 'stimulants'
     },
     7: {
-        'text': '⚡ *Вопрос 7/12 — БЛОК: СТИМУЛЯТОРЫ*\n\n'
+        'text': '⚡ *Вопрос 8/13 — БЛОК: СТИМУЛЯТОРЫ*\n\n'
                 'Чувствуете ли зависимость от стимуляторов (кофе, энергетики, никотин)?',
         'block': 'stimulants'
     },
@@ -74458,6 +74477,23 @@ async def ahs_q5_handler(callback: CallbackQuery, state: FSMContext):
 async def ahs_q6_handler(callback: CallbackQuery, state: FSMContext):
     score = int(callback.data.split("_")[-1])
     await state.update_data(ahs6=score)
+    # ПОПРАВКА #174: После сладкого — спрашиваем солёное
+    await callback.message.edit_text(AHS_QUESTIONS['6b']['text'], parse_mode="Markdown", reply_markup=get_ahs_keyboard('6b'))
+    await state.set_state(AHSTestStates.waiting_ahs6b)
+
+
+@router.callback_query(F.data.startswith("ahs_q6b_"))
+async def ahs_q6b_handler(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #174: Тяга к солёному — маркер альдостерона."""
+    score = int(callback.data.split("_")[-1])
+    await state.update_data(ahs6b=score)
+
+    # Диагностика: если только солёное >= 2 — маркер надпочечников
+    data = await state.get_data()
+    ahs6_sweet = data.get('ahs6', 0)
+    if score >= 2 and ahs6_sweet <= 1:
+        await callback.answer("🧂 Тяга к солёному — маркер надпочечников. Записала!", show_alert=False)
+
     await callback.message.edit_text(AHS_QUESTIONS[7]['text'], parse_mode="Markdown", reply_markup=get_ahs_keyboard(7))
     await state.set_state(AHSTestStates.waiting_ahs7)
 

@@ -2846,6 +2846,10 @@ async def init_db():
             ('hrv_patterns_unlocked', 'INTEGER DEFAULT 0'),
             ('hrv_patterns_last_shown', 'TEXT'),
             ('bgs_remind_later_date', 'TEXT'),
+            # ПОПРАВКА #174: время отбоя/подъёма + тяга к солёному
+            ('real_bedtime', 'TEXT'),
+            ('real_waketime', 'TEXT'),
+            ('ahs6b', 'INTEGER DEFAULT 0'),
         ]:
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")

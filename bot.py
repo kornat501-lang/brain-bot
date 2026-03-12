@@ -279,6 +279,13 @@ async def init_db():
                 -- ПОПРАВКА #108: Травма
                 has_war_trauma INTEGER DEFAULT 0,
                 
+                -- ПОПРАВКА #171v2: реальное время сна + семья
+                real_bedtime TEXT,
+                real_waketime TEXT,
+                ahs6b INTEGER DEFAULT 0,
+                family_atmosphere TEXT,
+                support_person TEXT,
+                
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -2850,6 +2857,9 @@ async def init_db():
             ('real_bedtime', 'TEXT'),
             ('real_waketime', 'TEXT'),
             ('ahs6b', 'INTEGER DEFAULT 0'),
+            # ПОПРАВКА #171v2: атмосфера дома и поддержка
+            ('family_atmosphere', 'TEXT'),
+            ('support_person', 'TEXT'),
         ]:
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
@@ -9777,7 +9787,9 @@ class LifeEventsStates(StatesGroup):
     waiting_events = State()      # Выбор событий (множественный)
     waiting_when = State()        # Когда произошло
     waiting_emotional = State()   # Эмоциональное состояние
-    waiting_caregiver = State()   # ПОПРАВКА #76: Уход за другими
+    waiting_caregiver = State()       # ПОПРАВКА #76: Уход за другими
+    waiting_family_atmosphere = State()  # ПОПРАВКА #171v2: Атмосфера дома
+    waiting_support_person = State()     # ПОПРАВКА #171v2: Поддержка
 
 
 class StressStates(StatesGroup):
@@ -23692,7 +23704,7 @@ async def collect_cri_data(telegram_id: int) -> dict:
                     (telegram_id,)
                 )
                 row2 = await cursor2.fetchone()
-                data['pss_score'] = round(row2['pss4_score'] * 2.5) if row2 else 20
+                data['pss_score'] = 0  # ПОПРАВКА #171v2: мини-тест убран, нет данных
     except:
         data['pss_score'] = 20
     
@@ -23714,7 +23726,7 @@ async def collect_cri_data(telegram_id: int) -> dict:
                     (telegram_id,)
                 )
                 row2 = await cursor2.fetchone()
-                data['gad2_score'] = round(row2['gad2_score'] * 3.5) if row2 else 3
+                data['gad2_score'] = 0  # ПОПРАВКА #171v2: мини-тест убран, нет данных
     except:
         data['gad2_score'] = 3
     
@@ -33931,9 +33943,10 @@ MINI_TEST_QUESTIONS = {
         "options": [
             ("🌑 Нет, в комнате темно", "mq16_0", 0),
             ("💡 Только искусственный свет", "mq16_1", 1),
-            ("🌤 Иногда выхожу на улицу", "mq16_2", 2),
-            ("☀️ Да, стараюсь выходить на свет", "mq16_3", 3),
-            ("🌞 Всегда, это привычка!", "mq16_4", 4),
+            ("🪟 Открываю шторы / стою у окна", "mq16_2", 2),
+            ("🌤 Иногда выхожу на улицу", "mq16_3", 3),
+            ("☀️ Да, стараюсь выходить на свет", "mq16_4", 4),
+            ("🌞 Всегда, это привычка!", "mq16_5", 5),
         ],
         "field": "circ_m1"
     },
@@ -37805,9 +37818,16 @@ async def process_fog(callback: CallbackQuery, state: FSMContext):
 
 # ── ОНБОРДИНГ 2.0: Мост к наследственности из нового флоу ──
 
+@router.callback_query(F.data == "heredity_to_life_events")
+async def heredity_to_life_events(callback: CallbackQuery, state: FSMContext):
+    """После наследственности → жизненные обстоятельства (мужчины / 60+)"""
+    await callback.answer()
+    await show_life_events_screen(callback, state)
+
+
+@router.callback_query(F.data == "onb_heredity_start")
 @router.callback_query(F.data == "onb_heredity_start")
 async def onb_heredity_start(callback: CallbackQuery, state: FSMContext):
-    """Наследственность: из Недели 2 (standalone) или legacy онбординг"""
     await callback.answer()
     
     # Определяем: это standalone (Неделя 2) или legacy онбординг?
@@ -37872,12 +37892,36 @@ async def start_heredity(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(OnboardingStates.waiting_h1, F.data.startswith("h1_"))
 async def process_h1(callback: CallbackQuery, state: FSMContext):
-    """H1: Деменция → H2: ССЗ"""
+    """H1: Деменция → объяснение → H2: ССЗ"""
     await callback.answer()
     h1 = callback.data.replace("h1_", "")
     await state.update_data(h1_dementia=h1)
-    
+
+    if h1 in ("parent", "multiple"):
+        comment = (
+            "🔴 Ген APOE4 мог передаться.\n\n"
+            "Но это не приговор — сон, движение и питание\n"
+            "снижают риск нейродегенерации на 40-60%.\n"
+            "Образ жизни может остановить процесс\n"
+            "и не дать «плохим» генам включиться.\n\n"
+            "Я учту это в протоколах с первого дня. 💚"
+        )
+    elif h1 in ("grandparent", "other"):
+        comment = (
+            "🟡 Умеренный наследственный фон.\n\n"
+            "Профилактика через образ жизни работает\n"
+            "очень хорошо на этом уровне риска. Учту. 💚"
+        )
+    elif h1 == "no":
+        comment = (
+            "🟢 Нагрузки по нейродегенерации нет.\n"
+            "Хорошая база — продолжаем. 💚"
+        )
+    else:
+        comment = "Хорошо, идём дальше. 💚"
+
     await callback.message.edit_text(
+        f"{comment}\n\n"
         "❤️ *Вопрос 2 из 6*\n\n"
         "Были ли у близких родственников\n"
         "проблемы с сердцем или сосудами *до 60 лет*?\n\n"
@@ -37895,12 +37939,35 @@ async def process_h1(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(OnboardingStates.waiting_h2, F.data.startswith("h2_"))
 async def process_h2(callback: CallbackQuery, state: FSMContext):
-    """H2: ССЗ → H3: Диабет"""
+    """H2: ССЗ → объяснение → H3: Диабет"""
     await callback.answer()
     h2 = callback.data.replace("h2_", "")
     await state.update_data(h2_cvd=h2)
-    
+
+    if h2 == "multiple":
+        comment = (
+            "🔴 Возможна семейная предрасположенность к ССЗ.\n\n"
+            "Но образ жизни влияет на экспрессию этих генов\n"
+            "на 60-70%. Контроль воспаления, давления\n"
+            "и режим сна — твои главные инструменты.\n\n"
+            "Выстроим правильный образ жизни — процесс\n"
+            "можно остановить. Учту в протоколах. 💚"
+        )
+    elif h2 == "one":
+        comment = (
+            "🟡 Есть наследственный фактор по сердцу.\n"
+            "Следим за воспалением и давлением. Учту. 💚"
+        )
+    elif h2 == "no":
+        comment = (
+            "🟢 Сердечно-сосудистый фон чистый.\n"
+            "Отличная база — продолжаем. 💚"
+        )
+    else:
+        comment = "Хорошо, идём дальше. 💚"
+
     await callback.message.edit_text(
+        f"{comment}\n\n"
         "🍬 *Вопрос 3 из 6*\n\n"
         "Есть ли диабет у близких родственников?",
         parse_mode="Markdown",
@@ -37917,12 +37984,34 @@ async def process_h2(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(OnboardingStates.waiting_h3, F.data.startswith("h3_"))
 async def process_h3(callback: CallbackQuery, state: FSMContext):
-    """H3: Диабет → H4: Ментальное здоровье"""
+    """H3: Диабет → объяснение → H4: Ментальное здоровье"""
     await callback.answer()
     h3 = callback.data.replace("h3_", "")
     await state.update_data(h3_diabetes=h3)
-    
+
+    if h3 in ("type2", "unknown_type"):
+        comment = (
+            "🔴 Инсулинорезистентность может передаваться.\n\n"
+            "Но образ жизни влияет на экспрессию этих генов\n"
+            "на 60-70%. Режим питания, движение и сон —\n"
+            "ключевые инструменты чтобы остановить процесс.\n\n"
+            "Я учту это в протоколах с первого дня. 💚"
+        )
+    elif h3 == "type1":
+        comment = (
+            "🟡 Диабет 1 типа — другой механизм (аутоиммунный).\n"
+            "Учту в рекомендациях. 💚"
+        )
+    elif h3 == "no":
+        comment = (
+            "🟢 Метаболический фон хороший.\n"
+            "Продолжаем. 💚"
+        )
+    else:
+        comment = "Хорошо, идём дальше. 💚"
+
     await callback.message.edit_text(
+        f"{comment}\n\n"
         "😔 *Вопрос 4 из 6*\n\n"
         "Были ли у близких родственников\n"
         "депрессия, тревожные расстройства,\n"
@@ -37940,12 +38029,35 @@ async def process_h3(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(OnboardingStates.waiting_h4, F.data.startswith("h4_"))
 async def process_h4(callback: CallbackQuery, state: FSMContext):
-    """H4: Ментальное → H5: Долгожители"""
+    """H4: Ментальное → объяснение → H5: Долгожители"""
     await callback.answer()
     h4 = callback.data.replace("h4_", "")
     await state.update_data(h4_mental=h4)
-    
+
+    if h4 == "multiple":
+        comment = (
+            "🔴 Нейрохимический фон может передаваться.\n\n"
+            "Но образ жизни влияет на экспрессию этих генов\n"
+            "на 60-70%. Стресс-протоколы, сон и режим дня —\n"
+            "твои главные инструменты чтобы остановить\n"
+            "процесс и не дать «плохим» генам включиться.\n\n"
+            "Я учту это в протоколах с первого дня. 💚"
+        )
+    elif h4 == "one":
+        comment = (
+            "🟡 Умеренный ментальный фактор.\n"
+            "Учту в рекомендациях по стрессу и сну. 💚"
+        )
+    elif h4 == "no":
+        comment = (
+            "🟢 Ментальный фон чистый.\n"
+            "Хорошая база — продолжаем. 💚"
+        )
+    else:
+        comment = "Хорошо, идём дальше. 💚"
+
     await callback.message.edit_text(
+        f"{comment}\n\n"
         "🎂 *Вопрос 5 из 6*\n\n"
         "Есть ли в вашей семье долгожители\n"
         "(85+ лет) с сохранным умом?",
@@ -37962,13 +38074,34 @@ async def process_h4(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(OnboardingStates.waiting_h5, F.data.startswith("h5_"))
 async def process_h5(callback: CallbackQuery, state: FSMContext):
-    """H5: Долгожители → H6: Онкология"""
+    """H5: Долгожители → объяснение → H6: Онкология"""
     await callback.answer()
     h5 = callback.data.replace("h5_", "")
     await state.update_data(h5_longevity=h5)
-    
+
+    if h5 == "multiple":
+        comment = (
+            "🟢🟢 Гены долголетия в роду!\n\n"
+            "Это отличная база — у тебя есть\n"
+            "биологический потенциал для долгой\n"
+            "и здоровой жизни. Раскроем его вместе. 💚"
+        )
+    elif h5 == "one":
+        comment = (
+            "🟢 Долгожитель в семье — очень хороший знак.\n"
+            "Этот потенциал есть и в тебе. 💚"
+        )
+    elif h5 == "no":
+        comment = (
+            "Нейтральный фон — продолжаем.\n"
+            "Образ жизни важнее генов. 💚"
+        )
+    else:
+        comment = "Хорошо, идём дальше. 💚"
+
     await callback.message.edit_text(
-        "🎗️ *Вопрос 6 из 6*\n\n"
+        f"{comment}\n\n"
+        "🎗 *Вопрос 6 из 6*\n\n"
         "Были ли онкологические заболевания\n"
         "у близких родственников?",
         parse_mode="Markdown",
@@ -37986,10 +38119,40 @@ async def process_h5(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(OnboardingStates.waiting_h6, F.data.startswith("h6_"))
 async def process_h6(callback: CallbackQuery, state: FSMContext):
-    """H6: Онкология → Завершение наследственности"""
+    """H6: Онкология → объяснение → Завершение наследственности"""
     await callback.answer()
     h6 = callback.data.replace("h6_", "")
     await state.update_data(h6_cancer=h6)
+
+    if h6 in ("before_50", "multiple"):
+        h6_comment = (
+            "🔴 Ранний онкологический анамнез в семье.\n"
+            "Механизм репарации ДНК мог передаться.\n\n"
+            "Но это не приговор — образ жизни влияет\n"
+            "на экспрессию генов на 60-70%.\n"
+            "Правильный режим может остановить процесс\n"
+            "и не дать «плохим» генам включиться.\n\n"
+            "Я учту это в протоколах с первого дня. 💚"
+        )
+    elif h6 == "50_65":
+        h6_comment = (
+            "🟡 Есть наследственный фактор.\n\n"
+            "Образ жизни решает — учту в рекомендациях\n"
+            "по питанию и протоколам защиты. 💚"
+        )
+    elif h6 == "after_65":
+        h6_comment = (
+            "🟡 Онкология в позднем возрасте —\n"
+            "во многом естественный процесс старения.\n"
+            "Небольшой фактор, держим в виду. 💚"
+        )
+    elif h6 == "no":
+        h6_comment = (
+            "🟢 Онкологической нагрузки в роду нет.\n"
+            "Хорошая база для профилактики. 💚"
+        )
+    else:
+        h6_comment = "Хорошо, записала. 💚"
     
     # Получаем данные и рассчитываем риски
     data = await state.get_data()
@@ -38022,6 +38185,7 @@ async def process_h6(callback: CallbackQuery, state: FSMContext):
         if gender == "female" and age_group not in ("60-69", "70+"):
             await state.set_state(OnboardingStates.waiting_cycle)
             await callback.message.edit_text(
+                f"{h6_comment}\n\n"
                 "Хотите учитывать менструальный цикл?\n\n"
                 "💡 _Для женщин это важно: HRV, энергия\n"
                 "и настроение значительно меняются в разные\n"
@@ -38036,7 +38200,13 @@ async def process_h6(callback: CallbackQuery, state: FSMContext):
                 ])
             )
         else:
-            await show_life_events_screen(callback, state)
+            await callback.message.edit_text(
+                f"{h6_comment}\n\n➡️ Продолжаем.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="➡️ Продолжить", callback_data="heredity_to_life_events")]
+                ])
+            )
     else:
         # Standalone путь (Неделя 2) — пересчёт + уведомление
         user = await get_user(callback.from_user.id)
@@ -55087,10 +55257,81 @@ async def life_events_caregiver_finish(callback: CallbackQuery, state: FSMContex
 
 
 # ═══════════════════════════════════════════════════════════════
-# ОНБОРДИНГ 2.0 — БЫСТРАЯ ОЦЕНКА (10/10) + ПЕРЕХОД К ТЕСТАМ
+# ПОПРАВКА #171v2: Атмосфера дома + Поддержка
 # ═══════════════════════════════════════════════════════════════
 
 @router.callback_query(F.data == "onb_quick_assess")
+async def onb_family_atmosphere(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #171v2: Атмосфера дома — новый вопрос после caregiver"""
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    name = user.get("name", "друг") if user else "друг"
+
+    await callback.message.edit_text(
+        f"💚 *{name}, последние два вопроса о твоей жизни.*\n\n"
+        "Как бы ты описала атмосферу дома?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💚 Тёплая, поддерживающая", callback_data="fatm_warm")],
+            [InlineKeyboardButton(text="🙂 Спокойная, дружелюбная", callback_data="fatm_calm")],
+            [InlineKeyboardButton(text="😐 Каждый сам по себе", callback_data="fatm_cold")],
+            [InlineKeyboardButton(text="😤 Бывает напряжённо", callback_data="fatm_tense")],
+            [InlineKeyboardButton(text="🔴 Постоянные конфликты", callback_data="fatm_toxic")],
+        ])
+    )
+    await state.set_state(LifeEventsStates.waiting_family_atmosphere)
+
+
+@router.callback_query(LifeEventsStates.waiting_family_atmosphere, F.data.startswith("fatm_"))
+async def onb_support_person(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #171v2: Поддержка — второй вопрос"""
+    await callback.answer()
+    val = callback.data.replace("fatm_", "")
+    await state.update_data(family_atmosphere=val)
+    await save_user(callback.from_user.id, {"family_atmosphere": val})
+
+    await callback.message.edit_text(
+        "💬 Есть человек, с которым можно поговорить о переживаниях?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Да, всегда", callback_data="sup_always")],
+            [InlineKeyboardButton(text="Иногда", callback_data="sup_sometimes")],
+            [InlineKeyboardButton(text="Редко", callback_data="sup_rarely")],
+            [InlineKeyboardButton(text="Нет, не с кем", callback_data="sup_nobody")],
+        ])
+    )
+    await state.set_state(LifeEventsStates.waiting_support_person)
+
+
+@router.callback_query(LifeEventsStates.waiting_support_person, F.data.startswith("sup_"))
+async def onb_after_support(callback: CallbackQuery, state: FSMContext):
+    """ПОПРАВКА #171v2: После поддержки → быстрая оценка"""
+    await callback.answer()
+    val = callback.data.replace("sup_", "")
+    await state.update_data(support_person=val)
+    await save_user(callback.from_user.id, {"support_person": val})
+
+    # Красный флаг: toxic + nobody → мягкое слово
+    data = await state.get_data()
+    family = data.get("family_atmosphere", "calm")
+
+    if family == "toxic" and val == "nobody":
+        extra = "\n\n💚 Ты справляешься с этим одна — это требует сил. Я учту это."
+    elif family == "warm" and val in ("always", "sometimes"):
+        extra = "\n\n💚 Хорошая поддержка дома — это ресурс. Это важно."
+    else:
+        extra = ""
+
+    await callback.message.edit_text(
+        f"Записала.{extra}\n\nТеперь — быстрая оценка состояния.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Продолжить", callback_data="onb_quick_assess_go")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "onb_quick_assess_go")
 async def onb_quick_assess_start(callback: CallbackQuery, state: FSMContext):
     """ОНБОРДИНГ 2.0: Быстрая оценка — Энергия (1/4)"""
     await callback.answer()
@@ -57432,7 +57673,8 @@ CIRCADIAN_QUESTIONS = {
         "options": [
             ("Да, каждый день (прогулка/лайтбокс)", 0),
             ("Большинство дней (5-6 из 7)", 1),
-            ("3-4 дня в неделю", 2),
+            ("🪟 Открываю шторы / стою у окна", 2),
+            ("3-4 дня в неделю", 3),
             ("1-2 дня в неделю", 4),
             ("Нет, сразу в помещение", 5),
         ]

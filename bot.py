@@ -4733,7 +4733,7 @@ PRACTICE_CARDS_HANDLERS = {
             "6. Вокруг глаз (нежно!) → к вискам × 5\n"
             "7. Снова ключицы — 10 кругов\n\n"
             "💡 Убирает отёки, улучшает цвет лица.\n"
-            "Активирует глимфатику — выведение токсинов из мозга."
+            "Запускает очистку мозга от токсинов во сне."
         ),
     },
     # ── ПРОТОКОЛЫ ──
@@ -5491,7 +5491,7 @@ PRACTICE_TAGS["energy_morning_combo"] = {"comt_type": "all", "time_of_day": "mor
 # ═══════════════════════════════════════════════════════════════
 
 GENE_PRACTICE_BOOST = {
-    # CRH AA → HPA-ось перегрета → успокоительные дыхательные практики
+    # CRH AA → гормоны стресса перегрета → успокоительные дыхательные практики
     ("crh", "AA"): {
         "practices": [
             "resonant_breathing", "resonant_6bpm", "coherent_breathing",
@@ -7563,7 +7563,7 @@ async def check_test_availability(telegram_id: int, test_type: str) -> dict:
         return {
             'available': False,
             'status': 'locked',
-            'message': f"🔒 Откроется через {sub['days_until_tests']} дней",
+            'message': f"🔒 Тест пока недоступен",
             'days_until': sub['days_until_tests'],
             'open_date': sub.get('tests_open_date')
         }
@@ -11439,7 +11439,7 @@ GENETICS_GLOBAL_MODIFIERS = {
 НО это НЕ приговор — профилактика работает!
 
 **Ваши приоритеты:**
-• СОН — критически важен (глимфатика!)
+• СОН — критически важен (мозг очищается только во сне!)
 • Омега-3 — высокие дозы (2-3г EPA+DHA)
 • Когнитивный трекер — отслеживайте регулярно
 • Физическая активность — обязательно
@@ -12310,7 +12310,7 @@ CORRECTION_MESSAGES = {
 В субботу и воскресенье вы легли/встали 
 значительно позже цели.
 
-Это называется "социальный джетлаг" — 
+Это сбивает ваши внутренние часы — 
 как если бы вы слетали в другой часовой пояс.
 
 ⚠️ Последствия:
@@ -14549,7 +14549,7 @@ async def send_morning_reminders():
                             chat_id=tid, text=plan_msg, parse_mode="Markdown",
                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                 [InlineKeyboardButton(text="🗺️ Мой маршрут", callback_data="roadmap_menu")],
-                                [InlineKeyboardButton(text="▶️ Утренний чек-ин", callback_data="morning_checkin")],
+                                [InlineKeyboardButton(text="☀️ Доброе утро!", callback_data="morning_checkin")],
                             ])
                         )
                         print(f"✅ Понедельный план маршрута: {tid}")
@@ -14675,7 +14675,7 @@ async def send_morning_reminders():
                     msg = await bot.send_message(
                         chat_id=tid,
                         text=f"🌅 Доброе утро, {name}!\n\n"
-                             f"Ты вчера не заполнила вечерний чекин.\n"
+                             f"Вчера не успела ответить вечером?\n"
                              f"Давай быстро вспомним:\n\n"
                              f"🕐 Во сколько ты легла?",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -14697,7 +14697,7 @@ async def send_morning_reminders():
                     msg = await bot.send_message(
                         chat_id=tid,
                         text=f"🌅 Доброе утро, {name}!\n\n"
-                             f"Вижу, вчера вечерний чек-ин не прошли.\n"
+                             f"Вчера пропустили вечерний опрос.\n"
                              f"Быстро за минуту — 5 вопросов?\n\n"
                              f"_(Это поможет точнее отслеживать динамику)_",
                         parse_mode="Markdown",
@@ -14710,11 +14710,10 @@ async def send_morning_reminders():
                 msg = await bot.send_message(
                     chat_id=tid,
                     text=f"🌅 Доброе утро, {name}!\n\n"
-                         f"Время утреннего чек-ина.\n"
-                         f"Как прошла ночь?\n\n"
+                         f"Как спала? Пара вопросов — 12 секунд.\n\n"
                          f"💡 Не забудьте измерить HRV!",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="▶️ Начать чек-ин", callback_data="morning_checkin")],
+                        [InlineKeyboardButton(text="☀️ Ответить", callback_data="morning_checkin")],
                         [InlineKeyboardButton(text="❤️ Добавить HRV", callback_data="hrv_add")]
                     ])
                 )
@@ -14831,7 +14830,7 @@ async def send_evening_reminders():
                     name = user.get("name", "друг")
                     await bot.send_message(
                         chat_id=tid,
-                        text=f"🌙 {name}, ты начала вечерний чекин.\nПродолжим?",
+                        text=f"🌙 {name}, ты начала вечерний опрос.\nПродолжим?",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                             [InlineKeyboardButton(text="▶️ Продолжить", callback_data="evening_continue_after_stress")],
                             [InlineKeyboardButton(text="🔄 Начать заново", callback_data="evening_checkin")],
@@ -14857,10 +14856,9 @@ async def send_evening_reminders():
             msg = await bot.send_message(
                 chat_id=user["telegram_id"],
                 text=f"🌙 Добрый вечер, {name}!\n\n"
-                     f"Время вечернего чек-ина.\n"
                      f"Как прошёл день?",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="▶️ Начать чек-ин", callback_data="evening_checkin")]
+                    [InlineKeyboardButton(text="🌙 Ответить", callback_data="evening_checkin")]
                 ])
             )
             # ПОПРАВКА #139: Сохраняем ID для удаления если не ответят
@@ -15121,12 +15119,12 @@ async def send_ahs_reminders():
                 if last_ahs:
                     text = (f"⚡ {name}, прошёл месяц!\n\n"
                             f"Пора пройти тест БГС (Баланс Гормонов Стресса).\n"
-                            f"Это поможет отследить состояние вашей HPA-оси.\n\n"
+                            f"Это поможет отследить уровень гормонов стресса.\n\n"
                             f"Займёт 3-5 минут.")
                 else:
                     text = (f"⚡ {name}, пройдите тест БГС!\n\n"
                             f"Тест покажет:\n"
-                            f"• Состояние HPA-оси (гормоны стресса)\n"
+                            f"• Гормоны стресса\n"
                             f"• Стадию дисфункции (если есть)\n"
                             f"• Персональный протокол восстановления\n\n"
                             f"Займёт 3-5 минут.")
@@ -17698,7 +17696,7 @@ def generate_genetic_recommendations(genetics: dict) -> list:
              "description": "Снижает кортизол после стресса на 20%"},
             {"category": "lifestyle", "priority": "critical", "gene": "CRH AA",
              "title": "Избегать хронического стресса", "dosage": "",
-             "description": "Ваша HPA-ось особенно чувствительна"},
+             "description": "Ваша гормоны стресса особенно чувствительна"},
             {"category": "lifestyle", "priority": "critical", "gene": "CRH AA",
              "title": "Резонансное дыхание 6/мин", "dosage": "ежедневно 10 мин",
              "description": "ОБЯЗАТЕЛЬНО! Лучшая HPA-регуляция"},
@@ -17952,7 +17950,7 @@ GENE_PROTOCOL_META = {
     },
     "CRH AA": {
         "cost": "$50-70/мес",
-        "timeline": "1-2 недели → кортизол ↓; 4-6 недель → HPA-ось стабильна",
+        "timeline": "1-2 недели → кортизол ↓; 4-6 недель → гормоны стресса стабильна",
         "biomarkers": "Кортизол утро, Кортизол вечер, DHEA-S",
         "avoid": ["Хронический стресс", "Випассана/интенсивные ретриты",
                   "Недосып <6 часов"],
@@ -19667,7 +19665,7 @@ async def get_personalized_protocol(telegram_id: int) -> dict:
         # APOE e4
         apoe = genetics.get("apoe") or ""
         if "e4" in apoe:
-            protocol["priorities"].append("Сон — критический приоритет (глимфатика)")
+            protocol["priorities"].append("Сон — критический приоритет (очистка мозга)")
             protocol["priorities"].append("Когнитивный трекер — регулярно")
             protocol["supplements"].append("Омега-3 высокие дозы (2-3г)")
     
@@ -20309,7 +20307,7 @@ def get_childhood_anxiety_text(user_data: dict, name: str) -> str:
 Стресс в детстве (даже "обычный" — 
 холодность родителей, конфликты, давление)
 → надпочечники истощились рано
-→ HPA-ось сформировалась "на взводе"
+→ гормоны стресса сформировалась "на взводе"
 
 С тех пор тело живёт в режиме "опасность".
 
@@ -24669,7 +24667,7 @@ def get_cortisol_belly_block() -> str:
 
 Что делаем:
 • Снижаем стресс (ванны, дыхание, магний)
-• Восстанавливаем HPA-ось
+• Восстанавливаем гормоны стресса
 • Жир на животе начнёт уходить сам"""
 
 
@@ -25331,7 +25329,7 @@ SYNDROME_PROTOCOLS = {
         },
         'LEVEL_2': {
             'weeks': '5-8',
-            'goal': 'Восстановление HPA-оси',
+            'goal': 'Восстановление гормонов стресса',
             'criteria': 'Тревога снизилась, сон нормализовался',
             'supplements': [
                 {'name': 'Rhodiola Rosea', 'dose': '200 mg', 'time': 'Утро', 'reason': 'Адаптоген после стабилизации'},
@@ -27858,7 +27856,7 @@ def get_day_menu_keyboard(checkin_trial_active: bool = True):
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=morning_text, callback_data="morning_checkin")],
-        [InlineKeyboardButton(text="☀️ Дневной чек-ин", callback_data="day_checkin")],
+        [InlineKeyboardButton(text="🌤 Как ты сейчас?", callback_data="day_checkin")],
         [InlineKeyboardButton(text=evening_text, callback_data="evening_checkin")],
         [InlineKeyboardButton(text="📋 Мои задания", callback_data="my_tasks")],
         [
@@ -30073,25 +30071,15 @@ async def cmd_start(message: Message, state: FSMContext):
     else:
         await message.answer(
             "🌅 Привет! Я — Аврора.\n\n"
-            "Ваш персональный детектив здоровья.\n\n"
-            "Я — не трекер привычек и не напоминалка "
-            "\"выпей воду\". Таких тысячи.\n\n"
-            "Я другое. Я каждый день наблюдаю за вами — "
-            "сон, энергия, стресс, настроение, давление — "
-            "и СВЯЗЫВАЮ в картину, "
-            "которую вы сами не видите:\n\n"
-            "   🔍 \"Голова болит? Смотрю вчерашние данные:\n"
-            "   легла в час, экраны до полуночи,\n"
-            "   стресс 8, 26-й день цикла.\n"
-            "   Всё совпало. Вот что делать прямо сейчас.\"\n\n"
-            "   🔍 \"Тянет на сладкое без стресса +\n"
-            "   сонливость + перепады настроения =\n"
-            "   через 1-2 дня может быть мигрень.\n"
-            "   Магний прямо сейчас.\"\n\n"
-            "Ни один врач не знает, во сколько "
-            "вы легли, что ели, какой день цикла. "
-            "Он видит вас 15 минут раз в полгода.\n\n"
-            "Я вижу вас каждый день.",
+            "Устаёшь, но не высыпаешься?\n"
+            "Тянет на сладкое, а живот растёт?\n"
+            "Голова как в тумане?\n"
+            "Тревога без причины?\n"
+            "Всем говоришь «всё нормально»?\n\n"
+            "А что если это не 5 разных проблем —\n"
+            "а одна цепочка?\n\n"
+            "Я нахожу связи, которые ты не видишь.\n"
+            "И показываю — на твоих данных.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Дальше →", callback_data="onb_welcome_2")]
             ])
@@ -30129,24 +30117,30 @@ async def onb_welcome_2(callback: CallbackQuery):
 async def onb_welcome_3(callback: CallbackQuery):
     """ОНБОРДИНГ 2.0 — Экран 3: Что делает бот"""
     await callback.answer()
+    # Гендерная адаптация "спала/спал"
+    user = await get_user(callback.from_user.id)
+    gender = user.get("gender", "") if user else ""
+    slept = "спал?" if gender == "male" else "спала?"
+
     await callback.message.edit_text(
-        "⚙️ Как это работает:\n\n"
-        "Каждый день — 3 коротких чек-ина "
-        "(утро, день, вечер). По 2-3 минуты.\n\n"
-        "На основе ваших ответов я:\n\n"
-        "🔍 Нахожу связи между сном, стрессом,\n"
-        "   питанием, циклом и самочувствием\n\n"
-        "🎯 Даю персональные практики —\n"
-        "   конкретно под ваше состояние СЕЙЧАС\n\n"
-        "📊 Показываю прогресс:\n"
-        "   \"за месяц мигрени -50%,\n"
-        "   сон +1.5 балла, стресс -2\"\n\n"
-        "🆘 Помогаю в моменте:\n"
-        "   Паника, стресс, бессонница —\n"
-        "   нажми SOS, я проведу за руку.\n\n"
-        "💚 Важно: я wellness-помощник, не врач. "
+        "Как это работает:\n\n"
+        f"Я буду писать тебе 3 раза в день:\n"
+        f"☀️ Утром — как {slept} (12 секунд)\n"
+        "🌤 Днём — как энергия? (10 секунд)\n"
+        "🌙 Вечером — как прошёл день? (1 минута)\n\n"
+        "На основе твоих ответов я:\n\n"
+        "🔍 Найду похитителей твоего сна и энергии\n"
+        "🎯 Дам одну задачу в неделю — не десять\n"
+        "📊 Покажу результат на твоих данных:\n"
+        "   «Сон был 3 → стал 6. Видишь?»\n\n"
+        "И ты увидишь своими глазами как меняется\n"
+        "твоё состояние — не на словах, а в цифрах.\n\n"
+        "После приёма у врача ты остаёшься\n"
+        "один на один с рекомендациями.\n"
+        "Здесь — я каждый день с тобой.\n\n"
+        "💚 Важно: я помощник, не врач.\n"
         "Не ставлю диагнозы и не заменяю медицину.\n\n"
-        "Давайте знакомиться?",
+        "Давай знакомиться?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👋 Давайте!", callback_data="onb_start")]
         ])
@@ -32077,8 +32071,7 @@ async def monthly_tests_menu_handler(callback: CallbackQuery):
 Месячные тесты доступны 
 *за 5 дней до конца подписки*.
 
-⏳ Откроются через *{days_until} дней*
-📅 Дата: {open_date_str}
+📅 Доступно с: {open_date_str}
 
 ━━━━━━━━━━━━━━━━━━━━━
 
@@ -35044,7 +35037,7 @@ async def sos_box_feedback_better(callback: CallbackQuery, state: FSMContext):
             text,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➡️ Продолжить чек-ин", callback_data="evening_continue_after_stress")],
+                [InlineKeyboardButton(text="➡️ Продолжить", callback_data="evening_continue_after_stress")],
             ])
         )
     else:
@@ -35083,7 +35076,7 @@ async def sos_box_feedback_same(callback: CallbackQuery, state: FSMContext):
     ]
     
     if from_evening:
-        buttons.append([InlineKeyboardButton(text="➡️ Продолжить чек-ин", callback_data="evening_continue_after_stress")])
+        buttons.append([InlineKeyboardButton(text="➡️ Продолжить", callback_data="evening_continue_after_stress")])
     else:
         buttons.append([InlineKeyboardButton(text="◀️ Пока всё", callback_data="back_to_menu")])
     
@@ -35124,7 +35117,7 @@ async def sos_box_feedback_worse(callback: CallbackQuery, state: FSMContext):
     ]
     
     if from_evening:
-        buttons.append([InlineKeyboardButton(text="➡️ Продолжить чек-ин", callback_data="evening_continue_after_stress")])
+        buttons.append([InlineKeyboardButton(text="➡️ Продолжить", callback_data="evening_continue_after_stress")])
     
     buttons.append([InlineKeyboardButton(text="📞 Мне нужна помощь", callback_data="sos_help_needed")])
     
@@ -35635,7 +35628,7 @@ async def sos_breathing_better(callback: CallbackQuery, state: FSMContext):
             text,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➡️ Продолжить чек-ин", callback_data="evening_continue_after_stress")],
+                [InlineKeyboardButton(text="➡️ Продолжить", callback_data="evening_continue_after_stress")],
             ])
         )
     else:
@@ -35683,7 +35676,7 @@ async def sos_breathing_better_fallback(callback: CallbackQuery, state: FSMConte
             text,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➡️ Продолжить чек-ин", callback_data="evening_continue_after_stress")],
+                [InlineKeyboardButton(text="➡️ Продолжить", callback_data="evening_continue_after_stress")],
             ])
         )
     else:
@@ -35724,7 +35717,7 @@ _Холод на лицо → рефлекс ныряльщика → вагус
         [InlineKeyboardButton(text="✅ Сделал(а)", callback_data="sos_cold_water_done")],
     ]
     if from_evening:
-        buttons.append([InlineKeyboardButton(text="➡️ Продолжить чек-ин", callback_data="evening_continue_after_stress")])
+        buttons.append([InlineKeyboardButton(text="➡️ Продолжить", callback_data="evening_continue_after_stress")])
     else:
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="sos_help")])
     
@@ -35767,7 +35760,7 @@ async def sos_cold_water_done(callback: CallbackQuery, state: FSMContext):
             text,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➡️ Продолжить чек-ин", callback_data="evening_continue_after_stress")],
+                [InlineKeyboardButton(text="➡️ Продолжить", callback_data="evening_continue_after_stress")],
             ])
         )
     else:
@@ -35808,7 +35801,7 @@ async def sos_breathing_bad(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🔄 Ещё раз дыхание", callback_data="sos_breathing_start")],
     ]
     if from_evening:
-        buttons.append([InlineKeyboardButton(text="➡️ Продолжить чек-ин", callback_data="evening_continue_after_stress")])
+        buttons.append([InlineKeyboardButton(text="➡️ Продолжить", callback_data="evening_continue_after_stress")])
     buttons.append([InlineKeyboardButton(text="💙 Понял(а)", callback_data="back_to_menu")])
     
     await callback.message.edit_text(
@@ -37704,75 +37697,6 @@ async def process_work_schedule(callback: CallbackQuery, state: FSMContext):
     
     await callback.message.edit_text(
         f"✅ Записал!{warning}\n\n"
-        "📋 *ЭНЕРГИЯ*\n\n"
-        "Как вы обычно чувствуете себя утром\n"
-        "(первые 1-2 часа после пробуждения)?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="1️⃣ Разбит, еле встаю", callback_data="energy_1")],
-            [InlineKeyboardButton(text="2️⃣ Вялый, без энергии", callback_data="energy_2")],
-            [InlineKeyboardButton(text="3️⃣ Нормально, средне", callback_data="energy_3")],
-            [InlineKeyboardButton(text="4️⃣ Хорошо, есть энергия", callback_data="energy_4")],
-            [InlineKeyboardButton(text="5️⃣ Отлично! Бодрый и готов к дню", callback_data="energy_5")]
-        ])
-    )
-    await state.set_state(OnboardingStates.waiting_energy)
-
-
-
-@router.callback_query(OnboardingStates.waiting_energy, F.data.startswith("energy_"))
-async def process_energy(callback: CallbackQuery, state: FSMContext):
-    """Обработка энергии → вопрос про сон"""
-    await callback.answer()
-    energy = int(callback.data.replace("energy_", ""))
-    await state.update_data(energy_score=energy)
-    
-    await callback.message.edit_text(
-        "😴 *СОН*\n\n"
-        "Как бы вы оценили качество своего сна в целом?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="1️⃣ Ужасно — не высыпаюсь никогда", callback_data="sleep_1")],
-            [InlineKeyboardButton(text="2️⃣ Плохо — часто проблемы", callback_data="sleep_2")],
-            [InlineKeyboardButton(text="3️⃣ Средне — бывает по-разному", callback_data="sleep_3")],
-            [InlineKeyboardButton(text="4️⃣ Хорошо — обычно высыпаюсь", callback_data="sleep_4")],
-            [InlineKeyboardButton(text="5️⃣ Отлично — сон глубокий", callback_data="sleep_5")]
-        ])
-    )
-    await state.set_state(OnboardingStates.waiting_sleep)
-
-
-@router.callback_query(OnboardingStates.waiting_sleep, F.data.startswith("sleep_"))
-async def process_sleep(callback: CallbackQuery, state: FSMContext):
-    """Обработка сна → вопрос про стресс"""
-    await callback.answer()
-    sleep = int(callback.data.replace("sleep_", ""))
-    await state.update_data(sleep_score=sleep)
-    
-    await callback.message.edit_text(
-        "😰 *СТРЕСС*\n\n"
-        "Как бы вы оценили свой общий уровень стресса?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="1️⃣ Критический — на грани срыва", callback_data="stress_1")],
-            [InlineKeyboardButton(text="2️⃣ Очень высокий", callback_data="stress_2")],
-            [InlineKeyboardButton(text="3️⃣ Высокий", callback_data="stress_3")],
-            [InlineKeyboardButton(text="4️⃣ Умеренный", callback_data="stress_4")],
-            [InlineKeyboardButton(text="5️⃣ Низкий — жизнь спокойная", callback_data="stress_5")]
-        ])
-    )
-    await state.set_state(OnboardingStates.waiting_stress)
-
-
-@router.callback_query(OnboardingStates.waiting_stress, F.data.startswith("stress_"))
-async def process_stress(callback: CallbackQuery, state: FSMContext):
-    """Обработка стресса → переход к наследственности (туман спросит когнитивный трекер)"""
-    await callback.answer()
-    stress = int(callback.data.replace("stress_", ""))
-    await state.update_data(stress_score=stress)
-    
-    # Сразу к наследственности — туман покрывается когнитивным трекером позже
-    await callback.message.edit_text(
         "🧬 Теперь несколько вопросов о здоровье вашей семьи.\n\n"
         "Это поможет понять ваши индивидуальные риски\n"
         "и персонализировать программу.\n\n"
@@ -37786,6 +37710,45 @@ async def process_stress(callback: CallbackQuery, state: FSMContext):
         ])
     )
     await state.set_state(OnboardingStates.waiting_heredity_intro)
+
+
+
+# LEGACY: энергия/сон/стресс — перехватываем если кто-то застрял
+@router.callback_query(F.data.startswith("energy_"))
+async def process_energy(callback: CallbackQuery, state: FSMContext):
+    """LEGACY: Пропускаем → наследственность"""
+    await callback.answer()
+    await state.set_state(OnboardingStates.waiting_heredity_intro)
+    await callback.message.edit_text(
+        "🧬 Теперь несколько вопросов о здоровье вашей семьи.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Продолжить", callback_data="start_heredity")]
+        ])
+    )
+
+@router.callback_query(F.data.startswith("sleep_"))
+async def process_sleep(callback: CallbackQuery, state: FSMContext):
+    """LEGACY: Пропускаем → наследственность"""
+    await callback.answer()
+    await state.set_state(OnboardingStates.waiting_heredity_intro)
+    await callback.message.edit_text(
+        "🧬 Теперь несколько вопросов о здоровье вашей семьи.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Продолжить", callback_data="start_heredity")]
+        ])
+    )
+
+@router.callback_query(F.data.startswith("stress_"))
+async def process_stress(callback: CallbackQuery, state: FSMContext):
+    """LEGACY: Пропускаем → наследственность"""
+    await callback.answer()
+    await state.set_state(OnboardingStates.waiting_heredity_intro)
+    await callback.message.edit_text(
+        "🧬 Теперь несколько вопросов о здоровье вашей семьи.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Продолжить", callback_data="start_heredity")]
+        ])
+    )
 
 
 @router.callback_query(OnboardingStates.waiting_fog, F.data.startswith("fog_"))
@@ -41178,14 +41141,14 @@ async def _complete_morning_checkin(callback, state: FSMContext):
     except Exception as e:
         print(f"⚠️ prodrome check error in morning: {e}")
     
-    # Напоминание Ступень 2 (приоритет 6)
-    try:
-        step2 = await check_step2_reminder(tid)
-        if step2:
-            step2_kb = InlineKeyboardMarkup(inline_keyboard=step2["buttons"])
-            extra_queue.append((6, step2["text"], step2_kb))
-    except Exception as e:
-        logger.error(f"Step2 reminder error: {e}")
+    # Напоминание Ступень 2 — УБРАНО #171v2 (наследственность теперь в онбординге)
+    # try:
+    #     step2 = await check_step2_reminder(tid)
+    #     if step2:
+    #         step2_kb = InlineKeyboardMarkup(inline_keyboard=step2["buttons"])
+    #         extra_queue.append((6, step2["text"], step2_kb))
+    # except Exception as e:
+    #     logger.error(f"Step2 reminder error: {e}")
 
     # Напоминание наследственность (приоритет 7)
     try:
@@ -41879,7 +41842,7 @@ async def evening_stress(callback: CallbackQuery, state: FSMContext):
             "Сделай прямо сейчас или перед сном 💚",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🫁 Дыхание 4-4-4-4", callback_data="sos_box_breathing")],
-                [InlineKeyboardButton(text="➡️ Продолжить чек-ин", callback_data="evening_continue_after_stress")]
+                [InlineKeyboardButton(text="➡️ Продолжить", callback_data="evening_continue_after_stress")]
             ]),
             parse_mode="Markdown"
         )
@@ -45840,7 +45803,7 @@ async def handle_retro_bedtime(callback: CallbackQuery):
             f"✅ Записала: легла в {bedtime}\n\n"
             f"Теперь утренний чекин? 🌅",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="▶️ Утренний чек-ин", callback_data="morning_checkin")],
+                [InlineKeyboardButton(text="☀️ Доброе утро!", callback_data="morning_checkin")],
             ])
         )
 
@@ -55513,46 +55476,33 @@ async def onb_tests_later(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "onb_start_tests")
 async def onb_start_tests(callback: CallbackQuery, state: FSMContext):
-    """ОНБОРДИНГ 2.0: Начать тесты → Композитный мини-тест"""
+    """ОНБОРДИНГ 2.0: Начать тесты → сразу к полным тестам (мини-тест убран #171v2)"""
     await callback.answer()
-    
     await save_user(callback.from_user.id, {"onboarding_phase": 3})
-    
     user = await get_user(callback.from_user.id)
     name = user.get("name", "друг") if user else "друг"
-    
     await callback.message.edit_text(
-        f"📝 *{name}, быстрая диагностика*\n\n"
-        "18 вопросов за 5 минут — оценим:\n"
-        "• Стресс и тревожность\n"
-        "• Качество сна\n"
-        "• Энергию и надпочечники\n"
-        "• Циркадные ритмы\n\n"
-        "После этого — ещё 2 коротких теста.\n"
-        "Итого ~10 минут на всё.",
+        f"📝 *{name}, диагностика*\n\n"
+        "Несколько тестов — займёт ~10 минут.\n\n"
+        "Начнём с циркадного ритма — это основа всего.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➡️ Начать", callback_data="mini_test_go_onb")]
+            [InlineKeyboardButton(text="➡️ Начать", callback_data="circadian_test_menu")]
         ])
     )
 
 
 @router.callback_query(F.data == "mini_test_go_onb")
 async def mini_test_go_onb(callback: CallbackQuery, state: FSMContext):
-    """Первый вопрос мини-теста в онбординге"""
+    """LEGACY: мини-тест убран → сразу к циркадному"""
     await callback.answer()
     await state.clear()
-    await state.update_data(mini_test_answers={}, is_onboarding=True)
-    
-    q = MINI_TEST_QUESTIONS[1]
-    text = f"{q['block_title']}\n\n{q['text']}" if q.get('block_title') else q['text']
-    
     await callback.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=get_mini_test_keyboard(1)
+        "Начнём с циркадного теста.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Начать", callback_data="circadian_test_menu")]
+        ])
     )
-    await state.set_state(MiniTestStates.waiting_mq1)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -56222,11 +56172,11 @@ ZBI_SHORT_QUESTIONS = [
 ]
 
 ZBI_OPTIONS = [
-    ("0 — Никогда", 0),
-    ("1 — Редко", 1),
-    ("2 — Иногда", 2),
-    ("3 — Часто", 3),
-    ("4 — Почти всегда", 4),
+    ("Никогда", 0),
+    ("Редко", 1),
+    ("Иногда", 2),
+    ("Часто", 3),
+    ("Почти всегда", 4),
 ]
 
 
@@ -60540,7 +60490,7 @@ async def get_integrated_assessment(telegram_id: int) -> dict:
 4. Сон 9-10 часов (приоритет!)
 
 Циркадка и стресс-менеджмент — ПОСЛЕ 
-стабилизации HPA-оси под контролем врача."""
+стабилизации гормонов стресса под контролем врача."""
         return result
     
     if circadian_critical:
@@ -60551,7 +60501,7 @@ async def get_integrated_assessment(telegram_id: int) -> dict:
             
             ahs_note = ""
             if ahs_elevated:
-                ahs_note = f"\n\n⚡ HPA-ось также истощена (AHS: {ahs}/48)!\nБГС улучшится вместе с циркадкой."
+                ahs_note = f"\n\n⚡ гормоны стресса также истощена (AHS: {ahs}/48)!\nБГС улучшится вместе с циркадкой."
             
             result["recommendation"] = f"""🔴🔴 ДВОЙНАЯ КРАСНАЯ ЗОНА!
 
@@ -60573,7 +60523,7 @@ async def get_integrated_assessment(telegram_id: int) -> dict:
             
             ahs_note = ""
             if ahs_mild:
-                ahs_note = f"\n\n⚡ БГС: {ahs}/48 — лёгкое напряжение HPA-оси.\nНормализуется при восстановлении циркадки."
+                ahs_note = f"\n\n⚡ БГС: {ahs}/48 — лёгкое напряжение гормонов стресса.\nНормализуется при восстановлении циркадки."
             
             result["recommendation"] = f"""🔴 ПРИОРИТЕТ: ЦИРКАДКА!
 
@@ -60592,7 +60542,7 @@ async def get_integrated_assessment(telegram_id: int) -> dict:
             
             ahs_note = ""
             if ahs_elevated:
-                ahs_note = f"\n\n⚡ HPA-ось в стадии 2 (AHS: {ahs}/48)\nВажно снизить нагрузку!"
+                ahs_note = f"\n\n⚡ гормоны стресса в стадии 2 (AHS: {ahs}/48)\nВажно снизить нагрузку!"
             
             result["recommendation"] = f"""🟠 ВНИМАНИЕ: ОБА ТРЕБУЮТ РАБОТЫ!
 
@@ -60633,7 +60583,7 @@ async def get_integrated_assessment(telegram_id: int) -> dict:
             
             ahs_note = ""
             if ahs_elevated:
-                ahs_note = f"\n\n⚡ HPA-ось истощена (AHS: {ahs}/48)\nВажен щадящий режим!"
+                ahs_note = f"\n\n⚡ гормоны стресса истощена (AHS: {ahs}/48)\nВажен щадящий режим!"
             
             result["recommendation"] = f"""🔴 ФОКУС: СТРЕСС!
 
@@ -60670,7 +60620,7 @@ async def get_integrated_assessment(telegram_id: int) -> dict:
             
             ahs_note = ""
             if ahs is not None and ahs_normal:
-                ahs_note = f"\n⚡ HPA-ось здорова ✅"
+                ahs_note = f"\n⚡ гормоны стресса здорова ✅"
             
             result["recommendation"] = f"""🟢🟢 ОТЛИЧНО!
 
@@ -61056,7 +61006,7 @@ async def show_summary_brief(callback: CallbackQuery, data: dict):
         sqs_level = get_level(sqs_score, [12, 8, 5, 0], ["отличный", "хороший", "сниженный", "критический"])
     else:
         sqs_level = get_level(sqs_score, [28, 20, 15, 0], ["отличный", "хороший", "сниженный", "критический"])
-    circ_level = get_level(circ_score, [45, 30, 15, 0], ["отличный", "умеренный", "сниженный", "критический"])
+    circ_level = get_level(circ_score, [45, 30, 20, 0], ["отличный", "умеренный", "сниженный", "критический"])
     if pss_is_mini:
         pss_level = get_level(16 - pss_score, [10, 7, 4, 0], ["низкий", "умеренный", "повышенный", "высокий"])
     else:
@@ -61484,7 +61434,7 @@ async def show_detailed_report(callback: CallbackQuery):
     if pss_score and pss_score > 27:
         warning_text += """
 🔴 *СТРЕСС — высокий:*
-├── HPA-ось перегружена
+├── гормоны стресса перегружена
 ├── Кортизол хронически повышен
 └── Важно: дыхательные практики
 """
@@ -61588,7 +61538,7 @@ async def show_goals_and_plan(callback: CallbackQuery):
 
 ├── 🌅 Восстановить циркадный ритм
 ├── 🌙 Нормализовать выработку мелатонина
-├── ⚡ Нормализовать работу HPA-оси
+├── ⚡ Нормализовать работу гормонов стресса
 ├── 🧠 Запустить глимфатическую систему
 ├── 💧 Запустить лимфатическую систему
 └── 🩸 Восстановить капиллярную систему
@@ -61827,7 +61777,7 @@ _Баня — приятно. Залманов — лечит._"""
     await callback.message.answer(sauna_block, parse_mode="Markdown")
     await asyncio.sleep(0.3)
     
-    # === СООБЩЕНИЕ 5: HPA-ось (надпочечники) ===
+    # === СООБЩЕНИЕ 5: гормоны стресса (надпочечники) ===
     hpa_block = f"""━━━━━━━━━━━━━━━━━━━━━
 ⚡ *ВОССТАНОВЛЕНИЕ HPA-ОСИ*
 
@@ -61944,7 +61894,7 @@ COMT-ген определяет:
    _(нельзя укрепить то, о чём не знаешь)_
 
 2️⃣ *Подготовить тело*
-   _(капилляры, лимфа, HPA-ось — это фундамент)_
+   _(капилляры, лимфа, гормоны стресса — это фундамент)_
 
 3️⃣ *Регулярность практик*
    _(не "попробовал и бросил", а система)_
@@ -66438,7 +66388,7 @@ async def finish_habits(callback: CallbackQuery, state: FSMContext):
         text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Готова! Жду чекины от Авроры", callback_data="start_checkins")],
+            [InlineKeyboardButton(text="✅ Готова! Жду сообщений от Авроры", callback_data="start_checkins")],
             [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
         ])
     )
@@ -74378,7 +74328,7 @@ def get_ahs_interpretation(ahs_total: int) -> dict:
             'recovery_time': 'Не требуется',
             'protocol': 'C',
             'red_button': False,
-            'description': 'HPA-ось функционирует нормально. Профилактика.'
+            'description': 'гормоны стресса функционирует нормально. Профилактика.'
         }
     elif ahs_total <= 20:
         return {
@@ -74891,14 +74841,14 @@ async def ahs_test_results(callback: CallbackQuery):
 
 @router.callback_query(F.data == "ahs_info")
 async def ahs_info(callback: CallbackQuery):
-    """Информация о HPA-оси"""
+    """Информация о гормонов стресса"""
     await callback.answer()
     
     text = """ℹ️ *ЧТО ТАКОЕ HPA-ОСЬ?*
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-🧠 *HPA-ось* — это система связи:
+🧠 *гормоны стресса* — это система связи:
 **H**ypothalamus (гипоталамус)
 **P**ituitary (гипофиз)  
 **A**drenal (надпочечники)
@@ -74912,7 +74862,7 @@ async def ahs_info(callback: CallbackQuery):
 Термин не признан медициной.
 Надпочечники НЕ устают как мышцы.
 
-Реальность — это *ДИСРЕГУЛЯЦИЯ HPA-оси*:
+Реальность — это *ДИСРЕГУЛЯЦИЯ гормонов стресса*:
 ├── Нарушение сигналов между органами
 ├── Неправильный ритм кортизола
 └── Истощение рецепторов
@@ -80614,7 +80564,7 @@ GG = нужна активация через голодание.
         text = """😰 **БЛОК 2: СТРЕСС И НЕРВНАЯ СИСТЕМА**
 
 **CRH** — Кортизол
-Регуляция HPA-оси (стресс-система).
+Регуляция гормонов стресса (стресс-система).
 AA = кортизол взлетает в 5-10 раз!
 
 **BDNF** — Нейропластичность
@@ -86004,12 +85954,12 @@ _{comment}_"""
     if bedtime_logged:
         buttons = [
             [InlineKeyboardButton(text="⏱️ Как быстро уснул" + ending + "?", callback_data="ask_sleep_latency")],
-            [InlineKeyboardButton(text="☕ Полный чек-ин", callback_data="morning_checkin_quick")],
+            [InlineKeyboardButton(text="☕ Утренний опрос", callback_data="morning_checkin_quick")],
             [InlineKeyboardButton(text="✅ Всё, спасибо", callback_data="quick_done")]
         ]
     else:
         buttons = [
-            [InlineKeyboardButton(text="☕ Утренний чек-ин", callback_data="morning_checkin_quick")],
+            [InlineKeyboardButton(text="☕ Утренний опрос", callback_data="morning_checkin_quick")],
             [InlineKeyboardButton(text="✅ Всё, спасибо", callback_data="quick_done")]
         ]
     
@@ -86163,7 +86113,7 @@ async def save_sleep_latency(callback: CallbackQuery, state: FSMContext):
         response,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="☕ Продолжить чек-ин", callback_data="morning_checkin_quick")],
+            [InlineKeyboardButton(text="☕ Продолжить", callback_data="morning_checkin_quick")],
             [InlineKeyboardButton(text="✅ Готово", callback_data="quick_done")]
         ])
     )
@@ -86330,7 +86280,7 @@ async def handle_any_message(message: Message, state: FSMContext):
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🆘 Мне нужна поддержка", callback_data="sos_menu")],
-                [InlineKeyboardButton(text="📊 Хочу чек-ин", callback_data="evening_checkin")],
+                [InlineKeyboardButton(text="📊 Вечерний опрос", callback_data="evening_checkin")],
                 [InlineKeyboardButton(text="🛁 Хочу ванну", callback_data="capillary_menu")],
                 [InlineKeyboardButton(text="📋 В меню", callback_data="back_to_menu")],
             ])
@@ -86357,7 +86307,7 @@ async def handle_any_message(message: Message, state: FSMContext):
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🆘 SOS — мне плохо", callback_data="sos_menu")],
-                [InlineKeyboardButton(text="📊 Вечерний чек-ин", callback_data="evening_checkin")],
+                [InlineKeyboardButton(text="📊 Вечерний опрос", callback_data="evening_checkin")],
                 [InlineKeyboardButton(text="📋 Главное меню", callback_data="back_to_menu")],
             ])
         )
@@ -87284,7 +87234,7 @@ async def return_comeback_handler(callback: CallbackQuery):
         "Что хочешь сделать?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Быстрый чек-ин", callback_data="morning_checkin")],
+            [InlineKeyboardButton(text="📊 Ответить", callback_data="morning_checkin")],
             [InlineKeyboardButton(text="🫁 Подышать 1 мин", callback_data="sos_quick")],
             [InlineKeyboardButton(text="📋 В меню", callback_data="back_to_menu")],
         ])
@@ -87904,8 +87854,8 @@ PCL_SHORT_QUESTIONS = [
 ]
 
 PCL_OPTIONS = [
-    ("0 — Совсем нет", 0), ("1 — Немного", 1), ("2 — Умеренно", 2),
-    ("3 — Сильно", 3), ("4 — Крайне сильно", 4),
+    ("Совсем нет", 0), ("Немного", 1), ("Умеренно", 2),
+    ("Сильно", 3), ("Крайне сильно", 4),
 ]
 
 ZBI_SHORT_QUESTIONS = [
@@ -87916,8 +87866,8 @@ ZBI_SHORT_QUESTIONS = [
 ]
 
 ZBI_OPTIONS = [
-    ("0 — Никогда", 0), ("1 — Редко", 1), ("2 — Иногда", 2),
-    ("3 — Часто", 3), ("4 — Почти всегда", 4),
+    ("Никогда", 0), ("Редко", 1), ("Иногда", 2),
+    ("Часто", 3), ("Почти всегда", 4),
 ]
 
 # Заблокированные практики для ПТСР
@@ -88053,24 +88003,9 @@ def filter_recommendations_for_ptsd(recommendations: list, profile: str) -> list
 
 @router.callback_query(F.data == "profile_screen_start")
 async def profile_screen_caregiver(callback: CallbackQuery, state: FSMContext):
-    """Q1: Ухаживаешь ли за кем-то?"""
+    """Скрининг: caregiver убран (#171v2 — уже спрашивается в онбординге) → сразу к MRS/ADAM"""
     await callback.answer()
-    user = await get_user(callback.from_user.id)
-    name = user.get("name", "друг") if user else "друг"
-
-    await callback.message.edit_text(
-        f"👥 *{name}, ты ухаживаешь за кем-то?*\n"
-        f"(как родственник или как сиделка/помощник)",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👩‍⚕️ Да, за родственником (год+)", callback_data="pscr_cg_long")],
-            [InlineKeyboardButton(text="💼 Да, я сиделка / помощник", callback_data="pscr_cg_prof")],
-            [InlineKeyboardButton(text="📅 Да, недавно начала", callback_data="pscr_cg_recent")],
-            [InlineKeyboardButton(text="🕊️ Было раньше, сейчас нет", callback_data="pscr_cg_past")],
-            [InlineKeyboardButton(text="✅ Нет", callback_data="pscr_cg_no")]
-        ])
-    )
-    await state.set_state(OnboardingStates.waiting_profile_caregiver)
+    await profile_go_to_menopause_or_andropause(callback.message, state, callback.from_user.id)
 
 
 # ─── B3: Caregiver ────────────────────────────────────────────

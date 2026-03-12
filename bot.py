@@ -55282,7 +55282,7 @@ async def onb_family_atmosphere(callback: CallbackQuery, state: FSMContext):
     await state.set_state(LifeEventsStates.waiting_family_atmosphere)
 
 
-@router.callback_query(LifeEventsStates.waiting_family_atmosphere, F.data.startswith("fatm_"))
+@router.callback_query(F.data.startswith("fatm_"))
 async def onb_support_person(callback: CallbackQuery, state: FSMContext):
     """ПОПРАВКА #171v2: Поддержка — второй вопрос"""
     await callback.answer()
@@ -55303,7 +55303,7 @@ async def onb_support_person(callback: CallbackQuery, state: FSMContext):
     await state.set_state(LifeEventsStates.waiting_support_person)
 
 
-@router.callback_query(LifeEventsStates.waiting_support_person, F.data.startswith("sup_"))
+@router.callback_query(F.data.startswith("sup_"))
 async def onb_after_support(callback: CallbackQuery, state: FSMContext):
     """ПОПРАВКА #171v2: После поддержки → быстрая оценка"""
     await callback.answer()

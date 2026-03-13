@@ -717,6 +717,94 @@ async def init_db():
         """)
         
         # ═══════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════
+        # ПОПРАВКА #180: лог ежедневных советов — чтобы не повторяться
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS daily_tips_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                tip_id TEXT NOT NULL,
+                tip_type TEXT,
+                sent_at TEXT DEFAULT (datetime('now')),
+                completed INTEGER DEFAULT 0,
+                completed_at TEXT DEFAULT NULL
+            )
+        """)
+
+        # ПОПРАВКА #186: лог сезонных советов
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS seasonal_tips_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                tip_id TEXT NOT NULL,
+                month_num INTEGER NOT NULL,
+                year_num INTEGER NOT NULL,
+                sent_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        # ПОПРАВКА #187: состояние мини-серии пользователя
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS mini_series_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL UNIQUE,
+                series_id TEXT,
+                current_day INTEGER DEFAULT 0,
+                started_at TEXT,
+                completed_at TEXT,
+                last_sent_date TEXT
+            )
+        """)
+
+        # ПОПРАВКА #187: лог мини-серий (история)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS mini_series_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                series_id TEXT NOT NULL,
+                day_num INTEGER NOT NULL,
+                sent_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        # ПОПРАВКА #184: ежемесячный опрос прогресса
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS monthly_surveys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                month_num INTEGER NOT NULL,
+                survey_date TEXT DEFAULT (date('now')),
+                sleep_answer TEXT,
+                wakeup_answer TEXT,
+                light_answer TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        # ПОПРАВКА #178: архив снимков отчётов
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS report_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                -- Ключевые показатели на дату снимка
+                sqs_total INTEGER,
+                sqs_level TEXT,
+                pss_total INTEGER,
+                stress_level TEXT,
+                gad_total INTEGER,
+                ahs_total INTEGER,
+                ahs_stage INTEGER,
+                circadian_score INTEGER,
+                circadian_level TEXT,
+                bio_age INTEGER,
+                chrono_age INTEGER,
+                chronotype TEXT,
+                -- Флаг: первый отчёт пользователя
+                is_first INTEGER DEFAULT 0
+            )
+        """)
+
         # ТЕСТ КАЧЕСТВА СНА (SQS - Sleep Quality Score)
         # 18 вопросов, 40 баллов максимум
         # ═══════════════════════════════════════════════════════
@@ -2339,7 +2427,26 @@ async def init_db():
             ('heredity_completed', 'INTEGER DEFAULT 0'),
             ('heredity_remind_date', 'TEXT'),
             ('heredity_remind_count', 'INTEGER DEFAULT 0'),
-            # Фаза 4: План отката биовозраста
+            # ПОПРАВКА #177: Обоняние и вкус — маркеры ранней деменции
+            # Значения: 'no' | 'yes_covid' | 'yes_gradual' | 'yes_unknown'
+            ('smell_change', "TEXT DEFAULT 'no'"),
+            ('taste_change', "TEXT DEFAULT 'no'"),
+            # ПОПРАВКА #181: Курение
+            ('smoking_status', "TEXT DEFAULT 'never'"),
+            ('smoking_amount', "TEXT DEFAULT NULL"),
+            # ПОПРАВКА #175: флаг показа генетического крючка — показываем ОДИН раз
+            # в самый релевантный момент, не спамим во всех тестах подряд
+            ('dna_hook_shown', 'INTEGER DEFAULT 0'),
+            # ПОПРАВКА #179: дата последнего пересмотра хронотипа
+            ('chronotype_updated_at', 'TEXT DEFAULT NULL'),
+            # ПОПРАВКА #181: Курение
+            ('smoking_status', "TEXT DEFAULT 'none'"),
+            ('smoking_amount', "TEXT DEFAULT NULL"),
+            # ПОПРАВКА #185: День рождения из Telegram
+            ('birth_day',   'INTEGER DEFAULT NULL'),
+            ('birth_month', 'INTEGER DEFAULT NULL'),
+            ('birth_year',  'INTEGER DEFAULT NULL'),
+            ('birthday_source', "TEXT DEFAULT NULL"),  # 'telegram' или 'manual'            # Фаза 4: План отката биовозраста
             ('rollback_plan_active', 'INTEGER DEFAULT 0'),
             ('rollback_plan_date', 'TEXT'),
             ('rollback_check_date', 'TEXT'),
@@ -3316,6 +3423,22 @@ async def init_db():
                 pass
         await db.commit()
 
+    # ПОПРАВКА #190: Миграция — флаг крючка витамина Д
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN vitd_hook_shown INTEGER DEFAULT 0")
+            await db.commit()
+        except:
+            pass
+
+    # ПОПРАВКА #191: Миграция — флаг крючка сидячего образа жизни
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN sedentary_hook_shown INTEGER DEFAULT 0")
+            await db.commit()
+        except:
+            pass
+
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  КОПИЛОЧКА СОВЕТОВ — КАТАЛОГ И ФУНКЦИИ                          ║
@@ -3500,6 +3623,28 @@ def is_quiet_hours(now: datetime, user: dict) -> bool:
             return quiet_start_min <= current_min < quiet_end_min
     except Exception:
         return now.hour >= 22 or now.hour < 9
+
+
+async def try_get_telegram_birthday(telegram_id: int) -> dict | None:
+    """
+    ПОПРАВКА #185: Тихо получаем день рождения из Telegram.
+    Возвращает dict с day, month, year (year может быть None).
+    Возвращает None если не удалось или не заполнено.
+    Не сообщаем пользователю что «подсмотрели» — просто используем.
+    """
+    try:
+        chat = await bot.get_chat(telegram_id)
+        bd = getattr(chat, "birthdate", None)
+        if bd is None:
+            return None
+        day   = getattr(bd, "day",   None)
+        month = getattr(bd, "month", None)
+        year  = getattr(bd, "year",  None)
+        if day and month:
+            return {"day": day, "month": month, "year": year}
+        return None
+    except Exception:
+        return None
 
 
 def get_age_group(exact_age: int) -> str:
@@ -9575,6 +9720,17 @@ class OnboardingStates(StatesGroup):
     waiting_h4 = State()
     waiting_h5 = State()
     waiting_h6 = State()
+    # ПОПРАВКА #177: Обоняние и вкус — маркеры ранней деменции
+    # Встроены после h6, перед циклом. Учитываем COVID-контекст.
+    waiting_smell = State()
+    waiting_taste = State()
+    # ПОПРАВКА #181: Курение — статус и количество
+    waiting_smoking_status = State()
+    waiting_smoking_amount = State()
+    # ПОПРАВКА #184: Ежемесячный опрос прогресса
+    survey_sleep = State()
+    survey_wakeup = State()
+    survey_light = State()
     # ПОПРАВКА #107: Материнство
     waiting_has_children = State()
     waiting_youngest_age = State()
@@ -16414,6 +16570,106 @@ async def progress_photos_menu_handler(callback: CallbackQuery):
     )
 
 
+def get_waist_risk_insight(waist_cm: float, gender: str, delta_waist: float = None) -> str:
+    """
+    ПОПРАВКА #193: Оценка риска висцерального жира по талии.
+    Возвращает строку-инсайт или пустую строку если всё ок.
+    """
+    if not waist_cm:
+        return ""
+
+    is_female = str(gender).lower() in ("female", "ж", "женский", "f", "woman")
+
+    if is_female:
+        if waist_cm >= 88:
+            level = "high"
+        elif waist_cm >= 80:
+            level = "moderate"
+        else:
+            level = "ok"
+    else:
+        if waist_cm >= 102:
+            level = "high"
+        elif waist_cm >= 94:
+            level = "moderate"
+        else:
+            level = "ok"
+
+    moving = ""
+    if delta_waist is not None and delta_waist < -1:
+        moving = " Ты движешься в правильную сторону — продолжай! 💪"
+    elif delta_waist is not None and delta_waist > 1:
+        moving = " Обрати внимание на питание и активность."
+
+    if level == "high":
+        return (
+            f"\n🔴 *Талия в зоне высокого риска.* Висцеральный жир окружает "
+            f"внутренние органы — печень, поджелудочную, сердце. "
+            f"Это прямой путь к жировому гепатозу и метаболическому синдрому.{moving}"
+        )
+    elif level == "moderate":
+        return (
+            f"\n🟡 *Талия в зоне внимания.* Висцеральный жир начинает влиять "
+            f"на здоровье печени и гормональный баланс.{moving}"
+        )
+    return ""
+
+
+def get_weight_trend_text(measurements_history: list) -> str:
+    """
+    ПОПРАВКА #193: Считает тренд по последним замерам (3+).
+    Возвращает строку или пустую строку.
+    """
+    weights = [(m['weight'], m['created_at']) for m in measurements_history if m.get('weight')]
+    if len(weights) < 3:
+        return ""
+
+    # Берём первый и последний из последних 3
+    recent = weights[-3:]
+    first_w, first_d = recent[0]
+    last_w, last_d = recent[-1]
+
+    try:
+        d1 = datetime.fromisoformat(first_d)
+        d2 = datetime.fromisoformat(last_d)
+        days = max((d2 - d1).days, 1)
+        delta = round(last_w - first_w, 1)
+        weeks = round(days / 7, 1)
+
+        if abs(delta) < 0.3:
+            return f"\n📊 _Вес стабилен последние {weeks:.0f} нед._"
+        elif delta < 0:
+            rate = abs(delta) / (days / 30)
+            if rate <= 4:
+                quality = "темп оптимальный 🎯"
+            else:
+                quality = "темп высокий — следи за питанием"
+            return f"\n📊 _{delta:+.1f} кг за {weeks:.0f} нед. — {quality}_"
+        else:
+            return f"\n📊 _{delta:+.1f} кг за {weeks:.0f} нед._"
+    except Exception:
+        return ""
+
+
+async def get_measurements_history(telegram_id: int, limit: int = 10) -> list:
+    """
+    ПОПРАВКА #193: История замеров для тренда.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT weight, waist, ankle, created_at FROM measurements
+                WHERE telegram_id = ?
+                ORDER BY created_at ASC
+                LIMIT ?
+            """, (telegram_id, limit))
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
 async def get_user_measurements(telegram_id: int) -> dict:
     """ПОПРАВКА #127: Получает замеры пользователя"""
     try:
@@ -16599,28 +16855,30 @@ async def skip_ankle(callback: CallbackQuery, state: FSMContext):
 
 
 async def save_measurements(telegram_id: int, state: FSMContext, message, is_callback=False):
-    """ПОПРАВКА #127: Сохраняет замеры"""
+    """ПОПРАВКА #127 + #193: Сохраняет замеры и показывает динамику + инсайты по висцеральному жиру"""
     data = await state.get_data()
-    
+
     weight = data.get('weight')
     waist = data.get('waist')
     ankle = data.get('ankle')
-    
+
     if not any([weight, waist, ankle]):
         text = "⚠️ Нужно указать хотя бы один замер."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="add_measurements")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="progress_photos_menu")]
+        ])
         if is_callback:
-            await message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="add_measurements")],
-                [InlineKeyboardButton(text="◀️ Назад", callback_data="progress_photos_menu")]
-            ]))
+            await message.edit_text(text, reply_markup=kb)
         else:
-            await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="add_measurements")],
-                [InlineKeyboardButton(text="◀️ Назад", callback_data="progress_photos_menu")]
-            ]))
+            await message.answer(text, reply_markup=kb)
         await state.clear()
         return
-    
+
+    # Берём предыдущие замеры ДО сохранения нового
+    prev = await get_user_measurements(telegram_id)
+    history = await get_measurements_history(telegram_id)
+
     # Сохраняем в БД
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -16628,30 +16886,63 @@ async def save_measurements(telegram_id: int, state: FSMContext, message, is_cal
             VALUES (?, ?, ?, ?, ?)
         """, (telegram_id, weight, waist, ankle, datetime.now().isoformat()))
         await db.commit()
-    
-    # Формируем результат
+
+    # Получаем пол пользователя для оценки риска талии
+    user = await get_user(telegram_id)
+    gender = user.get('gender', '') if user else ''
+
+    # ── Формируем результат ──
     text = "✅ *ЗАМЕРЫ СОХРАНЕНЫ!*\n\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
+
+    # Вес с динамикой
     if weight:
-        text += f"⚖️ Вес: *{weight} кг*\n"
+        prev_weight = prev.get('weight_current') if prev else None
+        if prev_weight and prev_weight != weight:
+            delta_w = round(weight - prev_weight, 1)
+            w_emoji = "📉" if delta_w < 0 else "📈"
+            text += f"⚖️ Вес: *{weight} кг* ({delta_w:+.1f} кг {w_emoji})\n"
+        else:
+            text += f"⚖️ Вес: *{weight} кг*\n"
+
+    # Талия с динамикой
+    delta_waist = None
     if waist:
-        text += f"📏 Талия: *{waist} см*\n"
+        prev_waist = prev.get('waist_current') if prev else None
+        if prev_waist and prev_waist != waist:
+            delta_waist = round(waist - prev_waist, 1)
+            wst_emoji = "📉" if delta_waist < 0 else "📈"
+            text += f"📏 Талия: *{waist} см* ({delta_waist:+.1f} см {wst_emoji})\n"
+        else:
+            text += f"📏 Талия: *{waist} см*\n"
+
     if ankle:
         text += f"🦶 Щиколотка: *{ankle} см*\n"
-    
-    text += "\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += "💡 Добавляй замеры раз в неделю — так ты увидишь прогресс!"
-    
+
+    text += "\n━━━━━━━━━━━━━━━━━━━━━"
+
+    # ПОПРАВКА #193: Тренд по 3+ замерам
+    trend = get_weight_trend_text(history + [{'weight': weight, 'created_at': datetime.now().isoformat()}])
+    if trend:
+        text += trend
+
+    # ПОПРАВКА #193: Инсайт по висцеральному жиру / печени
+    waist_insight = get_waist_risk_insight(waist, gender, delta_waist)
+    if waist_insight:
+        text += f"\n{waist_insight}"
+
+    if not waist_insight and not trend:
+        text += "\n\n💡 Добавляй замеры раз в неделю — так ты увидишь прогресс!"
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📸 Добавить фото", callback_data="progress_photos_menu")],
         [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
     ])
-    
+
     if is_callback:
         await message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
     else:
         await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
-    
+
     await state.clear()
 
 
@@ -24931,6 +25222,7 @@ def get_chronotype_choice_text(chronotype: str, choice: str, name: str) -> str:
 async def save_chronotype(telegram_id: int, chronotype: str, choice: str = None):
     """Сохранить хронотип и выбор пользователя.
     ПОПРАВКА #139: Также ставит target_bedtime по хронотипу.
+    ПОПРАВКА #179: Записывает дату обновления для сезонного пересмотра.
     """
     # Маппинг хронотип → целевое время
     CHRONO_BEDTIMES = {
@@ -24944,12 +25236,12 @@ async def save_chronotype(telegram_id: int, chronotype: str, choice: str = None)
     async with aiosqlite.connect(DB_PATH) as db:
         if choice:
             await db.execute(
-                "UPDATE users SET chronotype = ?, chronotype_choice = ?, target_bedtime = ? WHERE telegram_id = ?",
+                "UPDATE users SET chronotype = ?, chronotype_choice = ?, target_bedtime = ?, chronotype_updated_at = datetime('now') WHERE telegram_id = ?",
                 (chronotype, choice, target_bed, telegram_id)
             )
         else:
             await db.execute(
-                "UPDATE users SET chronotype = ?, target_bedtime = ? WHERE telegram_id = ?",
+                "UPDATE users SET chronotype = ?, target_bedtime = ?, chronotype_updated_at = datetime('now') WHERE telegram_id = ?",
                 (chronotype, target_bed, telegram_id)
             )
         await db.commit()
@@ -34547,11 +34839,53 @@ async def process_timezone(callback: CallbackQuery, state: FSMContext):
     # Сохраняем часовой пояс
     tz_info = RUSSIA_TIMEZONES.get(tz_code, {'offset': 3, 'name': 'Москва'})
     await state.update_data(timezone=tz_code, timezone_offset=tz_info['offset'])
-    
+
     data = await state.get_data()
     name = data.get('name', '')
-    
-    # Переходим к возрасту
+
+    # ПОПРАВКА #185: пробуем тихо получить день рождения из Telegram
+    bd = await try_get_telegram_birthday(callback.from_user.id)
+    if bd and bd.get("year"):
+        # Есть полная дата — сохраняем, вычисляем возраст, пропускаем вопрос
+        exact_age = datetime.now().year - bd["year"]
+        age_group = get_age_group(exact_age)
+        await save_user(callback.from_user.id, {
+            "birth_day":       bd["day"],
+            "birth_month":     bd["month"],
+            "birth_year":      bd["year"],
+            "exact_age":       exact_age,
+            "age_group":       age_group,
+            "birthday_source": "telegram",
+        })
+        await state.update_data(
+            age_group=age_group, exact_age=exact_age,
+            birth_day=bd["day"], birth_month=bd["month"], birth_year=bd["year"]
+        )
+        # Пропускаем вопрос — переходим сразу дальше
+        from aiogram.types import Message as AioMessage
+        # Создаём фейковый переход: редактируем сообщение и меняем state
+        await callback.message.edit_text(
+            f"✅ Часовой пояс: {tz_info['name']} ({tz_info['utc']})\n\n"
+            f"*Выберите ваш пол:*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👩 Женский", callback_data="gender_female")],
+                [InlineKeyboardButton(text="👨 Мужской", callback_data="gender_male")],
+            ])
+        )
+        await state.set_state(OnboardingStates.waiting_gender)
+        return
+
+    elif bd and not bd.get("year"):
+        # Есть день и месяц — сохраняем, но год неизвестен — спрашиваем группу
+        await save_user(callback.from_user.id, {
+            "birth_day":       bd["day"],
+            "birth_month":     bd["month"],
+            "birthday_source": "telegram",
+        })
+        await state.update_data(birth_day=bd["day"], birth_month=bd["month"])
+
+    # Переходим к возрасту (обычный путь или если год неизвестен)
     await callback.message.edit_text(
         f"✅ Часовой пояс: {tz_info['name']} ({tz_info['utc']})\n\n"
         f"К какой возрастной группе вы относитесь?",
@@ -34561,7 +34895,7 @@ async def process_timezone(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="40-49", callback_data="age_40-49")],
             [InlineKeyboardButton(text="50-59", callback_data="age_50-59")],
             [InlineKeyboardButton(text="60-69", callback_data="age_60-69")],
-            [InlineKeyboardButton(text="70+", callback_data="age_70+")]
+            [InlineKeyboardButton(text="70+",   callback_data="age_70+")],
         ])
     )
     await state.set_state(OnboardingStates.waiting_age)
@@ -37861,19 +38195,28 @@ async def process_h1(callback: CallbackQuery, state: FSMContext):
     await state.update_data(h1_dementia=h1)
 
     if h1 in ("parent", "multiple"):
+        # ═══ ПОПРАВКА #175: самый сильный триггер для ДНК-крючка ═══
+        # Человек только что сказал «у родителей был Альцгеймер» —
+        # это эмоциональный момент, крючок здесь не реклама, а забота.
+        dna_hook = await maybe_show_dna_hook(callback.from_user.id, "heredity_dementia")
         comment = (
             "🔴 Ген APOE4 мог передаться.\n\n"
-            "Но это не приговор — сон, движение и питание\n"
+            "Но даже если передался — это не приговор.\n"
+            "Это сигнал: нужно серьёзнее отнестись\n"
+            "к сферам, которые влияют на его запуск.\n\n"
+            "Сон, движение, питание и стресс-протоколы\n"
             "снижают риск нейродегенерации на 40-60%.\n"
-            "Образ жизни может остановить процесс\n"
-            "и не дать «плохим» генам включиться.\n\n"
-            "Я учту это в протоколах с первого дня. 💚"
+            "Образ жизни буквально решает — включится\n"
+            "ген или останется «спящим».\n\n"
+            f"💚 Аврора учтёт это с первого дня.{dna_hook}"
         )
     elif h1 in ("grandparent", "other"):
         comment = (
             "🟡 Умеренный наследственный фон.\n\n"
             "Профилактика через образ жизни работает\n"
-            "очень хорошо на этом уровне риска. Учту. 💚"
+            "очень хорошо на этом уровне риска.\n"
+            "Аврора учтёт это при составлении\n"
+            "твоих протоколов. 💚"
         )
     elif h1 == "no":
         comment = (
@@ -37908,18 +38251,22 @@ async def process_h2(callback: CallbackQuery, state: FSMContext):
     await state.update_data(h2_cvd=h2)
 
     if h2 == "multiple":
+        # ═══ ПОПРАВКА #175: крючок ССЗ — если про деменцию уже не показали ═══
+        dna_hook = await maybe_show_dna_hook(callback.from_user.id, "heredity_cvd")
         comment = (
             "🔴 Возможна семейная предрасположенность к ССЗ.\n\n"
-            "Но образ жизни влияет на экспрессию этих генов\n"
-            "на 60-70%. Контроль воспаления, давления\n"
-            "и режим сна — твои главные инструменты.\n\n"
-            "Выстроим правильный образ жизни — процесс\n"
-            "можно остановить. Учту в протоколах. 💚"
+            "Но даже если ген передался — это не приговор.\n"
+            "Это сигнал: воспаление, давление и режим сна\n"
+            "— именно те сферы, которые запускают эти гены.\n\n"
+            "Образ жизни влияет на их экспрессию на 60-70%.\n"
+            "Это означает: ты контролируешь большую часть.\n\n"
+            f"💚 Аврора учтёт это с первого дня.{dna_hook}"
         )
     elif h2 == "one":
         comment = (
             "🟡 Есть наследственный фактор по сердцу.\n"
-            "Следим за воспалением и давлением. Учту. 💚"
+            "Аврора учтёт это — следим за воспалением\n"
+            "и давлением. 💚"
         )
     elif h2 == "no":
         comment = (
@@ -37953,17 +38300,21 @@ async def process_h3(callback: CallbackQuery, state: FSMContext):
     await state.update_data(h3_diabetes=h3)
 
     if h3 in ("type2", "unknown_type"):
+        # ═══ ПОПРАВКА #175: крючок диабет — если про деменцию/ССЗ уже не показали ═══
+        dna_hook = await maybe_show_dna_hook(callback.from_user.id, "heredity_diabetes")
         comment = (
             "🔴 Инсулинорезистентность может передаваться.\n\n"
-            "Но образ жизни влияет на экспрессию этих генов\n"
-            "на 60-70%. Режим питания, движение и сон —\n"
-            "ключевые инструменты чтобы остановить процесс.\n\n"
-            "Я учту это в протоколах с первого дня. 💚"
+            "Но даже если передалась — это не приговор.\n"
+            "Это сигнал: питание, движение и сон — именно\n"
+            "те сферы, которые решают, включится этот ген\n"
+            "или останется «спящим».\n\n"
+            "Образ жизни влияет на экспрессию этих генов\n"
+            f"на 60-70%. Ты контролируешь большую часть.{dna_hook}"
         )
     elif h3 == "type1":
         comment = (
             "🟡 Диабет 1 типа — другой механизм (аутоиммунный).\n"
-            "Учту в рекомендациях. 💚"
+            "Аврора учтёт это в рекомендациях. 💚"
         )
     elif h3 == "no":
         comment = (
@@ -38000,16 +38351,23 @@ async def process_h4(callback: CallbackQuery, state: FSMContext):
     if h4 == "multiple":
         comment = (
             "🔴 Нейрохимический фон может передаваться.\n\n"
-            "Но образ жизни влияет на экспрессию этих генов\n"
-            "на 60-70%. Стресс-протоколы, сон и режим дня —\n"
-            "твои главные инструменты чтобы остановить\n"
-            "процесс и не дать «плохим» генам включиться.\n\n"
-            "Я учту это в протоколах с первого дня. 💚"
+            "Но даже если передался — это не приговор.\n"
+            "Это сигнал: стресс, сон и социальные связи —\n"
+            "именно те сферы, которые решают, включатся\n"
+            "эти гены или останутся «спящими».\n\n"
+            "Образ жизни влияет на их экспрессию на 60-70%.\n"
+            "Ты контролируешь большую часть.\n\n"
+            "💡 Аврора проанализирует твой профиль\n"
+            "и поможет выстроить жизнь так, чтобы\n"
+            "нейрохимический фон оставался стабильным. 💚\n\n"
+            "_На 4-м уровне: ДНК-тест (5-HTTLPR, COMT)\n"
+            "покажет точный нейрохимический профиль._"
         )
     elif h4 == "one":
         comment = (
             "🟡 Умеренный ментальный фактор.\n"
-            "Учту в рекомендациях по стрессу и сну. 💚"
+            "Аврора учтёт это в протоколах\n"
+            "по стрессу и сну. 💚"
         )
     elif h4 == "no":
         comment = (
@@ -38091,17 +38449,24 @@ async def process_h6(callback: CallbackQuery, state: FSMContext):
         h6_comment = (
             "🔴 Ранний онкологический анамнез в семье.\n"
             "Механизм репарации ДНК мог передаться.\n\n"
-            "Но это не приговор — образ жизни влияет\n"
-            "на экспрессию генов на 60-70%.\n"
-            "Правильный режим может остановить процесс\n"
-            "и не дать «плохим» генам включиться.\n\n"
-            "Я учту это в протоколах с первого дня. 💚"
+            "Но даже если передался — это не приговор.\n"
+            "Это сигнал: воспаление, токсическая нагрузка\n"
+            "и окислительный стресс — именно те сферы,\n"
+            "которые решают, включатся эти гены или нет.\n\n"
+            "Образ жизни влияет на их экспрессию на 60-70%.\n"
+            "Ты контролируешь большую часть.\n\n"
+            "💡 Аврора проанализирует твой профиль\n"
+            "и поможет выстроить жизнь так, чтобы\n"
+            "защитные механизмы работали, а не дремали. 💚\n\n"
+            "_На 4-м уровне: ДНК-тест (NRF2, BRCA-скрининг)\n"
+            "покажет точный риск и уточнит протоколы защиты._"
         )
     elif h6 == "50_65":
         h6_comment = (
             "🟡 Есть наследственный фактор.\n\n"
-            "Образ жизни решает — учту в рекомендациях\n"
-            "по питанию и протоколам защиты. 💚"
+            "Образ жизни решает — Аврора учтёт это\n"
+            "в рекомендациях по питанию\n"
+            "и протоколах защиты. 💚"
         )
     elif h6 == "after_65":
         h6_comment = (
@@ -38135,20 +38500,296 @@ async def process_h6(callback: CallbackQuery, state: FSMContext):
         "onboarding_step2_pending": 0,
     })
     await save_family_risk(callback.from_user.id, risk_data)
-    
-    # Определяем: standalone (Неделя 2) или legacy онбординг?
+
+    # ═══ ПОПРАВКА #181: Вопрос о курении — перед обонянием ═══
+    await callback.message.edit_text(
+        f"{h6_comment}\n\n"
+        "🚬 *Ещё один важный вопрос.*\n\n"
+        "Вы курите или курили?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Не курю", callback_data="smoke_never")],
+            [InlineKeyboardButton(text="🕊 Бросил(а) больше года назад", callback_data="smoke_quit_long")],
+            [InlineKeyboardButton(text="🌿 Бросаю / меньше года", callback_data="smoke_quit_recent")],
+            [InlineKeyboardButton(text="🚬 Курю", callback_data="smoke_active")],
+        ])
+    )
+    await state.set_state(OnboardingStates.waiting_smoking_status)
+
+
+@router.callback_query(OnboardingStates.waiting_smoking_status, F.data.startswith("smoke_"))
+async def process_smoking_status(callback: CallbackQuery, state: FSMContext):
+    """
+    ПОПРАВКА #181: Курение — статус.
+    Если активный курильщик — спрашиваем количество.
+    Остальные → сразу к обонянию.
+    """
+    await callback.answer()
+    status = callback.data.replace("smoke_", "")
+
+    status_comments = {
+        "never": "✅ Хорошо — это снижает риски по нескольким направлениям сразу.",
+        "quit_long": (
+            "🕊 Отлично — бросить курить больше года назад уже даёт "
+            "значимое восстановление сосудов и лёгких. "
+            "Аврора это учтёт."
+        ),
+        "quit_recent": (
+            "🌿 Это важный шаг. Организм уже начал восстанавливаться. "
+            "Аврора поддержит тебя в этом процессе."
+        ),
+    }
+
+    await save_user(callback.from_user.id, {"smoking_status": status})
+
+    if status == "active":
+        # Спрашиваем количество
+        await callback.message.edit_text(
+            "🚬 *Сколько примерно сигарет в день?*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="До 5 сигарет", callback_data="smokamt_light")],
+                [InlineKeyboardButton(text="5–15 сигарет", callback_data="smokamt_medium")],
+                [InlineKeyboardButton(text="Пачка и больше (20+)", callback_data="smokamt_heavy")],
+            ])
+        )
+        await state.set_state(OnboardingStates.waiting_smoking_amount)
+    else:
+        comment = status_comments.get(status, "Записала. 💚")
+        await _ask_smell(callback.message, state, prefix=comment)
+
+
+@router.callback_query(OnboardingStates.waiting_smoking_amount, F.data.startswith("smokamt_"))
+async def process_smoking_amount(callback: CallbackQuery, state: FSMContext):
+    """
+    ПОПРАВКА #181: Количество сигарет — финальный шаг.
+    После этого → вопрос об обонянии.
+    """
+    await callback.answer()
+    amount = callback.data.replace("smokamt_", "")
+
+    amount_comments = {
+        "light": (
+            "🚬 До 5 сигарет — риск есть, но он управляемый.\n"
+            "Аврора включит это в профиль рисков."
+        ),
+        "medium": (
+            "🚬 5–15 сигарет в день — это уже системное воспаление.\n"
+            "Особенно важно в связке с наследственностью.\n"
+            "Аврора учтёт это в рекомендациях."
+        ),
+        "heavy": (
+            "🚬 Пачка и больше — это значимый фактор риска\n"
+            "по онкологии, ССЗ и когнитивному здоровью.\n\n"
+            "Я понимаю, что бросить курить непросто.\n"
+            "Аврора не будет давить — но будет честно\n"
+            "показывать как это влияет именно на твой профиль. 💚"
+        ),
+    }
+
+    await save_user(callback.from_user.id, {
+        "smoking_status": "active",
+        "smoking_amount": amount,
+    })
+
+    comment = amount_comments.get(amount, "Записала. 💚")
+    await _ask_smell(callback.message, state, prefix=comment)
+
+
+async def _ask_smell(message, state: FSMContext, prefix: str = ""):
+    """Показывает вопрос об обонянии — общий переход из курения."""
+    text = ""
+    if prefix:
+        text = f"{prefix}\n\n"
+    text += (
+        "👃 *Последний вопрос — про ощущения.*\n\n"
+        "Замечали ли вы изменения в обонянии —\n"
+        "запахи стали менее яркими, слабее\n"
+        "или вы иногда их не чувствуете?"
+    )
+    await message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Нет, всё нормально", callback_data="smell_no")],
+            [InlineKeyboardButton(text="🦠 Да, но это было после COVID", callback_data="smell_covid")],
+            [InlineKeyboardButton(text="📉 Да, постепенно снизилось", callback_data="smell_gradual")],
+            [InlineKeyboardButton(text="🤷 Заметила, но не знаю почему", callback_data="smell_unknown")],
+        ])
+    )
+    await state.set_state(OnboardingStates.waiting_smell)
+
+
+@router.callback_query(OnboardingStates.waiting_smell, F.data.startswith("smell_"))
+async def process_smell(callback: CallbackQuery, state: FSMContext):
+    """
+    ПОПРАВКА #177: Обоняние — маркер ранней деменции.
+    Ключевое разделение: постковидное (временное) vs постепенное (сигнал).
+    """
+    await callback.answer()
+    smell = callback.data.replace("smell_", "")
+    await state.update_data(smell_change=smell)
+    await save_user(callback.from_user.id, {"smell_change": smell})
+
+    if smell == "covid":
+        comment = (
+            "🦠 _Постковидное снижение обоняния — отдельная история.\n"
+            "Оно обычно восстанавливается, но мы будем следить._ 💚"
+        )
+    elif smell == "gradual":
+        comment = (
+            "📝 _Зафиксировала. Постепенное снижение обоняния —\n"
+            "один из ранних сигналов, который важно отслеживать._ 💚"
+        )
+    elif smell == "unknown":
+        comment = "📝 _Хорошо, зафиксировала — будем наблюдать в динамике._ 💚"
+    else:
+        comment = "✅ _Отлично — с обонянием всё в норме._ 💚"
+
+    await callback.message.edit_text(
+        f"{comment}\n\n"
+        "👅 *И последнее.*\n\n"
+        "Изменился ли у вас вкус в последнее время —\n"
+        "еда кажется менее яркой, безвкусной,\n"
+        "или вкусовые предпочтения сильно поменялись?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Нет, всё как раньше", callback_data="taste_no")],
+            [InlineKeyboardButton(text="🦠 Да, после COVID — потом вернулось", callback_data="taste_covid")],
+            [InlineKeyboardButton(text="📉 Да, постепенно всё стало пресным", callback_data="taste_gradual")],
+            [InlineKeyboardButton(text="🔄 Вкусы резко поменялись (хочу непривычное)", callback_data="taste_changed")],
+            [InlineKeyboardButton(text="🤷 Заметила, но не знаю почему", callback_data="taste_unknown")],
+        ])
+    )
+    await state.set_state(OnboardingStates.waiting_taste)
+
+
+@router.callback_query(OnboardingStates.waiting_taste, F.data.startswith("taste_"))
+async def process_taste(callback: CallbackQuery, state: FSMContext):
+    """
+    ПОПРАВКА #177: Вкус — маркер ранней деменции.
+    'taste_changed' (резкая смена вкусов) = отдельный сигнал нарушений
+    зон мозга отвечающих за аппетит (лобные доли).
+    """
+    await callback.answer()
+    taste = callback.data.replace("taste_", "")
+    await state.update_data(taste_change=taste)
+    await save_user(callback.from_user.id, {"taste_change": taste})
+
+    if taste == "covid":
+        taste_comment = (
+            "🦠 _Постковидное изменение вкуса — понятно и ожидаемо.\n"
+            "Если не прошло более 6 месяцев — стоит упомянуть врачу._ 💚"
+        )
+    elif taste == "gradual":
+        taste_comment = (
+            "📝 _Постепенное угасание вкусов — зафиксировала.\n"
+            "Это важный сигнал, будем отслеживать._ 💚"
+        )
+    elif taste == "changed":
+        taste_comment = (
+            "📝 _Резкая смена вкусовых предпочтений — тоже зафиксировала.\n"
+            "Это может быть связано с изменениями в работе мозга.\n"
+            "Аврора будет следить за динамикой._ 💚"
+        )
+    elif taste == "unknown":
+        taste_comment = "📝 _Хорошо, наблюдаем в динамике._ 💚"
+    else:
+        taste_comment = "✅ _С вкусом всё в порядке._ 💚"
+
+    # ── ПОПРАВКА #181: вопрос про курение перед переходом дальше ──
+    await callback.message.answer(
+        f"{taste_comment}\n\n"
+        "🚬 *Последний вопрос этого блока.*\n\n"
+        "Как обстоит дело с курением?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Не курю", callback_data="smoking_never")],
+            [InlineKeyboardButton(text="🕊 Бросил(а) давно (год+)", callback_data="smoking_quit_long")],
+            [InlineKeyboardButton(text="🌿 Бросаю / меньше года", callback_data="smoking_quit_recent")],
+            [InlineKeyboardButton(text="🚬 Курю", callback_data="smoking_yes")],
+        ])
+    )
+    await state.set_state(OnboardingStates.waiting_smoking_status)
+
+
+@router.callback_query(OnboardingStates.waiting_smoking_status, F.data.startswith("smoking_"))
+async def process_smoking_status(callback: CallbackQuery, state: FSMContext):
+    """
+    ПОПРАВКА #181: Статус курения.
+    Если курит — спрашиваем сколько. Иначе идём дальше.
+    """
+    await callback.answer()
+    status = callback.data.replace("smoking_", "")
+    await state.update_data(smoking_status=status)
+    await save_user(callback.from_user.id, {"smoking_status": status})
+
+    if status == "yes":
+        # Спрашиваем количество
+        await callback.message.edit_text(
+            "🚬 *Сколько сигарет в день примерно?*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="До 5 сигарет", callback_data="smamt_light")],
+                [InlineKeyboardButton(text="5–15 сигарет", callback_data="smamt_moderate")],
+                [InlineKeyboardButton(text="Пачка и больше (20+)", callback_data="smamt_heavy")],
+            ])
+        )
+        await state.set_state(OnboardingStates.waiting_smoking_amount)
+    else:
+        # Комментарий и идём дальше
+        if status == "never":
+            comment = "✅ _Отлично — это убирает целый блок рисков._"
+        elif status == "quit_long":
+            comment = "💚 _Бросила больше года назад — организм уже значительно восстановился._"
+        else:
+            comment = "🌿 _Бросаешь — это важное решение. Аврора будет это учитывать._"
+
+        await callback.message.edit_text(comment, parse_mode="Markdown")
+        await _proceed_after_smoking(callback, state)
+
+
+@router.callback_query(OnboardingStates.waiting_smoking_amount, F.data.startswith("smamt_"))
+async def process_smoking_amount(callback: CallbackQuery, state: FSMContext):
+    """
+    ПОПРАВКА #181: Количество сигарет.
+    """
+    await callback.answer()
+    amount = callback.data.replace("smamt_", "")
+    await state.update_data(smoking_amount=amount)
+    await save_user(callback.from_user.id, {"smoking_amount": amount})
+
+    comments = {
+        "light":    "📝 _До 5 сигарет — зафиксировала. Риски есть, но накопление медленнее._",
+        "moderate": "📝 _5–15 сигарет в день — это уже системное влияние на сосуды и сон. Зафиксировала._",
+        "heavy":    (
+            "📝 _Пачка и больше — это серьёзная нагрузка на весь организм.\\n"
+            "Аврора будет учитывать это во всех оценках рисков._ 💚"
+        ),
+    }
+    await callback.message.edit_text(
+        comments.get(amount, "📝 _Зафиксировала._"),
+        parse_mode="Markdown"
+    )
+    await _proceed_after_smoking(callback, state)
+
+
+async def _proceed_after_smoking(callback: CallbackQuery, state: FSMContext):
+    """
+    ПОПРАВКА #181: Продолжаем онбординг после вопроса про курение.
+    Восстанавливаем оригинальный переход из process_taste.
+    """
+    data = await state.get_data()
     source = data.get("heredity_source", "standalone")
-    
+
     if source == "onboarding":
-        # Legacy путь — переход к циклу/обстоятельствам
         user = await get_user(callback.from_user.id)
         gender = user.get("gender", "female") if user else data.get("gender", "female")
         age_group = user.get("age_group", "30-39") if user else data.get("age_group", "30-39")
-        
+
         if gender == "female" and age_group not in ("60-69", "70+"):
             await state.set_state(OnboardingStates.waiting_cycle)
-            await callback.message.edit_text(
-                f"{h6_comment}\n\n"
+            await callback.message.answer(
                 "Хотите учитывать менструальный цикл?\n\n"
                 "💡 _Для женщин это важно: HRV, энергия\n"
                 "и настроение значительно меняются в разные\n"
@@ -38163,27 +38804,25 @@ async def process_h6(callback: CallbackQuery, state: FSMContext):
                 ])
             )
         else:
-            await callback.message.edit_text(
-                f"{h6_comment}\n\n➡️ Продолжаем.",
-                parse_mode="Markdown",
+            await callback.message.answer(
+                "➡️ Продолжаем.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="➡️ Продолжить", callback_data="heredity_to_life_events")]
                 ])
             )
     else:
-        # Standalone путь (Неделя 2) — пересчёт + уведомление
+        # Standalone путь (Неделя 2)
         user = await get_user(callback.from_user.id)
         name = user.get("name", "друг") if user else "друг"
-        
         result = await recalculate_vitamins_with_heredity(callback.from_user.id)
         changes = result.get("changes", [])
-        
+
         if changes:
             changes_text = ""
             for ch in changes:
                 changes_text += f"\n\n{ch['risk']}:\n  + {ch['added']}"
             
-            await callback.message.edit_text(
+            await callback.message.answer(
                 f"✅ *{name}, наследственность учтена!*\n\n"
                 f"Найдены семейные риски → скорректировала план:"
                 f"{changes_text}\n\n"
@@ -38198,7 +38837,7 @@ async def process_h6(callback: CallbackQuery, state: FSMContext):
                 ])
             )
         else:
-            await callback.message.edit_text(
+            await callback.message.answer(
                 f"✅ *{name}, наследственность учтена!*\n\n"
                 "Хорошие новости — критичных семейных\n"
                 "рисков не обнаружено 🎉\n\n"
@@ -41207,6 +41846,23 @@ async def _complete_morning_checkin(callback, state: FSMContext):
     except:
         pass
 
+    # ПОПРАВКА #190: крючок витамина Д — энергия ≤3 три дня подряд
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT morning_energy FROM daily_checkins
+                WHERE telegram_id = ?
+                ORDER BY created_at DESC LIMIT 5
+            """, (tid,))
+            rows = await cursor.fetchall()
+        energy_vals = [r["morning_energy"] for r in rows if r["morning_energy"] is not None]
+        low_energy_days = sum(1 for e in energy_vals[:5] if int(e) <= 3)
+        if low_energy_days >= 3:
+            asyncio.create_task(maybe_send_vitd_hook(tid, "energy_low"))
+    except Exception as e:
+        logger.warning(f"vitd energy trigger error: {e}")
+
     await state.clear()
 
 
@@ -41960,18 +42616,28 @@ async def evening_caffeine(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     caffeine = callback.data.replace("caffeine_", "")
     await state.update_data(caffeine=caffeine)
-    
+
+    # ═══ ПОПРАВКА #175: крючок CYP1A2 при позднем кофе — один раз за всё время ═══
+    late_caffeine = caffeine in ("one_evening", "two_plus")
+    dna_hook = ""
+    if late_caffeine:
+        dna_hook = await maybe_show_dna_hook(callback.from_user.id, "caffeine")
+
     # Удаляем предыдущее сообщение с кнопками
     try:
         await callback.message.delete()
     except:
         pass
-    
-    await callback.message.answer(
+
+    screens_text = (
         "📱 *Напоминаю: включи ночной режим на всех экранах.*\n\n"
         "Синий свет подавляет мелатонин на 50% —\n"
         "это напрямую влияет на качество сна\n"
-        "и продуктивность завтра.",
+        f"и продуктивность завтра.{dna_hook}"
+    )
+
+    await callback.message.answer(
+        screens_text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Включил(а)", callback_data="screens_reminder_done")],
@@ -42687,6 +43353,27 @@ async def evening_relaxation_final(callback: CallbackQuery, state: FSMContext):
             )
     except Exception as e:
         logger.error(f"Unload offer error: {e}")
+
+    # ПОПРАВКА #191: крючок сидячего образа жизни — 5 дней без активности
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT exercise FROM sleep_factors
+                WHERE telegram_id = ?
+                ORDER BY date DESC LIMIT 7
+            """, (callback.from_user.id,))
+            rows = await cursor.fetchall()
+        low_activity_days = sum(
+            1 for r in rows
+            if r["exercise"] in (None, "none", "low", 0, "0")
+        )
+        if low_activity_days >= 5:
+            asyncio.create_task(
+                maybe_send_sedentary_hook(callback.from_user.id, "checkin_pattern")
+            )
+    except Exception as e:
+        logger.warning(f"sedentary checkin trigger error: {e}")
 
     await state.clear()
 
@@ -45109,8 +45796,139 @@ CAFFEINE_REDUCTION_STAGES = [
 ]
 
 
+# ═══════════════════════════════════════════════════════════════════
+# ПОПРАВКА #175: ЕДИНЫЙ ГЕНЕТИЧЕСКИЙ КРЮЧОК — один раз, в нужный момент
+# ═══════════════════════════════════════════════════════════════════
+#
+# Проблема: если показывать «узнать на 4-м уровне» после каждого теста
+# за один вечер — это воспринимается как спам и разрушает доверие.
+#
+# Решение: один крючок на пользователя, в самый сильный момент.
+# Приоритет триггеров (от сильного к слабому):
+#   1. heredity   — упомянул болезнь в семье (деменция, ССЗ, диабет)
+#   2. stress     — PSS ≥ 20 (высокий стресс)
+#   3. anxiety    — GAD ≥ 10 (умеренная тревога)
+#   4. chronotype — сова или поздняя сова
+#   5. caffeine   — пил кофе после 16:00
+#
+# Флаг dna_hook_shown = 1 после показа → больше не показываем.
+#
+# Использование:
+#   hook = await maybe_show_dna_hook(telegram_id, trigger="stress")
+#   if hook:
+#       text += hook
+
+DNA_HOOKS = {
+    "heredity_dementia": (
+        "\n\n💡 _Наследственность — это вероятность, не приговор. "
+        "Ген APOE4 мог передаться, а мог нет. "
+        "Без ДНК-теста мы работаем с риском вслепую — "
+        "с тестом можно выстроить точную профилактику. "
+        "Это один из самых ценных анализов на 4-м уровне._"
+    ),
+    "heredity_cvd": (
+        "\n\n💡 _Сердечно-сосудистые заболевания у родственников — "
+        "сигнал проверить ген SOD2 (митохондриальная защита) "
+        "и MTHFR (гомоцистеин и воспаление). "
+        "Знание генотипа меняет стратегию профилактики конкретно для тебя. "
+        "Это — на 4-м уровне._"
+    ),
+    "heredity_diabetes": (
+        "\n\n💡 _Диабет в семье — повод проверить гены FTO и TCF7L2, "
+        "которые определяют чувствительность к углеводам. "
+        "У некоторых людей «здоровая» диета по общим стандартам "
+        "вызывает скачки сахара. Точно знать — на 4-м уровне._"
+    ),
+    "stress": (
+        "\n\n💡 _Реакция на стресс на 40-60% определяется геном COMT. "
+        "Он объясняет, почему одни «отряхиваются» быстро, "
+        "а другие переживают дольше — это не слабость, это биология. "
+        "Узнать свой вариант — на 4-м уровне._"
+    ),
+    "anxiety": (
+        "\n\n💡 _Склонность к тревоге во многом задана геном "
+        "серотонинового транспортёра 5-HTTLPR. "
+        "Если тревога — твой постоянный фон, это может быть не характер, "
+        "а биология. Подробнее — на 4-м уровне._"
+    ),
+    "chronotype_owl": (
+        "\n\n💡 _Хронотип меняется с сезоном, но генетическая основа — нет. "
+        "Гены CLOCK и PER2 определяют, насколько реально сдвинуть твой ритм "
+        "к более раннему без потери качества сна. "
+        "Узнать свои «фабричные настройки» — на 4-м уровне._"
+    ),
+    "chronotype_night_owl": (
+        "\n\n💡 _Поздний хронотип часто имеет прямую генетическую причину — "
+        "гены CLOCK и PER2 буквально задают поздний выброс мелатонина. "
+        "Важно знать это прежде чем пытаться сдвинуть режим: "
+        "иногда это невозможно без вреда. Проверить — на 4-м уровне._"
+    ),
+    "chronotype_lark": (
+        "\n\n💡 _Ранний подъём — это часто генетика, а не просто привычка. "
+        "Ген PER2 у жаворонков запускает мелатонин раньше обычного. "
+        "Знать это полезно: поздние смены режима даются таким людям "
+        "тяжелее, чем кажется. Подтвердить генетически — на 4-м уровне._"
+    ),
+    "chronotype_pigeon": (
+        "\n\n💡 _Нейтральный хронотип — самый гибкий, но и у него "
+        "есть генетические границы. Гены CLOCK и PER2 задают диапазон, "
+        "в котором ритм меняется без вреда. "
+        "Узнать свои границы — на 4-м уровне._"
+    ),
+    "caffeine": (
+        "\n\n💡 _То, как долго кофеин держится в крови, "
+        "на 70% определяется геном CYP1A2. "
+        "Медленные метаболизаторы выводят его в 2-3 раза дольше "
+        "и часто не чувствуют связи между вечерней чашкой и плохим сном. "
+        "Узнать свой тип — на 4-м уровне._"
+    ),
+}
+
+# Приоритет: чем меньше число — тем важнее показать первым
+DNA_HOOK_PRIORITY = {
+    "heredity_dementia": 1,
+    "heredity_cvd": 2,
+    "heredity_diabetes": 3,
+    "stress": 4,
+    "anxiety": 5,
+    "chronotype_night_owl": 6,
+    "chronotype_owl": 7,
+    "chronotype_lark": 8,
+    "chronotype_pigeon": 9,
+    "caffeine": 10,
+}
+
+
+async def maybe_show_dna_hook(telegram_id: int, trigger: str) -> str:
+    """
+    ПОПРАВКА #175: Возвращает текст генетического крючка если:
+      - пользователь ещё не видел крючок (dna_hook_shown = 0)
+      - этот триггер существует в DNA_HOOKS
+
+    После показа ставит флаг dna_hook_shown = 1 в БД.
+    Возвращает пустую строку если крючок уже был показан.
+    """
+    try:
+        user = await get_user(telegram_id)
+        if not user:
+            return ""
+        if user.get("dna_hook_shown", 0):
+            return ""  # уже видел — молчим
+        hook_text = DNA_HOOKS.get(trigger, "")
+        if not hook_text:
+            return ""
+        await save_user(telegram_id, {"dna_hook_shown": 1})
+        return hook_text
+    except Exception:
+        return ""
+
+
 def generate_late_caffeine_warning(name: str, time_category: str) -> str:
-    """Мягкое предупреждение если кофе поздно"""
+    """Мягкое предупреждение если кофе поздно.
+    Генетический крючок CYP1A2 НЕ добавляем здесь — функция синхронная,
+    а maybe_show_dna_hook асинхронная. Крючок вызывается отдельно
+    в async-обработчике вечернего чекина: await maybe_show_dna_hook(id, 'caffeine').
+    """
     if time_category == 'after_16':
         return f"☕ *{name}*, кофе после 16:00 — может аукнуться ночью. Кофеин живёт 5-6 часов!"
     elif time_category == 'after_14':
@@ -46322,6 +47140,14 @@ async def finish_work_conditions(callback: CallbackQuery, state: FSMContext):
     ])
     
     await callback.message.answer(result_text, parse_mode="Markdown", reply_markup=keyboard)
+
+    # ПОПРАВКА #191: крючок сидячего образа жизни
+    movement = answers.get("movement_breaks", "")
+    if movement in ("sitting_all_day", "sedentary"):
+        asyncio.create_task(
+            maybe_send_sedentary_hook(callback.from_user.id, "work_conditions")
+        )
+
     await state.clear()
 
 
@@ -48915,6 +49741,16 @@ async def main():
     scheduler.add_job(send_weekly_reports, "cron", minute="*")
     scheduler.add_job(send_test_reminders, "cron", minute="*")
     scheduler.add_job(send_vitamin_analysis_reminders, "cron", minute="*")  # Было hour=10 — теперь per-user TZ
+    # ПОПРАВКА #176: Детектив заболеваний — раз в месяц, 1-го числа
+    scheduler.add_job(send_monthly_disease_check, "cron", minute="*")
+    # ПОПРАВКА #179: Сезонный пересмотр хронотипа — 1 ноября и 1 апреля
+    scheduler.add_job(send_seasonal_chronotype_check, "cron", minute="*")
+    # ПОПРАВКА #180: Ежедневный умный совет — в 20:00 по местному времени
+    scheduler.add_job(send_daily_brain_tip, "cron", minute="*")
+    # ПОПРАВКА #184: Ежемесячный опрос прогресса — по воскресеньям
+    scheduler.add_job(send_monthly_progress_survey, "cron", minute="*")
+    # ПОПРАВКА #185: Поздравление с днём рождения — каждый день в 9:00
+    scheduler.add_job(send_birthday_greetings, "cron", minute="*")
     # ПОПРАВКА #138: Напоминание о дыхании 4-7-8 перед сном
     scheduler.add_job(send_breathing_478_reminders, "cron", minute="*")
     
@@ -50699,6 +51535,11 @@ def _build_bgs_worsening_msg(name: str, old_stage: int, new_stage: int, source_t
         )
 
     text += "\n\nМаршрут адаптирован под новую стадию."
+
+    # ПОПРАВКА #190: крючок витамина Д при стадии 3
+    if new_stage == 3:
+        asyncio.create_task(maybe_send_vitd_hook(telegram_id, "bgs3"))
+
     return text
 
 
@@ -55519,7 +56360,13 @@ async def onb_step1_complete(callback: CallbackQuery, state: FSMContext):
     name = user.get("name", "друг") if user else "друг"
     
     # Получаем данные мини-теста
-    pss4 = gad2 = sqs = ahs = circ_mini = 0
+    # ═══ ПОПРАВКА #171: None вместо 0 для перевёрнутых шкал ═══
+    # SQS (сон) и AHS (надпочечники) — перевёрнутые шкалы:
+    # 0 = худший результат, но 0 также = «тест не пройден».
+    # Используем None как маркер «нет данных», чтобы не показывать
+    # ложный 🔴 когда тест просто не был пройден.
+    pss4 = gad2 = circ_mini = 0
+    sqs = ahs = None  # None = тест не пройден
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -55531,8 +56378,8 @@ async def onb_step1_complete(callback: CallbackQuery, state: FSMContext):
             if row:
                 pss4 = row["pss4_score"] or 0
                 gad2 = row["gad2_score"] or 0
-                sqs = row["sqs_mini_score"] or 0
-                ahs = row["ahs_mini_score"] or 0
+                sqs = row["sqs_mini_score"]   # сохраняем None если NULL
+                ahs = row["ahs_mini_score"]   # сохраняем None если NULL
                 circ_mini = row["circ_mini_score"] or 0
     except Exception as e:
         print(f"⚠️ step1 mini test fetch: {e}")
@@ -55563,87 +56410,61 @@ async def onb_step1_complete(callback: CallbackQuery, state: FSMContext):
         else: return "🔴 повышена"
     
     def sqs_lvl(s):
+        if s is None: return "⬜ тест не пройден"
         if s > 14: return "🟢 хороший"
         elif s > 10: return "🟡 умеренный"
         elif s > 6: return "🟠 сниженный"
         else: return "🔴 плохой"
     
     def ahs_lvl(s):
+        if s is None: return "⬜ тест не пройден"
         if s <= 4: return "🟢 норма"
         elif s <= 8: return "🟡 нагрузка"
         elif s <= 12: return "🟠 утомление"
         else: return "🔴 истощение"
     
-    def circ_lvl(s):
-        if s >= 45: return "🟢 отличный"
-        elif s >= 30: return "🟡 умеренный"
-        elif s >= 20: return "🟠 сниженный"
-        else: return "🔴 критический"
-    
-    # Сообщение 1: Результаты
-    msg1 = (
-        f"📋 *{name}, ТВОЯ ДИАГНОСТИКА*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 *РЕЗУЛЬТАТЫ:*\n\n"
-        f"├─ 😰 Стресс: {pss4}/16 {pss4_lvl(pss4)}\n"
-        f"├─ 😟 Тревога: {gad2}/6 {gad2_lvl(gad2)}\n"
-        f"├─ 😴 Сон: {sqs}/17 {sqs_lvl(sqs)}\n"
-        f"├─ ⚡ Надпочечники: {ahs}/16 {ahs_lvl(ahs)}\n"
-        f"└─ 🌅 Циркадка: {circ_score}/60 {circ_lvl(circ_score)}\n"
-    )
-    
-    await callback.message.edit_text(msg1, parse_mode="Markdown")
-    await asyncio.sleep(0.5)
-    
-    # Приоритет (что выделить)
-    alerts = []
-    if pss4 > 10:
-        alerts.append("⚠️ Стресс высокий — это приоритет")
-    if gad2 >= 3:
-        alerts.append("⚠️ Тревожность повышена — учту")
-    if sqs < 8:
-        alerts.append("⚠️ Сон страдает — будем работать")
-    if ahs > 8:
-        alerts.append("⚠️ Надпочечники истощены — нужна поддержка")
-    if circ_score < 15:
-        alerts.append("⚠️ Циркадные ритмы нарушены — ключевой фактор")
-    
-    # ПОПРАВКА #40: Контекстная заметка для GAD-2
-    if gad2 < 3 and (pss4 >= 9 or ahs >= 9 or sqs <= 6):
-        _life_context = False
-        _body_mind = False
-        try:
-            life_ev = await get_life_events(callback.from_user.id)
-            if life_ev:
-                ev_count = sum([
-                    life_ev.get("has_loss", 0), life_ev.get("has_divorce", 0),
-                    life_ev.get("has_job_loss", 0), life_ev.get("has_illness", 0),
-                    life_ev.get("has_relocation", 0), life_ev.get("has_other", 0),
-                ])
-                em_state = life_ev.get("emotional_state", 5) or 5
-                if (pss4 >= 9 and ev_count >= 2) or ev_count >= 3 or (em_state <= 2 and pss4 >= 7):
-                    _life_context = True
-            
-            if not _life_context and (ahs >= 9 or sqs <= 6) and pss4 >= 7:
-                _body_mind = True
-        except:
-            pass
-        
-        if _life_context:
-            alerts.append("💡 Тревога в норме, но при вашем стрессе будем отслеживать")
-        elif _body_mind:
-            alerts.append("💡 Тело сигналит о перегрузке, хотя тревога не ощущается — стоит быть внимательнее к себе")
-    
-    alerts_text = "\n".join(alerts) if alerts else "✅ Критических отклонений нет"
-    
-    # Сообщение 2: Что видно + что пока нет
+    # ═══ ПОПРАВКА #172: убираем фиктивную таблицу msg1 ═══
+    # На этом этапе пройден только циркадный тест — он единственный реальный.
+    # Показываем персонализированный инсайт по circ_score вместо таблицы с нулями.
+
+    if circ_score >= 45:
+        circ_insight = (
+            f"🌅 *Циркадный ритм:* {circ_score}/60 — отличный результат.\n\n"
+            f"Твои внутренние часы работают хорошо. "
+            f"Это фундамент — остальные блоки покажут детали."
+        )
+    elif circ_score >= 30:
+        circ_insight = (
+            f"🌅 *Циркадный ритм:* {circ_score}/60 — умеренные нарушения.\n\n"
+            f"Есть моменты, где ритм сбивается. "
+            f"Чтобы понять причины — нужно пройти оставшиеся блоки."
+        )
+    elif circ_score >= 20:
+        circ_insight = (
+            f"🌅 *Циркадный ритм:* {circ_score}/60 — заметные нарушения.\n\n"
+            f"Внутренние часы работают не в полную силу. "
+            f"Это влияет на энергию, сон и восстановление. "
+            f"А ещё именно в глубоком сне мозг запускает глимфатическую систему — "
+            f"очищение от токсинов, которое возможно только при нормальном ритме.\n\n"
+            f"Продолжим — чтобы увидеть полную картину."
+        )
+    else:
+        circ_insight = (
+            f"🌅 *Циркадный ритм:* {circ_score}/60 — сильный сбой.\n\n"
+            f"Это один из ключевых факторов усталости и плохого восстановления. "
+            f"При сбитом ритме мозг не успевает запустить глимфатическую систему — "
+            f"ночное очищение от токсинов, которое снижает риск когнитивных нарушений.\n\n"
+            f"Хорошая новость — это корректируется. "
+            f"Осталось ещё 3 блока, чтобы выстроить полную картину."
+        )
+
+    # Сообщение: первый инсайт + приглашение продолжить
     msg2 = (
+        f"📋 *{name}, первый результат готов*\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🔍 *ЧТО УЖЕ ВИДНО:*\n"
-        f"{alerts_text}\n\n"
+        f"{circ_insight}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💡 *{name}, это базовая картина.*\n\n"
-        f"Для *полной картины* не хватает:\n\n"
+        f"💡 *Для полной картины не хватает:*\n\n"
         f"🔒 *Хронотип* — без него расписание\n"
         f"   не персонализировано под твой ритм\n\n"
         f"🔒 *Когнитивный профиль* — точка «ДО»\n"
@@ -55654,7 +56475,7 @@ async def onb_step1_complete(callback: CallbackQuery, state: FSMContext):
         f"⏱ Ещё *18 вопросов, \\~4 минуты* — и картина\n"
         f"станет полной."
     )
-    
+
     await callback.message.answer(
         msg2,
         parse_mode="Markdown",
@@ -55856,14 +56677,15 @@ async def onb_test_pause_2(callback: CallbackQuery, state: FSMContext):
 # ═══════════════════════════════════════════════════════════════
 
 ONB_REJUV_QUESTIONS = [
-    {"key": "skin_quality", "text": "🪞 Кожа (цвет, текстура, ровность):", "low": "Серая, сухая", "high": "Сияет"},
-    {"key": "eyes_brightness", "text": "✨ Блеск в глазах:", "low": "Тусклые", "high": "Яркие"},
-    {"key": "eyes_whites", "text": "👁 Белки глаз (чистота):", "low": "Жёлтые/красные", "high": "Чистые белые"},
-    {"key": "undereye", "text": "👀 Круги и отёки под глазами:", "low": "Сильные", "high": "Нет"},
-    {"key": "hair_quality", "text": "💇 Волосы (блеск, густота):", "low": "Тусклые, выпадают", "high": "Блестят, густые"},
-    {"key": "nails_quality", "text": "💅 Ногти:", "low": "Ломкие, слоятся", "high": "Крепкие, ровные"},
-    {"key": "edema", "text": "💧 Отёки тела (лицо, руки, ноги):", "low": "Сильные", "high": "Нет отёков"},
-    {"key": "overall_look", "text": "🪞 Общий вид в зеркале:", "low": "Уставший", "high": "Свежий, отдохнувший"},
+    {"key": "skin_quality",   "text": "🪞 Кожа (цвет, текстура, ровность):", "low": "1 — Серая, сухая, тусклая",    "high": "10 — Сияющая, ровная, упругая"},
+    {"key": "eyes_brightness","text": "✨ Блеск в глазах:",                    "low": "1 — Тусклые, усталые",         "high": "10 — Живые, искрящиеся"},
+    {"key": "eyes_vitality",  "text": "👁 Жизненная сила глаз (открытость, влажность, глубина):", "low": "1 — Сухие, прищуренные, пустые", "high": "10 — Открытые, влажные, выразительные"},
+    {"key": "eyes_whites",    "text": "👁 Белки глаз (чистота, белизна):",    "low": "1 — Жёлтые, красные сосуды",  "high": "10 — Чистые белоснежные"},
+    {"key": "undereye",       "text": "👀 Круги и отёки под глазами:",        "low": "1 — Сильные тёмные",          "high": "10 — Нет совсем"},
+    {"key": "hair_quality",   "text": "💇 Волосы (блеск, густота):",          "low": "1 — Тусклые, выпадают",       "high": "10 — Блестящие, густые"},
+    {"key": "nails_quality",  "text": "💅 Ногти:",                            "low": "1 — Ломкие, расслаиваются",   "high": "10 — Крепкие, гладкие, ровные"},
+    {"key": "edema",          "text": "💧 Отёки тела (лицо, руки, ноги):",   "low": "1 — Выраженные отёки",        "high": "10 — Нет отёков"},
+    {"key": "overall_look",   "text": "🪞 Общий вид в зеркале:",             "low": "1 — Уставший, постаревший",   "high": "10 — Свежий, помолодевший"},
 ]
 
 
@@ -55903,7 +56725,7 @@ async def show_onb_rejuv_question(callback: CallbackQuery, state: FSMContext):
         return
     
     q = ONB_REJUV_QUESTIONS[idx]
-    text = f"_{idx + 1} из {len(ONB_REJUV_QUESTIONS)}_\n\n{q['text']}\n\n1 = {q['low']}\n5 = {q['high']}"
+    text = f"_{idx + 1} из {len(ONB_REJUV_QUESTIONS)}_\n\n{q['text']}\n\n{q['low']}\n{q['high']}"
     
     await callback.message.edit_text(
         text,
@@ -55915,7 +56737,14 @@ async def show_onb_rejuv_question(callback: CallbackQuery, state: FSMContext):
                 InlineKeyboardButton(text="3", callback_data="onb_rj_3"),
                 InlineKeyboardButton(text="4", callback_data="onb_rj_4"),
                 InlineKeyboardButton(text="5", callback_data="onb_rj_5"),
-            ]
+            ],
+            [
+                InlineKeyboardButton(text="6", callback_data="onb_rj_6"),
+                InlineKeyboardButton(text="7", callback_data="onb_rj_7"),
+                InlineKeyboardButton(text="8", callback_data="onb_rj_8"),
+                InlineKeyboardButton(text="9", callback_data="onb_rj_9"),
+                InlineKeyboardButton(text="10", callback_data="onb_rj_10"),
+            ],
         ])
     )
     await state.set_state(OnboardingStates.waiting_onb_rejuv)
@@ -56939,11 +57768,27 @@ async def show_stress_results(callback: CallbackQuery, state: FSMContext, result
         status_emoji = "🔴"
         level = "высокий"
     
-    short_text = f"""🔥 *Стресс: {pss}/40* {status_emoji}
-😰 *Тревожность: {gad}/21*
-_{level}_
+    # ═══ ПОПРАВКА #175: один генетический крючок — только если ещё не видел ═══
+    # Определяем самый релевантный триггер для этого пользователя.
+    # Сама функция проверит флаг dna_hook_shown и вернёт "" если уже было.
+    if gad >= 10:
+        trigger = "anxiety"
+    elif pss >= 20:
+        trigger = "stress"
+    else:
+        trigger = ""
 
-✅ Записала! Идём дальше."""
+    genetic_hook = await maybe_show_dna_hook(
+        callback.from_user.id, trigger
+    ) if trigger else ""
+
+    short_text = (
+        f"🔥 *Стресс: {pss}/40* {status_emoji}\n"
+        f"😰 *Тревожность: {gad}/21*\n"
+        f"_{level}_"
+        f"{genetic_hook}\n\n"
+        f"✅ Записала! Идём дальше."
+    )
 
     buttons = []
     
@@ -57847,19 +58692,49 @@ async def chronotype_q3(callback: CallbackQuery, state: FSMContext):
     }
     emoji, type_name = CHRONO_NAMES.get(chronotype, ("🕊", "ГОЛУБЬ"))
 
+    # ═══ ПОПРАВКА #175: персонализированная подача + прямой переход к ДНК ═══
     CHRONO_NOTES = {
-        "lark": "Твой организм настроен просыпаться рано — это хорошая база.",
-        "pigeon": "Хорошая новость — твой организм настроен вырабатывать мелатонин вовремя.",
-        "owl": "Твой мозг хочет засыпать позже — это физиология, не лень.",
-        "night_owl": "Сейчас ты ложишься очень поздно и теряешь пик очистки мозга во сне.",
+        "lark": (
+            "Твой организм настроен просыпаться рано — это хорошая база.\n\n"
+            "🧬 *Но вот что важно знать:* это поведенческий хронотип — "
+            "он меняется с сезоном и режимом. "
+            "Генетический хронотип (гены CLOCK, PER2) — это твои «фабричные настройки», "
+            "которые не меняются никогда. Он покажет, "
+            "насколько твой ранний подъём — природная сила, а не привычка."
+        ),
+        "pigeon": (
+            "Хорошая новость — твой организм настроен вырабатывать мелатонин вовремя.\n\n"
+            "🧬 *Но вот что важно знать:* это поведенческий хронотип — "
+            "он плавает в зависимости от сезона и образа жизни. "
+            "Генетический хронотип (гены CLOCK, PER2) покажет твою истинную природу — "
+            "и позволит настроить расписание точно под тебя, а не под среднестатистического человека."
+        ),
+        "owl": (
+            "Твой мозг хочет засыпать позже — это физиология, не лень.\n\n"
+            "🧬 *Но вот что важно знать:* если это записано в генах CLOCK и PER2 — "
+            "бороться с этим бессмысленно и вредно. "
+            "Генетический хронотип покажет, можно ли сдвинуть твой ритм — "
+            "и на сколько, без потери качества сна и очистки мозга."
+        ),
+        "night_owl": (
+            "Сейчас ты ложишься очень поздно и теряешь пик очистки мозга во сне.\n\n"
+            "🧬 *Но важно понять причину:* это привычка или генетика? "
+            "Если гены CLOCK говорят «поздний тип» — резкий сдвиг на ранний режим "
+            "только навредит. Генетический тест даст точный ответ — "
+            "и мы выстроим протокол под твою реальную природу."
+        ),
     }
     chrono_note = CHRONO_NOTES.get(chronotype, "")
 
+    # ═══ ПОПРАВКА #175: один генетический крючок — только если ещё не видел ═══
+    chrono_trigger = f"chronotype_{chronotype}"  # chronotype_owl / lark / pigeon / night_owl
+    chrono_genetic_hook = await maybe_show_dna_hook(callback.from_user.id, chrono_trigger)
+
     text = (
         f"{emoji} {name}, ТВОЙ ХРОНОТИП — *{type_name}*\n\n"
-        f"{chrono_note}\n\n"
-        f"💡 Для точного понимания существуют генетические тесты.\n"
-        f"Если захочешь — обсудим позже.\n\n"
+        f"{chrono_note}"
+        f"{chrono_genetic_hook}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"А сейчас давай посмотрим как ты живёшь.\n"
         f"Во сколько ты *реально* обычно ложишься?"
     )
@@ -57874,6 +58749,7 @@ async def chronotype_q3(callback: CallbackQuery, state: FSMContext):
              InlineKeyboardButton(text="22:00-23:00", callback_data="real_bed_normal")],
             [InlineKeyboardButton(text="23:00-00:00", callback_data="real_bed_late"),
              InlineKeyboardButton(text="После 00:00", callback_data="real_bed_very_late")],
+            [InlineKeyboardButton(text="🧬 Узнать генетический хронотип", callback_data="genetics_menu")],
         ])
     )
 
@@ -61370,6 +62246,107 @@ async def show_summary_detailed(callback: CallbackQuery):
         await start_soft_start_program(callback.from_user.id)
 
 
+# ═══════════════════════════════════════════════════════════════════
+# ПОПРАВКА #178: АРХИВ ОТЧЁТОВ
+# ═══════════════════════════════════════════════════════════════════
+
+async def save_report_snapshot(telegram_id: int, data: dict) -> None:
+    """
+    Сохраняет снимок ключевых показателей при просмотре подробного отчёта.
+    Первый снимок помечается is_first=1 и никогда не перезаписывается.
+    """
+    try:
+        sqs    = data.get("sqs") or {}
+        stress = data.get("stress") or {}
+        ahs    = data.get("ahs") or {}
+        circ   = data.get("circadian") or {}
+        user   = data.get("user") or {}
+
+        bio_age   = user.get("biological_age") or user.get("bio_age")
+        chrono    = user.get("age") or user.get("chrono_age")
+        chronotype = user.get("chronotype", "pigeon")
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Проверяем есть ли уже снимки для этого пользователя
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM report_snapshots WHERE telegram_id = ?",
+                (telegram_id,)
+            )
+            count = (await cursor.fetchone())[0]
+            is_first = 1 if count == 0 else 0
+
+            await db.execute("""
+                INSERT INTO report_snapshots (
+                    telegram_id, created_at,
+                    sqs_total, sqs_level,
+                    pss_total, stress_level, gad_total,
+                    ahs_total, ahs_stage,
+                    circadian_score, circadian_level,
+                    bio_age, chrono_age, chronotype,
+                    is_first
+                ) VALUES (
+                    ?, datetime('now'),
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?
+                )
+            """, (
+                telegram_id,
+                sqs.get("sqs_total"), sqs.get("sqs_level"),
+                stress.get("pss_total"), stress.get("stress_level"),
+                stress.get("gad_total"),
+                ahs.get("ahs_total"), ahs.get("hpa_stage") or ahs.get("ahs_stage"),
+                circ.get("circadian_score"), circ.get("circadian_level"),
+                bio_age, chrono, chronotype,
+                is_first
+            ))
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"save_report_snapshot error: {e}")
+
+
+async def format_snapshot(snap: dict, label: str) -> str:
+    """Форматирует один снимок отчёта для показа пользователю."""
+    sqs    = snap.get("sqs_total")
+    pss    = snap.get("pss_total")
+    gad    = snap.get("gad_total")
+    ahs    = snap.get("ahs_total")
+    stage  = snap.get("ahs_stage")
+    circ   = snap.get("circadian_score")
+    bio    = snap.get("bio_age")
+    chrono = snap.get("chrono_age")
+    ctype  = snap.get("chronotype", "")
+
+    chrono_names = {
+        "lark": "🌅 Жаворонок", "owl": "🦉 Сова",
+        "night_owl": "🌑 Поздняя сова", "pigeon": "🕊 Голубь"
+    }
+
+    lines = [f"📋 *{label}*\n"]
+    if sqs is not None:
+        emoji = "🟢" if sqs >= 25 else "🟡" if sqs >= 15 else "🔴"
+        lines.append(f"{emoji} Сон (SQS): *{sqs}/40*")
+    if pss is not None:
+        emoji = "🟢" if pss < 14 else "🟡" if pss < 20 else "🔴"
+        lines.append(f"{emoji} Стресс (PSS): *{pss}/40*")
+    if gad is not None:
+        emoji = "🟢" if gad < 5 else "🟡" if gad < 10 else "🔴"
+        lines.append(f"{emoji} Тревога (GAD): *{gad}/21*")
+    if ahs is not None:
+        emoji = "🟢" if (stage or 0) <= 1 else "🟡" if (stage or 0) == 2 else "🔴"
+        lines.append(f"{emoji} Надпочечники (AHS): *{ahs}* (стадия {stage or '—'})")
+    if circ is not None:
+        emoji = "🟢" if circ >= 25 else "🟡" if circ >= 15 else "🔴"
+        lines.append(f"{emoji} Циркадка: *{circ}/40*")
+    if bio and chrono:
+        diff = bio - chrono
+        emoji = "🟢" if diff <= 0 else "🟡" if diff <= 3 else "🔴"
+        lines.append(f"{emoji} Биовозраст: *{bio}* (хронологический: {chrono})")
+    if ctype:
+        lines.append(f"⏰ Хронотип: {chrono_names.get(ctype, ctype)}")
+
+    return "\n".join(lines)
+
+
 @router.callback_query(F.data == "detailed_report")
 async def show_detailed_report(callback: CallbackQuery):
     """
@@ -61383,6 +62360,8 @@ async def show_detailed_report(callback: CallbackQuery):
     # ═══ END PRO-ГЕЙТ ═══
     
     data = await collect_summary_data(callback.from_user.id)
+    # ПОПРАВКА #178: сохраняем снимок показателей на эту дату
+    await save_report_snapshot(callback.from_user.id, data)
     name = data.get("name", "друг")
     user = data.get("user") or {}
     
@@ -61495,6 +62474,8 @@ async def show_detailed_report(callback: CallbackQuery):
     buttons = [
         [InlineKeyboardButton(text="🎯 Цели и план", callback_data="goals_and_plan")],
         [InlineKeyboardButton(text="📋 Сводный отчёт", callback_data="summary_detailed")],
+        # ПОПРАВКА #178: кнопка стартового отчёта
+        [InlineKeyboardButton(text="🕰 Мой стартовый отчёт", callback_data="show_first_snapshot")],
         [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_menu")]
     ]
     
@@ -61503,6 +62484,97 @@ async def show_detailed_report(callback: CallbackQuery):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
+
+
+@router.callback_query(F.data == "show_first_snapshot")
+async def show_first_snapshot_handler(callback: CallbackQuery):
+    """
+    ПОПРАВКА #178: Показывает стартовый снимок и сравнивает с последним.
+    Если снимок один — говорит что прогресс появится после следующего отчёта.
+    """
+    await callback.answer()
+    tid = callback.from_user.id
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+
+            # Первый снимок
+            cursor = await db.execute("""
+                SELECT * FROM report_snapshots
+                WHERE telegram_id = ?
+                ORDER BY created_at ASC LIMIT 1
+            """, (tid,))
+            first = await cursor.fetchone()
+
+            # Последний снимок (может совпадать с первым)
+            cursor = await db.execute("""
+                SELECT * FROM report_snapshots
+                WHERE telegram_id = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (tid,))
+            latest = await cursor.fetchone()
+
+            # Количество снимков
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM report_snapshots WHERE telegram_id = ?",
+                (tid,)
+            )
+            total = (await cursor.fetchone())[0]
+
+        if not first:
+            await callback.message.answer(
+                "📋 Стартовый отчёт появится после первого просмотра подробного отчёта.",
+                parse_mode="Markdown"
+            )
+            return
+
+        first = dict(first)
+        first_date = first.get("created_at", "")[:10]
+        first_text = await format_snapshot(first, f"Старт · {first_date}")
+        await callback.message.answer(first_text, parse_mode="Markdown")
+
+        # Если снимков больше одного — показываем сравнение
+        if total > 1:
+            latest = dict(latest)
+            latest_date = latest.get("created_at", "")[:10]
+            latest_text = await format_snapshot(latest, f"Сейчас · {latest_date}")
+            await callback.message.answer(latest_text, parse_mode="Markdown")
+
+            # Считаем дельту по ключевым показателям
+            delta_lines = []
+            pairs = [
+                ("sqs_total",      "Сон (SQS)",      True),
+                ("pss_total",      "Стресс (PSS)",   False),
+                ("gad_total",      "Тревога (GAD)",  False),
+                ("circadian_score","Циркадка",        True),
+                ("bio_age",        "Биовозраст",      False),
+            ]
+            for key, label, higher_is_better in pairs:
+                v1 = first.get(key)
+                v2 = latest.get(key)
+                if v1 is not None and v2 is not None:
+                    diff = v2 - v1
+                    if diff == 0:
+                        delta_lines.append(f"➡️ {label}: без изменений")
+                    elif (diff > 0) == higher_is_better:
+                        delta_lines.append(f"📈 {label}: +{abs(diff)} ✅")
+                    else:
+                        delta_lines.append(f"📉 {label}: -{abs(diff)}")
+
+            if delta_lines:
+                delta_text = "📊 *Динамика с первого отчёта:*\n\n" + "\n".join(delta_lines)
+                await callback.message.answer(delta_text, parse_mode="Markdown")
+
+        else:
+            await callback.message.answer(
+                "_Это твой первый отчёт — прогресс появится когда откроешь подробный отчёт в следующий раз._",
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.warning(f"show_first_snapshot_handler error: {e}")
+        await callback.message.answer("Не удалось загрузить архив. Попробуй позже.")
 
 
 @router.callback_query(F.data == "goals_and_plan")
@@ -86919,16 +87991,3826 @@ async def generate_detective_weekly(telegram_id: int) -> str:
         return ""
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ПОПРАВКА #176: ДЕТЕКТИВ ЗАБОЛЕВАНИЙ — detect_disease_risk_by_markers()
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Собирает маркеры из ВСЕХ источников данных за последние 30 дней
+# и строит персональные цепочки рисков по 5 заболеваниям.
+#
+# Принципы (из методологии):
+#   • НЕ пугаем — "обратимо", "управляемо", "есть выход"
+#   • НЕ диагностируем — "вижу маркеры", не "у тебя болезнь"
+#   • Показываем связи которые человек не видит сам
+#   • Даём одно конкретное действие
+#   • Порог срабатывания: 3+ маркера для одного заболевания
+#
+# Вызывается: раз в месяц из планировщика send_monthly_disease_check()
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def collect_disease_markers(telegram_id: int) -> dict:
+    """
+    Собирает все маркеры риска заболеваний из БД за последние 30 дней.
+    Возвращает словарь с булевыми значениями и числовыми данными.
+    """
+    markers = {
+        # ── Сон ──────────────────────────────────────────────────
+        "sleep_short": False,       # Сон <7 часов (среднее за 30 дней)
+        "sleep_avg_hours": None,    # Среднее кол-во часов сна
+        "frequent_wakeups": False,  # 3+ пробуждения за ночь (из SQS)
+        "apnea_risk": False,        # Риск апноэ (красная кнопка SQS)
+        "circadian_red": False,     # Циркадка 🔴 (score < 20)
+        "circadian_score": None,
+
+        # ── Стресс и надпочечники ─────────────────────────────────
+        "stress_high": False,       # PSS ≥ 20 последний тест
+        "pss_score": None,
+        "ahs_red": False,           # Надпочечники 🔴 (стадия 3+)
+        "ahs_stage": None,
+        "second_wind": False,       # Второе дыхание после 20:00
+
+        # ── Питание и метаболизм ──────────────────────────────────
+        "sweet_craving": False,     # Тяга к сладкому (AHS q6 или чекин)
+        "late_meal": False,         # Поздний ужин >21:00 (>50% дней)
+        "skip_breakfast": False,    # Пропуск завтрака (>50% дней)
+        "postprandial_fatigue": False,  # Сонливость после еды
+        "waist_risk": False,        # Талия >80 (ж) / >94 (м)
+        "waist_cm": None,
+
+        # ── Эмоции и психика ──────────────────────────────────────
+        "mood_low_trend": False,    # Настроение ≤3 чаще 50% дней
+        "isolation": False,         # "Не с кем поговорить" (SOS scenario)
+        "emotional_suppression": False,  # Разрыв: кнопка 😊 vs разгрузка (гнев/бессилие)
+        "anxiety_gad": False,       # GAD ≥ 10
+
+        # ── Образ жизни ───────────────────────────────────────────
+        "night_shifts": False,      # Ночные смены
+        "no_exercise": False,       # Нет физической активности (>14 дней)
+
+        # ── Наследственность ─────────────────────────────────────
+        "heredity_dementia": False,
+        "heredity_cvd": False,
+        "heredity_diabetes": False,
+        "heredity_depression": False,
+        "heredity_cancer": False,
+
+        # ── Физиология ───────────────────────────────────────────
+        "menopause": False,         # Менопауза / перименопауза
+        "dermographism_spasm": False,  # Белый дермографизм (спазм)
+
+        # ── Когниция ─────────────────────────────────────────────
+        "brain_fog_trend": False,   # Туман/забывчивость (тренд)
+
+        # ── Курение ──────────────────────────────────────────────
+        "smoking_current": False,   # Курит сейчас
+        "smoking_heavy":   False,   # Пачка и больше
+        "smoking_quit":    False,   # Бросил(а)
+    }
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+
+            # ── Сон ──────────────────────────────────────────────
+            cursor = await db.execute("""
+                SELECT sqs_total, apnea_red_button,
+                       q7_wake_count, q8_snoring, q9_breath_stop
+                FROM sleep_assessment
+                WHERE telegram_id = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row:
+                row = dict(row)
+                sqs = row.get("sqs_total") or 0
+                markers["apnea_risk"] = bool(row.get("apnea_red_button"))
+                # SQS ≤ 10 = плохой сон
+                if sqs > 0 and sqs <= 10:
+                    markers["sleep_short"] = True
+                # Частые пробуждения: q7 = 3+ раз за ночь
+                wakeups = row.get("q7_wake_count") or 0
+                if str(wakeups) in ("3", "4", "3_plus", "many"):
+                    markers["frequent_wakeups"] = True
+
+            # ── Среднее время сна из чекинов ─────────────────────
+            cursor = await db.execute("""
+                SELECT AVG(sleep_quality) as avg_sq,
+                       AVG(morning_energy) as avg_energy
+                FROM daily_checkins
+                WHERE telegram_id = ?
+                AND date >= date('now', '-30 days')
+                AND checkin_type = 'morning'
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row:
+                row = dict(row)
+                avg_sq = row.get("avg_sq")
+                if avg_sq and avg_sq < 4:
+                    markers["sleep_short"] = True
+
+            # ── Циркадка ─────────────────────────────────────────
+            cursor = await db.execute("""
+                SELECT circadian_score FROM circadian_tests
+                WHERE telegram_id = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row:
+                score = dict(row).get("circadian_score") or 0
+                markers["circadian_score"] = score
+                markers["circadian_red"] = score > 0 and score < 20
+
+            # ── Стресс ───────────────────────────────────────────
+            cursor = await db.execute("""
+                SELECT pss_total FROM stress_records
+                WHERE telegram_id = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row:
+                pss = dict(row).get("pss_total") or 0
+                markers["pss_score"] = pss
+                markers["stress_high"] = pss >= 20
+
+            # ── Надпочечники (AHS) ───────────────────────────────
+            cursor = await db.execute("""
+                SELECT ahs_total, ahs_stage FROM ahs_records
+                WHERE telegram_id = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row:
+                row = dict(row)
+                stage = row.get("ahs_stage") or 0
+                markers["ahs_stage"] = stage
+                markers["ahs_red"] = stage >= 3
+                # Тяга к сладкому — AHS вопрос 6
+                ahs_total = row.get("ahs_total") or 0
+                if ahs_total >= 8:
+                    markers["sweet_craving"] = True
+
+            # ── Тревожность ───────────────────────────────────────
+            cursor = await db.execute("""
+                SELECT gad_total FROM anxiety_tests
+                WHERE telegram_id = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row:
+                gad = dict(row).get("gad_total") or 0
+                markers["anxiety_gad"] = gad >= 10
+
+            # ── Настроение и второе дыхание (чекины 30 дней) ─────
+            cursor = await db.execute("""
+                SELECT mood, stress, scenario, sleepiness, breakfast, late_meal
+                FROM daily_checkins
+                WHERE telegram_id = ?
+                AND date >= date('now', '-30 days')
+            """, (telegram_id,))
+            rows = await cursor.fetchall()
+            if rows:
+                rows = [dict(r) for r in rows]
+                total = len(rows)
+                low_mood_days = sum(
+                    1 for r in rows if (r.get("mood") or 5) <= 3
+                )
+                if total > 0 and low_mood_days / total >= 0.5:
+                    markers["mood_low_trend"] = True
+
+                second_wind_days = sum(
+                    1 for r in rows
+                    if r.get("sleepiness") in ("second_wind", "esleep_second_wind")
+                )
+                if second_wind_days >= 5:
+                    markers["second_wind"] = True
+
+                skip_bfast = sum(
+                    1 for r in rows
+                    if r.get("breakfast") in ("none", "skip", "coffee_only", "mbreakfast_coffee")
+                )
+                if total > 0 and skip_bfast / total >= 0.5:
+                    markers["skip_breakfast"] = True
+
+                late_meals = sum(
+                    1 for r in rows if r.get("late_meal") in ("after21", "heavy_late")
+                )
+                if total > 0 and late_meals / total >= 0.5:
+                    markers["late_meal"] = True
+
+                # Тяга к сладкому из чекинов
+                craving_days = sum(
+                    1 for r in rows
+                    if r.get("scenario") in ("craving", "sweet_craving")
+                )
+                if craving_days >= 5:
+                    markers["sweet_craving"] = True
+
+            # ── Изоляция (SOS-паттерн) ───────────────────────────
+            cursor = await db.execute("""
+                SELECT COUNT(*) as cnt FROM sos_sessions
+                WHERE telegram_id = ?
+                AND scenario IN ('loneliness', 'isolation', 'no_one_to_talk')
+                AND created_at >= date('now', '-30 days')
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row and dict(row).get("cnt", 0) >= 2:
+                markers["isolation"] = True
+
+            # ── Подавление эмоций: кнопка 😊, разгрузка — гнев/бессилие
+            cursor = await db.execute("""
+                SELECT COUNT(*) as cnt FROM sos_sessions
+                WHERE telegram_id = ?
+                AND scenario IN ('anger', 'helplessness', 'frustration', 'rage')
+                AND created_at >= date('now', '-30 days')
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            anger_releases = dict(row).get("cnt", 0) if row else 0
+
+            cursor = await db.execute("""
+                SELECT COUNT(*) as cnt FROM daily_checkins
+                WHERE telegram_id = ?
+                AND mood >= 7
+                AND date >= date('now', '-30 days')
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            high_mood_reports = dict(row).get("cnt", 0) if row else 0
+
+            # Разрыв: много "всё хорошо" + часто разгрузка гнева
+            if high_mood_reports >= 10 and anger_releases >= 3:
+                markers["emotional_suppression"] = True
+
+            # ── Физическая активность ─────────────────────────────
+            cursor = await db.execute("""
+                SELECT COUNT(*) as active_days
+                FROM daily_checkins
+                WHERE telegram_id = ?
+                AND date >= date('now', '-30 days')
+                AND scenario IN ('exercise_done', 'workout', 'active_day')
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row and dict(row).get("active_days", 0) < 4:
+                markers["no_exercise"] = True
+
+            # ── Ночные смены ──────────────────────────────────────
+            cursor = await db.execute("""
+                SELECT has_night_shifts, night_shifts
+                FROM work_profile
+                WHERE telegram_id = ?
+                ORDER BY id DESC LIMIT 1
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row:
+                row = dict(row)
+                if row.get("has_night_shifts") or row.get("night_shifts") not in (None, 0, "0", "none", "no"):
+                    markers["night_shifts"] = True
+
+            # ── Наследственность ──────────────────────────────────
+            cursor = await db.execute("""
+                SELECT h1_dementia, h2_cvd, h3_diabetes,
+                       h4_mental, h5_longevity, h6_cancer
+                FROM heredity_data
+                WHERE telegram_id = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row:
+                row = dict(row)
+                markers["heredity_dementia"] = row.get("h1_dementia") in ("parent", "grandparent", "multiple")
+                markers["heredity_cvd"] = row.get("h2_cvd") in ("multiple", "one")
+                markers["heredity_diabetes"] = row.get("h3_diabetes") in ("type2", "unknown_type")
+                markers["heredity_depression"] = row.get("h4_mental") in ("multiple", "one")
+                markers["heredity_cancer"] = row.get("h6_cancer") in ("before_50", "50_65")
+
+            # ── Пользователь: пол, талия, менопауза ───────────────
+            cursor = await db.execute("""
+                SELECT gender, waist_cm, menopause_status, andropause_probable
+                FROM users WHERE telegram_id = ?
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row:
+                row = dict(row)
+                gender = row.get("gender", "female")
+                waist = row.get("waist_cm")
+                markers["waist_cm"] = waist
+                if waist:
+                    threshold = 80 if gender == "female" else 94
+                    markers["waist_risk"] = waist > threshold
+                menopause = row.get("menopause_status", "none")
+                markers["menopause"] = menopause in ("menopause", "perimenopause")
+
+            # ── Сонливость после еды ──────────────────────────────
+            cursor = await db.execute("""
+                SELECT tired_after_eating, postprandial_fatigue
+                FROM lifestyle_profile
+                WHERE telegram_id = ?
+                ORDER BY id DESC LIMIT 1
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row:
+                row = dict(row)
+                if row.get("tired_after_eating") or row.get("postprandial_fatigue"):
+                    markers["postprandial_fatigue"] = True
+
+            # ── Обоняние и вкус (ПОПРАВКА #177) ──────────────────
+            # 'gradual'/'unknown' = нейродегенеративный сигнал
+            # 'covid' = исключаем — постковидное, временное
+            cursor = await db.execute("""
+                SELECT smell_change, taste_change, smoking_status, smoking_amount FROM users
+                WHERE telegram_id = ?
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row:
+                row = dict(row)
+                markers["smell_loss"] = row.get("smell_change") in ("gradual", "unknown")
+                markers["taste_loss"] = row.get("taste_change") in ("gradual", "changed", "unknown")
+                # ПОПРАВКА #181: курение
+                sm_status = row.get("smoking_status", "never")
+                sm_amount = row.get("smoking_amount")
+                markers["smoking_current"] = sm_status == "active"
+                markers["smoking_heavy"]   = sm_status == "active" and sm_amount == "heavy"
+                markers["smoking_quit"]    = sm_status in ("quit_long", "quit_recent")
+
+            # ── Дермографизм ──────────────────────────────────────
+            cursor = await db.execute("""
+                SELECT dermographism_result
+                FROM measurements
+                WHERE telegram_id = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (telegram_id,))
+            row = await cursor.fetchone()
+            if row:
+                result = dict(row).get("dermographism_result", "")
+                markers["dermographism_spasm"] = result in ("white", "spasm", "белый")
+
+    except Exception as e:
+        logger.warning(f"collect_disease_markers error: {e}")
+
+    return markers
+
+
+def score_disease_risks(markers: dict) -> dict:
+    """
+    Подсчитывает маркеры по каждому заболеванию.
+    Возвращает dict с количеством маркеров и списком сработавших.
+    Наследственность = +1 маркер И усиливает итоговое сообщение.
+    """
+    risks = {}
+
+    # ── 1. ДИАБЕТ 2 ТИПА ──────────────────────────────────────────────────
+    diabetes_markers = []
+    if markers["sweet_craving"]:
+        diabetes_markers.append("sweet_craving")
+    if markers["postprandial_fatigue"]:
+        diabetes_markers.append("postprandial_fatigue")
+    if markers["waist_risk"]:
+        diabetes_markers.append("waist_risk")
+    if markers["skip_breakfast"]:
+        diabetes_markers.append("skip_breakfast")
+    if markers["late_meal"]:
+        diabetes_markers.append("late_meal")
+    if markers["stress_high"]:
+        diabetes_markers.append("stress_high")
+    if markers["sleep_short"]:
+        diabetes_markers.append("sleep_short")
+    if markers["menopause"]:
+        diabetes_markers.append("menopause")
+    if markers["emotional_suppression"]:
+        diabetes_markers.append("emotional_suppression")
+    heredity_boost = markers["heredity_diabetes"]
+    if heredity_boost:
+        diabetes_markers.append("heredity_diabetes")
+    risks["diabetes"] = {
+        "count": len(diabetes_markers),
+        "markers": diabetes_markers,
+        "heredity": heredity_boost,
+    }
+
+    # ── 2. СЕРДЕЧНО-СОСУДИСТЫЕ ────────────────────────────────────────────
+    cvd_markers = []
+    if markers["stress_high"]:
+        cvd_markers.append("stress_high")
+    if markers["ahs_red"]:
+        cvd_markers.append("ahs_red")
+    if markers["sleep_short"]:
+        cvd_markers.append("sleep_short")
+    if markers["frequent_wakeups"]:
+        cvd_markers.append("frequent_wakeups")
+    if markers["apnea_risk"]:
+        cvd_markers.append("apnea_risk")
+    if markers["waist_risk"]:
+        cvd_markers.append("waist_risk")
+    if markers["isolation"]:
+        cvd_markers.append("isolation")
+    if markers["emotional_suppression"]:
+        cvd_markers.append("emotional_suppression")
+    if markers["menopause"]:
+        cvd_markers.append("menopause")
+    # ПОПРАВКА #181: курение — главный фактор риска ССЗ
+    if markers.get("smoking_current"):
+        cvd_markers.append("smoking")
+    if markers.get("smoking_heavy"):
+        cvd_markers.append("smoking_heavy")  # тяжёлое = двойной вес
+    heredity_boost = markers["heredity_cvd"]
+    if heredity_boost:
+        cvd_markers.append("heredity_cvd")
+    risks["cvd"] = {
+        "count": len(cvd_markers),
+        "markers": cvd_markers,
+        "heredity": heredity_boost,
+    }
+
+    # ── 3. ДЕМЕНЦИЯ / АЛЬЦГЕЙМЕР ──────────────────────────────────────────
+    dementia_markers = []
+    if markers["sleep_short"]:
+        dementia_markers.append("sleep_short")
+    if markers["frequent_wakeups"]:
+        dementia_markers.append("frequent_wakeups")
+    if markers["circadian_red"]:
+        dementia_markers.append("circadian_red")
+    if markers["sweet_craving"] and markers["postprandial_fatigue"]:
+        dementia_markers.append("insulin_brain")   # "диабет мозга"
+    if markers["isolation"]:
+        dementia_markers.append("isolation")
+    if markers["stress_high"]:
+        dementia_markers.append("stress_high")
+    if markers["emotional_suppression"]:
+        dementia_markers.append("emotional_suppression")
+    if markers["brain_fog_trend"]:
+        dementia_markers.append("brain_fog_trend")
+    # ПОПРАВКА #177: обоняние и вкус — ранние маркеры нейродегенерации
+    if markers.get("smell_loss"):
+        dementia_markers.append("smell_loss")
+    if markers.get("taste_loss"):
+        dementia_markers.append("taste_loss")
+    # ПОПРАВКА #177: висцеральный жир → воспаление → деменция
+    if markers.get("waist_risk"):
+        dementia_markers.append("waist_risk")
+    # ПОПРАВКА #181: курение → сосудистая деменция
+    if markers.get("smoking_current"):
+        dementia_markers.append("smoking")
+    heredity_boost = markers["heredity_dementia"]
+    if heredity_boost:
+        dementia_markers.append("heredity_dementia")
+    risks["dementia"] = {
+        "count": len(dementia_markers),
+        "markers": dementia_markers,
+        "heredity": heredity_boost,
+    }
+
+    # ── 4. ДЕПРЕССИЯ / ТРЕВОГА ────────────────────────────────────────────
+    depression_markers = []
+    if markers["sleep_short"]:
+        depression_markers.append("sleep_short")
+    if markers["ahs_red"]:
+        depression_markers.append("ahs_red")
+    if markers["second_wind"]:
+        depression_markers.append("second_wind")
+    if markers["mood_low_trend"]:
+        depression_markers.append("mood_low_trend")
+    if markers["isolation"]:
+        depression_markers.append("isolation")
+    if markers["emotional_suppression"]:
+        depression_markers.append("emotional_suppression")
+    if markers["sweet_craving"]:
+        depression_markers.append("sweet_craving")
+    if markers["menopause"]:
+        depression_markers.append("menopause")
+    if markers["anxiety_gad"]:
+        depression_markers.append("anxiety_gad")
+    heredity_boost = markers["heredity_depression"]
+    if heredity_boost:
+        depression_markers.append("heredity_depression")
+    risks["depression"] = {
+        "count": len(depression_markers),
+        "markers": depression_markers,
+        "heredity": heredity_boost,
+    }
+
+    # ── 5. ОНКОЛОГИЯ (профилактика) ───────────────────────────────────────
+    cancer_markers = []
+    if markers["night_shifts"]:
+        cancer_markers.append("night_shifts")
+    if markers["sleep_short"]:
+        cancer_markers.append("sleep_short")
+    if markers["frequent_wakeups"]:
+        cancer_markers.append("frequent_wakeups")
+    if markers["stress_high"] and markers["ahs_red"]:
+        cancer_markers.append("chronic_stress_immunity")
+    if markers["waist_risk"]:
+        cancer_markers.append("waist_risk")
+    if markers["circadian_red"]:
+        cancer_markers.append("circadian_red")
+    # ПОПРАВКА #181: курение — независимый фактор риска онкологии
+    if markers.get("smoking_current"):
+        cancer_markers.append("smoking")
+    if markers.get("smoking_heavy"):
+        cancer_markers.append("smoking_heavy")
+    heredity_boost = markers["heredity_cancer"]
+    if heredity_boost:
+        cancer_markers.append("heredity_cancer")
+    risks["cancer"] = {
+        "count": len(cancer_markers),
+        "markers": cancer_markers,
+        "heredity": heredity_boost,
+    }
+
+    return risks
+
+
+def generate_disease_message(disease: str, risk: dict, name: str, markers: dict) -> str:
+    """
+    Генерирует персонализированное сообщение по одному заболеванию.
+    Тон: НЕ пугаем, НЕ диагностируем, показываем связи, даём действие.
+    Вызывается только при count >= 3.
+    """
+    heredity_prefix = ""
+    if risk["heredity"]:
+        heredity_prefix = "В твоей семье это уже было — а значит маркеры важно не игнорировать.\n\n"
+
+    if disease == "diabetes":
+        active = risk["markers"]
+        chains = []
+        if "stress_high" in active and "sweet_craving" in active:
+            chains.append("Стресс → кортизол → тяга к сладкому → инсулиновые качели")
+        if "sleep_short" in active and "sweet_craving" in active:
+            chains.append("Сон < нормы → кортизол утром ↑ → лептин сбит → переедание")
+        if "emotional_suppression" in active:
+            chains.append("Подавленные эмоции → фоновый кортизол → вечернее заедание")
+        if "postprandial_fatigue" in active:
+            chains.append("Сонливость после еды — возможный признак инсулинорезистентности")
+        chain_text = "\n".join(f"• {c}" for c in chains) if chains else ""
+
+        action = "Один шаг: завтрак в первые 30 минут после подъёма — это сбрасывает инсулиновый старт дня."
+        return (
+            f"🍫 *{name}, вижу несколько маркеров которые нагружают обмен веществ.*\n\n"
+            f"{heredity_prefix}"
+            f"По отдельности — мелочи. Вместе — цепочка:\n"
+            f"{chain_text}\n\n"
+            f"Это ещё не диабет. Но это дорога — и на этом этапе всё обратимо.\n\n"
+            f"💚 {action}"
+        )
+
+    elif disease == "cvd":
+        active = risk["markers"]
+        chains = []
+        if "stress_high" in active and "ahs_red" in active:
+            chains.append("Хронический стресс + истощение надпочечников → давление не снижается")
+        if "sleep_short" in active or "frequent_wakeups" in active:
+            chains.append("Сон <6 часов или частые пробуждения → сердце не отдыхает ночью")
+        if "apnea_risk" in active:
+            chains.append("⚠️ Признаки апноэ: кислород падает ночью → адреналин → давление скачет")
+        if "emotional_suppression" in active:
+            chains.append("Подавленный гнев → давление ↑ при каждом подавлении")
+        if "isolation" in active:
+            chains.append("Изоляция — доказанный фактор риска сердца (×2 по исследованиям)")
+        # ПОПРАВКА #181: курение → ССЗ
+        if "smoking_heavy" in active:
+            chains.append("Пачка в день → постоянное воспаление сосудов + артериальное давление ↑")
+        elif "smoking" in active:
+            chains.append("Курение → оксидативный стресс → сосудистое воспаление → риск ССЗ ↑")
+        chain_text = "\n".join(f"• {c}" for c in chains) if chains else ""
+
+        action = (
+            "⚠️ Если есть признаки апноэ — это приоритет, обратись к сомнологу.\n"
+            "Иначе: дыхание 4-7-8 перед сном — снижает давление на 10-15 мм без таблеток."
+            if "apnea_risk" in active
+            else "Один шаг: 5 минут дыхания 4-7-8 вечером — снижает давление и даёт сердцу отдых."
+        )
+        return (
+            f"🫀 *{name}, вижу несколько факторов которые нагружают сердце.*\n\n"
+            f"{heredity_prefix}"
+            f"{chain_text}\n\n"
+            f"По отдельности — терпимо. Вместе — сердце работает на износ.\n\n"
+            f"💚 {action}"
+        )
+
+    elif disease == "dementia":
+        active = risk["markers"]
+        chains = []
+        if "sleep_short" in active or "frequent_wakeups" in active:
+            chains.append("Мозг не получает полную очистку: глимфатика работает только в глубоком сне")
+        if "circadian_red" in active:
+            chains.append("Циркадка сбита → мелатонин ↓ → антиоксидантная защита мозга слабее")
+        if "insulin_brain" in active:
+            chains.append("Тяга к сладкому + сонливость после еды → возможен «диабет мозга» (инсулин блокирует питание нейронов)")
+        if "stress_high" in active:
+            chains.append("Хронический кортизол → гиппокамп повреждается → память и фокус снижаются")
+        if "isolation" in active:
+            chains.append("Изоляция → когнитивный резерв ↓ → деменция наступает раньше")
+        # ПОПРАВКА #177: обоняние и вкус
+        if "smell_loss" in active:
+            chains.append("Снижение обоняния — один из самых ранних нейродегенеративных сигналов (риск деменции ↑ до 89%)")
+        if "taste_loss" in active:
+            chains.append("Изменение вкуса — связано с нарушениями в зонах мозга отвечающих за аппетит и восприятие")
+        if "waist_risk" in active:
+            chains.append("Висцеральный жир → хроническое воспаление → объём серого вещества снижается")
+        # ПОПРАВКА #181: курение → сосудистая деменция
+        if "smoking_heavy" in active:
+            chains.append("Пачка и больше → хроническое сосудистое воспаление → риск сосудистой деменции ↑↑")
+        elif "smoking" in active:
+            chains.append("Курение → оксидативный стресс → сосудистая деменция (второй по частоте тип)")
+        chain_text = "\n".join(f"• {c}" for c in chains) if chains else ""
+
+        # Определяем приоритетное действие
+        circ = markers.get("circadian_score")
+        has_sensory = "smell_loss" in active or "taste_loss" in active
+        if has_sensory and ("sleep_short" in active or "frequent_wakeups" in active):
+            action = "Один шаг: сон 7+ часов строго в темноте — мозг очищается и обонятельные нейроны восстанавливаются быстрее."
+        elif circ and circ < 20:
+            action = "Один шаг: утром — яркий свет 10 минут. Это перезапускает циркадку и мелатонин."
+        else:
+            action = "Один шаг: сон 7+ часов — это буквально мойка мозга. Каждую ночь."
+
+        return (
+            f"🧠 *{name}, мозг очищается только во сне — и вот что я вижу:*\n\n"
+            f"{heredity_prefix}"
+            f"{chain_text}\n\n"
+            f"Это обратимо. Мозг восстанавливается при правильных условиях.\n\n"
+            f"💚 {action}"
+        )
+
+    elif disease == "depression":
+        active = risk["markers"]
+        chains = []
+        if "ahs_red" in active and "second_wind" in active:
+            chains.append("Надпочечники истощены → кортизол не поднимается утром → нет энергии весь день")
+        if "sleep_short" in active:
+            chains.append("Недосып → серотонин ↓ → настроение ↓ → хуже спишь → порочный круг")
+        if "menopause" in active:
+            chains.append("Эстроген снижается → серотонин ↓ → тревога + бессонница + раздражительность")
+        if "sweet_craving" in active:
+            chains.append("Тяга к сладкому = сигнал: организм ищет серотонин через углеводы")
+        if "emotional_suppression" in active:
+            chains.append("Годы «всё хорошо» без выхода → истощение → «ничего не хочу»")
+        if "isolation" in active:
+            chains.append("Нет тёплых контактов → окситоцин и дофамин ↓ → классическая триада")
+        chain_text = "\n".join(f"• {c}" for c in chains) if chains else ""
+
+        action = "Один шаг: утром — 10 минут яркого света на улице. Это серотонин без таблеток."
+        return (
+            f"😔 *{name}, вижу: энергия и настроение снижаются уже несколько недель.*\n\n"
+            f"{heredity_prefix}"
+            f"Это может быть истощение надпочечников, нехватка света или начало выгорания:\n"
+            f"{chain_text}\n\n"
+            f"Есть выход — и он конкретный.\n\n"
+            f"💚 {action}\n\n"
+            f"_Если через 2 недели лучше не станет — поговорим о поддержке специалиста. Это не слабость._"
+        )
+
+    elif disease == "cancer":
+        active = risk["markers"]
+        chains = []
+        if "night_shifts" in active:
+            chains.append("Ночные смены → мелатонин ↓ → ВОЗ: ночная работа = вероятный канцероген")
+        if "sleep_short" in active or "circadian_red" in active:
+            chains.append("Мелатонин снижен → иммунные NK-клетки слабее → естественная защита ↓")
+        if "chronic_stress_immunity" in active:
+            chains.append("Хронический стресс → NK-клетки подавлены кортизолом")
+        # ПОПРАВКА #181: курение → онкология
+        if "smoking_heavy" in active and "heredity_cancer" in active:
+            chains.append("⚠️ Пачка и больше + наследственность по онкологии — это сочетание требует онкоскрининга ежегодно")
+        elif "smoking_heavy" in active:
+            chains.append("Пачка в день → 40+ мутаций в клетках ДНК ежедневно → иммунный надзор перегружен")
+        elif "smoking" in active:
+            chains.append("Курение → мутагенная нагрузка + снижение иммунного надзора за атипичными клетками")
+        chain_text = "\n".join(f"• {c}" for c in chains) if chains else ""
+
+        # Если курение + наследственность — меняем акцент
+        if "smoking_heavy" in active and "heredity_cancer" in active:
+            action = "Важно: онкоскрининг раз в год — это не паранойя, это твоя защита при таком профиле."
+            intro = f"🛡 *{name}, при таком сочетании факторов — профилактика это приоритет.*"
+        elif "smoking" in active or "smoking_heavy" in active:
+            action = "Два шага: сон в темноте (мелатонин) + поговори с врачом о скрининге — при курении это важно."
+            intro = f"🛡 *{name}, сон и иммунный надзор — вот на что делаем ставку.*"
+        else:
+            action = "Один шаг: сон в полной темноте + без экранов за час — мелатонин вырабатывается только так."
+            intro = f"🛡 *{name}, сон и мелатонин — твоя главная профилактика.*"
+
+        return (
+            f"{intro}\n\n"
+            f"{heredity_prefix}"
+            f"{chain_text}\n\n"
+            f"Это не лечение. Это профилактика — лучшая из возможных.\n\n"
+            f"💚 {action}"
+        )
+
+    return ""
+
+
+async def detect_disease_risk_by_markers(telegram_id: int) -> list[str]:
+    """
+    ПОПРАВКА #176: Главная функция детектива заболеваний.
+
+    Собирает маркеры → подсчитывает по каждому заболеванию →
+    возвращает список сообщений для заболеваний с 3+ маркерами.
+
+    Порядок вывода: от наибольшего числа маркеров к наименьшему.
+    Максимум 2 заболевания за один вызов (чтобы не перегружать).
+    """
+    try:
+        user = await get_user(telegram_id)
+        if not user:
+            return []
+        name = user.get("name") or "друг"
+
+        markers = await collect_disease_markers(telegram_id)
+        risks = score_disease_risks(markers)
+
+        # Фильтруем: только 3+ маркеров
+        triggered = [
+            (disease, risk)
+            for disease, risk in risks.items()
+            if risk["count"] >= 3
+        ]
+
+        # Сортируем: сначала с наследственностью, потом по количеству маркеров
+        triggered.sort(key=lambda x: (
+            -int(x[1]["heredity"]),
+            -x[1]["count"]
+        ))
+
+        # Максимум 2 сообщения за раз
+        messages = []
+        for disease, risk in triggered[:2]:
+            msg = generate_disease_message(disease, risk, name, markers)
+            if msg:
+                messages.append(msg)
+
+        return messages
+
+    except Exception as e:
+        logger.warning(f"detect_disease_risk_by_markers error: {e}")
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ПОПРАВКА #179: СЕЗОННЫЙ ПЕРЕСМОТР ХРОНОТИПА
+#
+# Два раза в год — 1 ноября и 1 апреля — бот напоминает проверить
+# хронотип. Именно в эти даты световой день резко меняется и организм
+# перестраивается. Пользователь может подтвердить что всё актуально
+# или пройти тест заново. Упоминаем что настройки можно менять вручную.
+# ═══════════════════════════════════════════════════════════════════
+
+# Тексты для двух сезонных точек
+CHRONOTYPE_SEASONAL_MESSAGES = {
+    "november": (
+        "🍂 *{name}, наступил ноябрь.*\n\n"
+        "Световой день стал почти вдвое короче — это влияет на режим сна "
+        "и хронотип у большинства людей. Совы начинают чувствовать себя "
+        "ещё более «ночными», жаворонки иногда тоже сдвигаются.\n\n"
+        "Твой хронотип сейчас: *{chrono_name}*\n\n"
+        "Всё ещё актуально — или что-то изменилось?"
+    ),
+    "april": (
+        "🌱 *{name}, наступил апрель.*\n\n"
+        "День резко стал длиннее — многие замечают что режим сам по себе "
+        "сдвигается раньше, энергия приходит утром быстрее.\n\n"
+        "Твой хронотип сейчас: *{chrono_name}*\n\n"
+        "Всё ещё актуально — или что-то изменилось?"
+    ),
+}
+
+CHRONO_NAMES_RU = {
+    "lark":      "🌅 Жаворонок",
+    "pigeon":    "🕊 Голубь",
+    "owl":       "🦉 Сова",
+    "night_owl": "🌑 Поздняя сова",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ПОПРАВКА #180: ЕЖЕДНЕВНЫЙ УМНЫЙ СОВЕТ
+#
+# Каждый вечер в 20:00 по местному времени бот отправляет один совет.
+# Чётный день от онбординга → ЗАДАНИЕ (делать прямо сейчас).
+# Нечётный день → ЗНАНИЕ (понять и изменить привычку).
+# Выбор совета внутри категории — по данным последнего чекина.
+# Не повторяется чаще чем раз в 10 дней (лог в daily_tips_log).
+# ═══════════════════════════════════════════════════════════════════
+
+# ───────────────────────────────────────────────────────────────────
+# ПУЛ ЗАДАНИЙ — конкретное действие прямо сегодня
+# Поля: id, text, tags (для привязки к данным чекина)
+# ───────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────
+# ПОПРАВКА #183: ВОПРОСЫ ВОСКРЕСЕНЬЯ
+# Каждое воскресенье вместо обычного совета — вопрос для размышления.
+# Не требует ответа боту. Просто останавливает и заставляет думать.
+# Рефлексия формирует нейронные связи не хуже физических упражнений.
+# Пул на 2+ года без повторов.
+# ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ПОПРАВКА #186: СЕЗОННЫЕ СОВЕТЫ
+# Отправляются 1 раз в месяц в первую субботу месяца.
+# Привязаны к конкретному месяцу (1–12).
+# Логируются в seasonal_tips_log — не повторяются в одном месяце.
+# ═══════════════════════════════════════════════════════════════════
+
+SEASONAL_TIPS = {
+    1: {  # Январь
+        "id": "season_january",
+        "text": (
+            "❄️ *Январь — время тишины и восстановления*\n\n"
+            "Мозг не любит гонку сразу после праздников. "
+            "Это нормально — январь эволюционно создан для замедления.\n\n"
+            "🌿 *Три вещи, которые помогут мозгу в январе:*\n"
+            "• Свет утром — даже 10 минут у окна сдвигают циркадный ритм после праздничного хаоса\n"
+            "• Белок на завтрак — восстанавливает дофаминовый синтез после сладкого декабря\n"
+            "• Сон до 23:00 хотя бы 5 ночей в неделю — мозг перезагружается только в глубоком сне\n\n"
+            "_Январская усталость — это не лень. Это физиология._"
+        ),
+    },
+    2: {  # Февраль
+        "id": "season_february",
+        "text": (
+            "🌨️ *Февраль — самый тёмный месяц для мозга*\n\n"
+            "Пик сезонного снижения серотонина — именно февраль. "
+            "Не март, не январь. Февраль.\n\n"
+            "🧠 *Что работает:*\n"
+            "• Витамин Д — если не сдавала анализ осенью, сейчас самое время\n"
+            "• Движение на улице в светлое время — даже пасмурный свет лучше искусственного\n"
+            "• Социальный контакт — разговоры с живыми людьми буквально поднимают уровень окситоцина\n\n"
+            "📍 _Если накрывает апатия — это сигнал тела, не характера._"
+        ),
+    },
+    3: {  # Март
+        "id": "season_march",
+        "text": (
+            "🌱 *Март — перестройка ритма*\n\n"
+            "Световой день прибавляется быстро. Мозг перестраивает циркадные часы — "
+            "и это буквально стресс для нервной системы.\n\n"
+            "⚡ *Как помочь перестройке:*\n"
+            "• Выходи на свет в первые 30 минут после пробуждения — ускоряет адаптацию\n"
+            "• Не меняй время отбоя резко — сдвигай по 15 минут в неделю\n"
+            "• Магний вечером — снимает «перегрев» нервной системы при переходе\n\n"
+            "_Мартовская раздражительность — это циркадный шторм. Пройдёт через 2–3 недели._"
+        ),
+    },
+    4: {  # Апрель
+        "id": "season_april",
+        "text": (
+            "🌸 *Апрель — время активации*\n\n"
+            "Мелатонин снижается, кортизол утром растёт, тело просыпается. "
+            "Апрель — лучшее время начать новую привычку.\n\n"
+            "🔋 *Апрельский протокол:*\n"
+            "• Первая прогулка без куртки — холодовой стресс запускает митохондриальный биогенез\n"
+            "• Сократи кофе после 14:00 — весной аденозиновые рецепторы чувствительнее\n"
+            "• Добавь одно новое движение в день — мозг в апреле учится быстрее\n\n"
+            "_Апрельская энергия — не случайность. Используй её._"
+        ),
+    },
+    5: {  # Май
+        "id": "season_may",
+        "text": (
+            "🌿 *Май — нейропластичность в пике*\n\n"
+            "Длинный световой день + тепло + первая зелень. "
+            "Исследования показывают: в мае люди учатся новому на 20–30% эффективнее.\n\n"
+            "📚 *Что стоит начать именно сейчас:*\n"
+            "• Новый навык или язык — мозг буквально в режиме роста\n"
+            "• Ходьба босиком по траве — вестибулярная + тактильная стимуляция\n"
+            "• Ранний подъём (5:30–6:00) — рассветный кортизол в мае особенно чистый\n\n"
+            "_Майское окно нейропластичности — короткое. Не упускай._"
+        ),
+    },
+    6: {  # Июнь
+        "id": "season_june",
+        "text": (
+            "☀️ *Июнь — белые ночи и мелатониновая ловушка*\n\n"
+            "В июне мозг получает избыток света — "
+            "мелатонин вырабатывается хуже, сон становится поверхностнее.\n\n"
+            "😴 *Защити свой сон:*\n"
+            "• Плотные шторы или маска — свет в 4 утра разбудит мозг без будильника\n"
+            "• Отбой строго до 23:00 — длинный световой день съедает часы\n"
+            "• Не смотри на яркий экран после 21:00 — летом это критичнее, чем зимой\n\n"
+            "_Июньская усталость — это не нехватка солнца. Это его избыток._"
+        ),
+    },
+    7: {  # Июль
+        "id": "season_july",
+        "text": (
+            "🌡️ *Июль — жара и мозг*\n\n"
+            "При температуре выше +28°C когнитивные функции снижаются на 13%. "
+            "Это не ощущение — это измеренный факт.\n\n"
+            "💧 *Июльский протокол для мозга:*\n"
+            "• 2.5–3 литра воды — каждый дополнительный стакан = +5% к концентрации\n"
+            "• Самую сложную работу — до 10 утра или после 18 вечера\n"
+            "• Холодный душ в полдень — снижает температуру ядра тела на 1–2°C на 2 часа\n\n"
+            "_Летняя туманность — это жажда. Не стресс и не усталость._"
+        ),
+    },
+    8: {  # Август
+        "id": "season_august",
+        "text": (
+            "🍂 *Август — подготовка к осени*\n\n"
+            "Световой день уже сокращается — мозг начинает перестройку, "
+            "хотя снаружи ещё лето.\n\n"
+            "🔄 *Переход без стресса:*\n"
+            "• Начни вставать на 15 минут раньше — плавный сдвиг до сентября\n"
+            "• Верни режим питания если летом он сбился\n"
+            "• Сделай анализ на витамин Д — последний шанс до осеннего дефицита\n\n"
+            "_Августовская меланхолия реальна. Тело знает, что лето кончается._"
+        ),
+    },
+    9: {  # Сентябрь
+        "id": "season_september",
+        "text": (
+            "🍁 *Сентябрь — новый цикл мозга*\n\n"
+            "Сентябрь — второй январь по нейробиологии. "
+            "Свет меняется, ритм меняется, мозг перезагружается.\n\n"
+            "📋 *Сентябрьский чеклист:*\n"
+            "• Новая привычка — лучшее время для старта (работает как в январе)\n"
+            "• Омега-3 если не принимала летом — осенью потребность выше\n"
+            "• Социальный ритм — после отпусков мозгу нужны живые связи\n\n"
+            "_Сентябрьская тревога — это нормальная адаптация. Не баг, а фича._"
+        ),
+    },
+    10: {  # Октябрь
+        "id": "season_october",
+        "text": (
+            "🌫️ *Октябрь — начало тёмного сезона*\n\n"
+            "С октября световой день падает ниже 10 часов. "
+            "Серотонин снижается. Мозг переходит в режим экономии.\n\n"
+            "💡 *Октябрьский протокол:*\n"
+            "• Светотерапия (10 000 лк, 20–30 мин утром) — клинически доказана при сезонной депрессии\n"
+            "• Витамин Д — начинай сейчас, не жди симптомов\n"
+            "• Движение на улице в обеденное время — поймай последний дневной свет\n\n"
+            "_Октябрьская вялость — сигнал. Ответь на него до, а не после._"
+        ),
+    },
+    11: {  # Ноябрь
+        "id": "season_november",
+        "text": (
+            "🕯️ *Ноябрь — самый сложный месяц*\n\n"
+            "Короткий день. Серое небо. Дефицит витамина Д у 80% людей в северных широтах. "
+            "Мозг буквально голодает по свету.\n\n"
+            "☀️ *Три вещи которые работают:*\n"
+            "• Витамин Д3 + К2 — не просто добавка, а нейропротектор. Оптимум: 50–80 нг/мл\n"
+            "• Свет у окна первые 30 минут дня — даже пасмурный свет в 10 раз сильнее комнатного\n"
+            "• Магний глицинат вечером — ноябрьская тревога часто это дефицит магния, не психология\n\n"
+            "📊 _Сдай 25(OH)D — результат удивит. 9 из 10 в ноябре ниже нормы._"
+        ),
+    },
+    12: {  # Декабрь
+        "id": "season_december",
+        "text": (
+            "✨ *Декабрь — время замедлиться*\n\n"
+            "Самый короткий день в году. Мозг эволюционно создан для зимнего отдыха — "
+            "но мы создали себе праздничный спринт вместо этого.\n\n"
+            "🌙 *Декабрьский протокол:*\n"
+            "• Защити сон — праздники сбивают ритм сильнее всего\n"
+            "• Один день в неделю без обязательств — мозгу нужна настоящая пауза\n"
+            "• Ограничь алкоголь — он разрушает REM-фазу, без которой нет восстановления\n\n"
+            "_Январская усталость рождается в декабре. Береги себя сейчас._"
+        ),
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# ПОПРАВКА #187: МИНИ-СЕРИИ
+# 4 серии, каждая 5–12 дней. Одна тема — один фокус.
+# Серия стартует автоматически через 7+ дней после предыдущей.
+# Пока серия активна — заменяет обычный совет вечером.
+# ═══════════════════════════════════════════════════════════════════
+
+MINI_SERIES = {
+    "memory_week": {
+        "title": "🧠 Неделя памяти",
+        "days": [
+            {
+                "id": "mem_1",
+                "text": (
+                    "🧠 *День 1/5 — Неделя памяти*\n\n"
+                    "*Метод дворца памяти*\n\n"
+                    "Выбери маршрут который знаешь наизусть — квартира, дорога к метро, офис. "
+                    "Мысленно «развесь» по нему 5 вещей которые хочешь запомнить.\n\n"
+                    "Техника работает потому что гиппокамп кодирует память через пространство — "
+                    "это его родной язык.\n\n"
+                    "📌 *Задание сегодня:* запомни 5 элементов списка покупок через дворец памяти."
+                ),
+            },
+            {
+                "id": "mem_2",
+                "text": (
+                    "🧠 *День 2/5 — Неделя памяти*\n\n"
+                    "*Интервальное повторение*\n\n"
+                    "Мозг забывает по кривой Эббингауза: 50% через час, 70% через день. "
+                    "Но если повторить в нужный момент — запоминание становится постоянным.\n\n"
+                    "Протокол: повтори сразу → через 20 минут → через день → через неделю.\n\n"
+                    "📌 *Задание сегодня:* возьми любые 10 фактов — и повтори их через 20 минут после изучения."
+                ),
+            },
+            {
+                "id": "mem_3",
+                "text": (
+                    "🧠 *День 3/5 — Неделя памяти*\n\n"
+                    "*Сон как архиватор памяти*\n\n"
+                    "Во время медленного сна гиппокамп «переписывает» воспоминания дня в кору. "
+                    "Это не метафора — это буквально передача данных между структурами мозга.\n\n"
+                    "Один час украденного сна = 40% потеря памяти следующего дня.\n\n"
+                    "📌 *Задание сегодня:* перед сном повтори мысленно три самых важных момента дня."
+                ),
+            },
+            {
+                "id": "mem_4",
+                "text": (
+                    "🧠 *День 4/5 — Неделя памяти*\n\n"
+                    "*Связи сильнее фактов*\n\n"
+                    "Мозг запоминает не изолированные факты — а связи между ними. "
+                    "Чем больше крючков — тем прочнее запись.\n\n"
+                    "Техника: когда учишь что-то новое, задай себе три вопроса:\n"
+                    "— Что это напоминает?\n— Где я это видела раньше?\n— К чему это применимо?\n\n"
+                    "📌 *Задание сегодня:* прочитай одну статью и найди три связи с тем, что уже знаешь."
+                ),
+            },
+            {
+                "id": "mem_5",
+                "text": (
+                    "🧠 *День 5/5 — Неделя памяти* 🎉\n\n"
+                    "*Движение запускает память*\n\n"
+                    "20 минут ходьбы перед учёбой повышают нейротрофический фактор BDNF на 20–30%. "
+                    "BDNF — это буквально «удобрение» для нейронов памяти.\n\n"
+                    "Ходьба + учёба = в 2 раза лучше, чем учёба сидя.\n\n"
+                    "📌 *Финальное задание:* 20 минут прогулки → потом повтори всё, что запомнила за неделю.\n\n"
+                    "🏆 _Неделя памяти завершена! Ты дала мозгу пять инструментов. Используй хотя бы один._"
+                ),
+            },
+        ],
+    },
+    "no_sugar_5": {
+        "title": "🍬 5 дней без сахара после 18:00",
+        "days": [
+            {
+                "id": "sugar_1",
+                "text": (
+                    "🍬 *День 1/5 — Без сахара после 18:00*\n\n"
+                    "Сахар вечером — главный враг глубокого сна. "
+                    "Инсулиновый скачок после 18:00 задерживает выброс мелатонина на 1–2 часа.\n\n"
+                    "Правило простое: после 18:00 — без сладкого, сока, белого хлеба, мёда.\n\n"
+                    "🔍 *Что скрыто:* кетчуп, соусы, «диетические» батончики — там тоже сахар.\n\n"
+                    "📌 *Сегодня:* пройди до 23:00 без сладкого после ужина. Один день — просто попробуй."
+                ),
+            },
+            {
+                "id": "sugar_2",
+                "text": (
+                    "🍬 *День 2/5 — Без сахара после 18:00*\n\n"
+                    "Вчера ты сделала это. Сегодня сложнее — мозг уже ищет привычный кайф.\n\n"
+                    "Тяга к сладкому вечером — это не голод. "
+                    "Это дофаминовый запрос: мозг хочет вознаграждения за день.\n\n"
+                    "💡 *Замена:* горький шоколад 85%+ (1–2 дольки), орехи, тёплый травяной чай с корицей.\n\n"
+                    "📌 *Сегодня:* приготовь альтернативу заранее — до момента, когда захочется."
+                ),
+            },
+            {
+                "id": "sugar_3",
+                "text": (
+                    "🍬 *День 3/5 — Без сахара после 18:00*\n\n"
+                    "Три дня — это уже паттерн. Мозг начинает перестраивать вечерний ритуал.\n\n"
+                    "Что происходит в теле: инсулин вечером снизился → мелатонин выходит вовремя → "
+                    "глубокий сон глубже → утром легче вставать.\n\n"
+                    "📊 Обычно это заметно именно на третий день.\n\n"
+                    "📌 *Сегодня:* обрати внимание на утро завтра — заметила ли разницу?"
+                ),
+            },
+            {
+                "id": "sugar_4",
+                "text": (
+                    "🍬 *День 4/5 — Без сахара после 18:00*\n\n"
+                    "Четыре дня — мозг уже привыкает. Тяга слабее?\n\n"
+                    "Вечерний сахар — это петля: плохой сон → усталость → больше сладкого → хуже сон.\n"
+                    "Ты разрываешь эту петлю прямо сейчас.\n\n"
+                    "💡 *Лайфхак на вечер:* белок на ужин (яйца, рыба, мясо) убирает тягу к сладкому "
+                    "лучше, чем сила воли.\n\n"
+                    "📌 *Сегодня:* добавь белок к ужину — и замерь тягу после."
+                ),
+            },
+            {
+                "id": "sugar_5",
+                "text": (
+                    "🍬 *День 5/5 — Без сахара после 18:00* 🎉\n\n"
+                    "Ты сделала это! Пять дней — это уже нейронный след.\n\n"
+                    "Что изменилось за 5 дней:\n"
+                    "• Инсулиновая чувствительность вечером выросла\n"
+                    "• Мелатонин выходит раньше и чище\n"
+                    "• Вечерняя тяга начала снижаться\n\n"
+                    "🏆 _Продолжи хотя бы ещё неделю — и вечерний сахар перестанет быть привычкой._"
+                ),
+            },
+        ],
+    },
+    "smell_week": {
+        "title": "👃 Неделя обоняния",
+        "days": [
+            {
+                "id": "smell_1",
+                "text": (
+                    "👃 *День 1/5 — Неделя обоняния*\n\n"
+                    "*Обоняние и мозг*\n\n"
+                    "Обонятельный нерв — единственный, кто идёт напрямую в лимбическую систему, "
+                    "минуя таламус. Это прямой провод к памяти и эмоциям.\n\n"
+                    "Снижение обоняния — ранний маркер нейродегенерации (за 5–7 лет до симптомов).\n\n"
+                    "📌 *Задание сегодня:* утром понюхай 4 разных запаха осознанно — "
+                    "кофе, лимон, специя, цветок. Назови каждый вслух."
+                ),
+            },
+            {
+                "id": "smell_2",
+                "text": (
+                    "👃 *День 2/5 — Неделя обоняния*\n\n"
+                    "*Обонятельная тренировка*\n\n"
+                    "Клинически доказано: 12 недель по 2 минуты в день — "
+                    "и обоняние восстанавливается даже после потери (post-COVID, возрастной).\n\n"
+                    "Протокол: 4 запаха, 20 секунд каждый, утром и вечером.\n"
+                    "Классический набор: роза, эвкалипт, лимон, гвоздика.\n\n"
+                    "📌 *Задание сегодня:* сделай первую тренировку — 4 запаха × 20 сек."
+                ),
+            },
+            {
+                "id": "smell_3",
+                "text": (
+                    "👃 *День 3/5 — Неделя обоняния*\n\n"
+                    "*Запах и память*\n\n"
+                    "Запах — самый мощный триггер автобиографической памяти. "
+                    "Это используют при работе с болезнью Альцгеймера: "
+                    "знакомые запахи возвращают воспоминания когда слова уже не работают.\n\n"
+                    "📌 *Задание сегодня:* найди запах из детства — "
+                    "выпечка, трава, духи мамы, смола. Понюхай и просто побудь в воспоминании 2 минуты."
+                ),
+            },
+            {
+                "id": "smell_4",
+                "text": (
+                    "👃 *День 4/5 — Неделя обоняния*\n\n"
+                    "*Обоняние за едой*\n\n"
+                    "80% того, что мы называем «вкусом» — это на самом деле запах. "
+                    "Закрой нос во время еды — и вкус исчезнет.\n\n"
+                    "Осознанное обоняние во время еды:\n"
+                    "— снижает скорость поглощения пищи\n"
+                    "— усиливает насыщение\n"
+                    "— активирует парасимпатику (антистресс)\n\n"
+                    "📌 *Задание сегодня:* перед каждым приёмом пищи — 3 секунды нюхай."
+                ),
+            },
+            {
+                "id": "smell_5",
+                "text": (
+                    "👃 *День 5/5 — Неделя обоняния* 🎉\n\n"
+                    "*Розмарин и когниция*\n\n"
+                    "В комнате с запахом розмарина люди показывают результаты на 15% лучше "
+                    "на тестах памяти и концентрации. Это измеренный факт, не народная медицина.\n\n"
+                    "Механизм: 1,8-цинеол из розмарина подавляет ацетилхолинэстеразу — "
+                    "тот же механизм что у препаратов от Альцгеймера.\n\n"
+                    "📌 *Финальное задание:* добудь веточку розмарина или эфирное масло — "
+                    "и работай следующий час рядом с ним.\n\n"
+                    "🏆 _Неделя обоняния завершена! Продолжай тренировку 4 запаха × 2 мин — "
+                    "результат придёт через 6–12 недель._"
+                ),
+            },
+        ],
+    },
+    "big_reset": {
+        "title": "🔄 Большой сброс — 12 дней",
+        "days": [
+            {
+                "id": "reset_1",
+                "text": (
+                    "🔄 *День 1/12 — Большой сброс*\n\n"
+                    "*Зачем сброс?*\n\n"
+                    "Мозг накапливает «шум» — привычки на автопилоте, "
+                    "паттерны которые уже не работают, фоновый стресс который стал нормой.\n\n"
+                    "12 дней — это один цикл циркадной перестройки. "
+                    "Достаточно чтобы заметить изменение. Мало чтобы перегрузиться.\n\n"
+                    "📌 *День 1:* только одно — ляг спать сегодня до 23:00. Без экрана за 30 минут."
+                ),
+            },
+            {
+                "id": "reset_2",
+                "text": (
+                    "🔄 *День 2/12 — Большой сброс*\n\n"
+                    "*Вода с утра*\n\n"
+                    "Мозг на 73% состоит из воды. За ночь ты теряешь 400–800 мл.\n"
+                    "Первое что получает мозг утром — задаёт тон всему дню.\n\n"
+                    "📌 *День 2:* стакан воды (300–500 мл) в первые 5 минут после пробуждения. "
+                    "До кофе, до телефона."
+                ),
+            },
+            {
+                "id": "reset_3",
+                "text": (
+                    "🔄 *День 3/12 — Большой сброс*\n\n"
+                    "*Утренний свет*\n\n"
+                    "Свет в первые 30–60 минут дня запускает выброс кортизола точно в нужное время — "
+                    "это называется cortisol awakening response. Без этого сигнала весь день «плывёт».\n\n"
+                    "📌 *День 3:* 10 минут у окна или на улице в течение часа после пробуждения. "
+                    "Без очков, без крыши над головой если возможно."
+                ),
+            },
+            {
+                "id": "reset_4",
+                "text": (
+                    "🔄 *День 4/12 — Большой сброс*\n\n"
+                    "*Движение до работы*\n\n"
+                    "20 минут ходьбы до начала умственной работы повышают BDNF, дофамин и "
+                    "серотонин одновременно. Это лучший «апгрейд» перед сложными задачами.\n\n"
+                    "📌 *День 4:* прогулка 15–20 минут утром — до работы, до компьютера."
+                ),
+            },
+            {
+                "id": "reset_5",
+                "text": (
+                    "🔄 *День 5/12 — Большой сброс*\n\n"
+                    "*Белок на завтрак*\n\n"
+                    "Углеводный завтрак → инсулиновый скачок → упадок через 2 часа.\n"
+                    "Белковый завтрак → стабильный глюкагон → ровная энергия до обеда.\n\n"
+                    "📌 *День 5:* завтрак с белком — яйца, рыба, творог, мясо. "
+                    "Без каши, без тоста, без сока."
+                ),
+            },
+            {
+                "id": "reset_6",
+                "text": (
+                    "🔄 *День 6/12 — Большой сброс*\n\n"
+                    "*Полдень без экрана*\n\n"
+                    "Мозгу нужен «холостой ход» — default mode network. "
+                    "Именно в этом режиме рождаются инсайты и consolidation памяти.\n\n"
+                    "📌 *День 6:* обеденный перерыв — 15 минут без телефона. "
+                    "Просто ешь, смотри в окно, гуляй."
+                ),
+            },
+            {
+                "id": "reset_7",
+                "text": (
+                    "🔄 *День 7/12 — Большой сброс*\n\n"
+                    "*Середина пути — что уже изменилось?*\n\n"
+                    "7 дней — это уже эпигенетический след. "
+                    "Часть привычек начала меняться на уровне экспрессии генов.\n\n"
+                    "📌 *День 7:* остановись на 5 минут. Что из первых 6 дней далось легче всего? "
+                    "Что было сложнее? Просто заметь — без оценки."
+                ),
+            },
+            {
+                "id": "reset_8",
+                "text": (
+                    "🔄 *День 8/12 — Большой сброс*\n\n"
+                    "*Ограничение кофе*\n\n"
+                    "Кофе после 14:00 блокирует аденозиновые рецепторы — сон становится менее глубоким, "
+                    "даже если ты засыпаешь легко.\n\n"
+                    "📌 *День 8:* последний кофе — до 13:00. Вечером — травяной чай или горячая вода с лимоном."
+                ),
+            },
+            {
+                "id": "reset_9",
+                "text": (
+                    "🔄 *День 9/12 — Большой сброс*\n\n"
+                    "*Дыхание как инструмент*\n\n"
+                    "4-7-8: вдох 4 сек, задержка 7, выдох 8. Три цикла.\n"
+                    "Снижает кортизол за 90 секунд — измеренный факт.\n\n"
+                    "📌 *День 9:* три цикла 4-7-8 перед каждым приёмом пищи. "
+                    "Парасимпатика включается — пищеварение улучшается автоматически."
+                ),
+            },
+            {
+                "id": "reset_10",
+                "text": (
+                    "🔄 *День 10/12 — Большой сброс*\n\n"
+                    "*Социальная связь*\n\n"
+                    "Живое общение (не переписка) активирует окситоцин и снижает кортизол "
+                    "сильнее, чем любая техника расслабления.\n\n"
+                    "📌 *День 10:* позвони (именно позвони, не напиши) одному человеку которого давно не слышала."
+                ),
+            },
+            {
+                "id": "reset_11",
+                "text": (
+                    "🔄 *День 11/12 — Большой сброс*\n\n"
+                    "*Вечерний ритуал*\n\n"
+                    "Мозгу нужен «буфер» между активным днём и сном. "
+                    "Резкое переключение — стресс для нервной системы.\n\n"
+                    "📌 *День 11:* создай 20-минутный ритуал перед сном — "
+                    "одно и то же каждый вечер. Чтение, ванна, медитация — что угодно тихое."
+                ),
+            },
+            {
+                "id": "reset_12",
+                "text": (
+                    "🔄 *День 12/12 — Большой сброс* 🎉\n\n"
+                    "*Ты прошла весь путь*\n\n"
+                    "12 дней — это:\n"
+                    "• Один цикл циркадной перестройки\n"
+                    "• Начало нейропластической адаптации\n"
+                    "• Эпигенетические изменения в 3–5 ключевых генах\n\n"
+                    "Выбери 2–3 привычки из этих 12 дней которые хочешь оставить навсегда. "
+                    "Не все — только лучшие для тебя.\n\n"
+                    "🏆 _Большой сброс завершён. Мозг говорит спасибо._"
+                ),
+            },
+        ],
+    },
+}
+
+SUNDAY_QUESTIONS = [
+    # — Новизна и рост —
+    {
+        "id": "sq_first_time",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Когда последний раз ты делала что-то *первый раз в жизни?*\n\n"
+            "_Мозг растёт именно в моменты новизны — не в моменты мастерства._"
+        ),
+    },
+    {
+        "id": "sq_learned",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Чему ты научилась за последние 6 месяцев — "
+            "пусть даже маленькому?\n\n"
+            "_Обучение новому — один из самых надёжных способов "
+            "отодвинуть когнитивное старение._"
+        ),
+    },
+    {
+        "id": "sq_uncomfortable",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Что ты избегаешь потому что это неудобно или страшно — "
+            "но знаешь что стоит попробовать?\n\n"
+            "_Зона дискомфорта и зона роста мозга — одно и то же место._"
+        ),
+    },
+    {
+        "id": "sq_curiosity",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "О чём ты давно хотела узнать больше — "
+            "но всё время откладывала?\n\n"
+            "_Любопытство — это не черта характера. "
+            "Это навык. И он тренируется._"
+        ),
+    },
+    {
+        "id": "sq_hands",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Когда ты последний раз делала что-то руками — "
+            "готовила необычное блюдо, чинила, лепила, рисовала?\n\n"
+            "_Мелкая моторика и мозг связаны теснее чем кажется. "
+            "Руки — это второй мозг._"
+        ),
+    },
+
+    # — Тело и ощущения —
+    {
+        "id": "sq_body_signal",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Что твоё тело пытается тебе сказать уже давно — "
+            "а ты делаешь вид что не слышишь?\n\n"
+            "_Тело говорит шёпотом. Потом громче. Потом кричит._"
+        ),
+    },
+    {
+        "id": "sq_energy_time",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "В какое время дня ты чувствуешь себя наиболее собой — "
+            "живой, ясной, в потоке?\n\n"
+            "_Это не случайность. Это твои биологические часы. "
+            "Стоит с ними подружиться._"
+        ),
+    },
+    {
+        "id": "sq_sleep_feel",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Как часто ты просыпаешься утром и первая мысль — "
+            "«хорошо поспала»?\n\n"
+            "_Если редко — это не норма. Это сигнал. "
+            "И с ним можно работать._"
+        ),
+    },
+    {
+        "id": "sq_pleasure",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Что приносит тебе настоящее удовольствие — "
+            "не «полезное» и не «надо», а просто радость?\n\n"
+            "_Дофамин от настоящего удовольствия защищает мозг. "
+            "Это не баловство — это нейробиология._"
+        ),
+    },
+    {
+        "id": "sq_tension",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Где в теле ты держишь напряжение прямо сейчас — "
+            "плечи, челюсть, живот?\n\n"
+            "_Хроническое мышечное напряжение — это кортизол в твёрдом виде. "
+            "Тело помнит всё что разум старается забыть._"
+        ),
+    },
+
+    # — Отношения и окружение —
+    {
+        "id": "sq_who_energizes",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Кто из людей в твоей жизни после общения "
+            "оставляет тебя с *больше* энергии чем было?\n\n"
+            "_Таких людей стоит беречь. И видеть чаще._"
+        ),
+    },
+    {
+        "id": "sq_who_drains",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Есть ли в твоём окружении кто-то, после встречи с кем "
+            "ты чувствуешь себя меньше?\n\n"
+            "_Токсичный человек рядом — это +9 месяцев биологического возраста. "
+            "Это не метафора — это исследование._"
+        ),
+    },
+    {
+        "id": "sq_last_laugh",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Когда ты последний раз смеялась — по-настоящему, "
+            "до слёз или живота?\n\n"
+            "_Смех снижает кортизол, повышает иммунитет и "
+            "активирует те же зоны мозга что и социальная связь._"
+        ),
+    },
+    {
+        "id": "sq_said",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Есть что-то что ты давно хочешь сказать кому-то — "
+            "но не говоришь?\n\n"
+            "_Невысказанное не исчезает. Оно живёт в теле "
+            "как фоновое напряжение._"
+        ),
+    },
+    {
+        "id": "sq_alone_together",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Ты сейчас больше нуждаешься в одиночестве — "
+            "или в близости с людьми?\n\n"
+            "_Мозг нуждается в обоих — по очереди. "
+            "Вопрос в том какой сейчас твой дефицит._"
+        ),
+    },
+
+    # — Смысл и направление —
+    {
+        "id": "sq_proud",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Чем из последних месяцев ты тихо гордишься — "
+            "даже если никому не говорила об этом?\n\n"
+            "_Мозг лучше запоминает и строит на том, что признаёт ценным. "
+            "Назови это вслух — хотя бы себе._"
+        ),
+    },
+    {
+        "id": "sq_five_years",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Что ты хочешь чтобы изменилось в твоей жизни "
+            "через пять лет?\n\n"
+            "_Мозг плохо работает с абстракцией «стать лучше». "
+            "Но очень хорошо — с конкретным образом будущего._"
+        ),
+    },
+    {
+        "id": "sq_enough",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Что было бы «достаточно» — если бы ты позволила себе "
+            "это определить?\n\n"
+            "_Хроническое «недостаточно» — это кортизол в постоянном режиме. "
+            "Мозг не отдыхает когда гонка не останавливается._"
+        ),
+    },
+    {
+        "id": "sq_waste",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "На что ты тратишь энергию — и понимаешь что это не твоё?\n\n"
+            "_Каждый раз когда делаешь не своё — мозг тратит "
+            "в 3 раза больше ресурсов чем на своё. "
+            "Это не лень. Это биология._"
+        ),
+    },
+    {
+        "id": "sq_morning_feel",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "С каким чувством ты обычно просыпаешься — "
+            "в понедельник утром?\n\n"
+            "_Это не просто настроение. Это индикатор того "
+            "насколько твоя жизнь совпадает с тем что для тебя важно._"
+        ),
+    },
+
+    # — Мозг и осознанность —
+    {
+        "id": "sq_autopilot",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Что ты делаешь каждый день на автопилоте — "
+            "не замечая?\n\n"
+            "_Автопилот экономит энергию мозга. Но иногда "
+            "он уводит нас туда куда мы не хотим ехать._"
+        ),
+    },
+    {
+        "id": "sq_phone",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Если честно — телефон в твоей жизни "
+            "больше помогает или забирает?\n\n"
+            "_Среднее время на телефон сегодня — 4-7 часов в день. "
+            "Мозг не может глубоко думать в режиме постоянных переключений._"
+        ),
+    },
+    {
+        "id": "sq_last_bored",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Когда ты последний раз скучала — просто сидела "
+            "без телефона и ничего не делала?\n\n"
+            "_Скука — это не пустота. Это режим дефолтной сети мозга. "
+            "Именно в ней рождаются лучшие идеи._"
+        ),
+    },
+    {
+        "id": "sq_notice",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Что ты заметила на этой неделе — "
+            "что обычно проходит мимо?\n\n"
+            "_Внимание — это мышца. Она устаёт и тренируется. "
+            "Замечать детали — это и есть тренировка._"
+        ),
+    },
+    {
+        "id": "sq_gratitude",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "За что в своём теле ты благодарна прямо сейчас — "
+            "что оно просто делает без твоего участия?\n\n"
+            "_Сердце сделало сегодня около 100 000 ударов. "
+            "Лёгкие — около 20 000 вдохов. Без напоминаний._"
+        ),
+    },
+
+    # — Изменения и время —
+    {
+        "id": "sq_changed",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Как ты изменилась за последние 3 года — "
+            "в том как думаешь, чувствуешь, выбираешь?\n\n"
+            "_Мозг меняется всю жизнь. Это называется нейропластичность. "
+            "Ты — доказательство._"
+        ),
+    },
+    {
+        "id": "sq_let_go",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Что ты наконец отпустила за последний год — "
+            "что раньше держало?\n\n"
+            "_Отпускание — это не слабость. Это работа префронтальной коры. "
+            "Это буквально сложнее чем удерживать._"
+        ),
+    },
+    {
+        "id": "sq_regret",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Если бы ты могла дать совет себе — 10 лет назад — "
+            "одним предложением, что бы это было?\n\n"
+            "_Не для того чтобы жалеть. Для того чтобы услышать "
+            "что ты знаешь сейчас._"
+        ),
+    },
+    {
+        "id": "sq_season",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "В какое время года ты чувствуешь себя наиболее живой?\n\n"
+            "_Это не просто предпочтение. Твои биологические часы "
+            "буквально настроены на определённый фотопериод. "
+            "Это твой сезон._"
+        ),
+    },
+    {
+        "id": "sq_old_self",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "Есть что-то что ты делала в детстве или юности — "
+            "и давно перестала — что хотелось бы вернуть?\n\n"
+            "_Не потому что надо. Потому что это было твоим._"
+        ),
+    },
+    {
+        "id": "sq_pace",
+        "text": (
+            "🌿 *Вопрос воскресенья*\n\n"
+            "В каком темпе ты живёшь сейчас — "
+            "это твой темп или навязанный?\n\n"
+            "_Хронический «не успеваю» — это не характер. "
+            "Это симптом. И он лечится._"
+        ),
+    },
+]
+
+# ───────────────────────────────────────────────────────────────────
+# ПОПРАВКА #183: ФАКТЫ-УДИВЛЯЛКИ
+# Третий тип дня — вместо задания или знания.
+# То что хочется переслать. Связь с мозгом, сном, телом — но через удивление.
+# Пул на 2+ года.
+# ───────────────────────────────────────────────────────────────────
+WONDER_FACTS = [
+    # — Сон и мозг —
+    {
+        "id": "wf_octopus_dream",
+        "text": (
+            "🐙 *Факт дня*\n\n"
+            "Осьминоги спят — и у них есть фазы REM. "
+            "Во время них кожа осьминога меняет цвет и мигает паттернами. "
+            "Учёные думают что они видят сны.\n\n"
+            "_А ты знаешь что твой мозг тоже «проигрывает» день заново "
+            "пока ты спишь? Это называется консолидация памяти._"
+        ),
+    },
+    {
+        "id": "wf_brain_clean",
+        "text": (
+            "🧠 *Факт дня*\n\n"
+            "Мозг буквально сжимается во время сна — "
+            "клетки уменьшаются на 60%, и спинномозговая жидкость "
+            "вымывает токсины через образовавшиеся каналы.\n\n"
+            "_Это открыли только в 2013 году. "
+            "До этого не знали зачем мы спим по-настоящему._"
+        ),
+    },
+    {
+        "id": "wf_yawn",
+        "text": (
+            "😮 *Факт дня*\n\n"
+            "Зевота заразна — даже через текст. "
+            "Ты сейчас, возможно, хочешь зевнуть.\n\n"
+            "_Это потому что зеркальные нейроны активируются "
+            "даже при чтении слова «зевота». "
+            "Тот же механизм отвечает за эмпатию._"
+        ),
+    },
+    {
+        "id": "wf_dream_forget",
+        "text": (
+            "💭 *Факт дня*\n\n"
+            "50% сна забывается в первые 5 минут после пробуждения. "
+            "Через 10 минут — 90%.\n\n"
+            "_Мозг активно стирает сны — вероятно чтобы не путать "
+            "их с реальными воспоминаниями. Это защитный механизм._"
+        ),
+    },
+    {
+        "id": "wf_sleep_position",
+        "text": (
+            "🦁 *Факт дня*\n\n"
+            "Львы спят по 20 часов в сутки. "
+            "Жирафы — по 30 минут в день (суммарно). "
+            "Летучие мыши — по 20 часов, вниз головой.\n\n"
+            "_У каждого вида своя архитектура сна. "
+            "Человеку нужно 7-9 часов — это не лень, "
+            "это эволюционная программа._"
+        ),
+    },
+
+    # — Нейропластичность —
+    {
+        "id": "wf_london_taxi",
+        "text": (
+            "🚕 *Факт дня*\n\n"
+            "Лондонские таксисты имеют увеличенный гиппокамп — "
+            "часть мозга отвечающую за навигацию и память. "
+            "Он буквально вырос от многолетней работы с картой города.\n\n"
+            "_Мозг физически меняется от того что мы делаем регулярно. "
+            "В любую сторону._"
+        ),
+    },
+    {
+        "id": "wf_neurons_born",
+        "text": (
+            "✨ *Факт дня*\n\n"
+            "Новые нейроны рождаются в твоём мозге прямо сейчас — "
+            "в гиппокампе, каждый день. "
+            "Этот процесс называется нейрогенез.\n\n"
+            "_Раньше думали что нейроны не восстанавливаются. "
+            "Это оказалось неправдой. Движение и обучение ускоряют их рождение._"
+        ),
+    },
+    {
+        "id": "wf_violin",
+        "text": (
+            "🎻 *Факт дня*\n\n"
+            "У скрипачей зона мозга отвечающая за левую руку "
+            "значительно больше чем у не-музыкантов. "
+            "Она физически увеличилась от практики.\n\n"
+            "_Мозг не фиксирован. Он лепится от использования. "
+            "Как мышца._"
+        ),
+    },
+    {
+        "id": "wf_placebo",
+        "text": (
+            "💊 *Факт дня*\n\n"
+            "Плацебо работает — даже когда человек знает что это плацебо. "
+            "В исследованиях люди получали улучшение зная что принимают "
+            "пустышку.\n\n"
+            "_Мозг настолько верит в выздоровление что запускает "
+            "реальные биохимические процессы. "
+            "Это называется открытое плацебо._"
+        ),
+    },
+    {
+        "id": "wf_phantom",
+        "text": (
+            "👁 *Факт дня*\n\n"
+            "Люди с ампутированной конечностью часто чувствуют её — "
+            "иногда с болью. Это называется фантомная боль.\n\n"
+            "_Потому что мозг хранит карту тела — и не сразу "
+            "обновляет её после потери. Боль реальна, "
+            "хотя конечности нет. Мозг создаёт реальность._"
+        ),
+    },
+
+    # — Тело и восприятие —
+    {
+        "id": "wf_heart_brain",
+        "text": (
+            "❤️ *Факт дня*\n\n"
+            "Сердце имеет собственную нервную систему — "
+            "около 40 000 нейронов. "
+            "Оно обрабатывает информацию независимо от мозга.\n\n"
+            "_Именно поэтому «сердце чувствует» — это не метафора. "
+            "Это нейробиология._"
+        ),
+    },
+    {
+        "id": "wf_gut_brain",
+        "text": (
+            "🦠 *Факт дня*\n\n"
+            "В кишечнике — 100 миллионов нейронов. "
+            "Это больше чем в спинном мозге.\n\n"
+            "_90% серотонина — «гормона счастья» — производится "
+            "в кишечнике, а не в мозге. "
+            "«Кишечное чутьё» — буквально второй мозг._"
+        ),
+    },
+    {
+        "id": "wf_nose_memory",
+        "text": (
+            "👃 *Факт дня*\n\n"
+            "Запах — единственное чувство которое идёт напрямую "
+            "в лимбическую систему — центр эмоций и памяти. "
+            "Все остальные чувства делают «пересадку».\n\n"
+            "_Вот почему запах булочки из детства вызывает "
+            "такие сильные воспоминания мгновенно._"
+        ),
+    },
+    {
+        "id": "wf_cold_water",
+        "text": (
+            "🌊 *Факт дня*\n\n"
+            "30 секунд холодной воды в конце душа "
+            "активируют симпатическую нервную систему — "
+            "выброс норадреналина увеличивается на 300%.\n\n"
+            "_Именно поэтому после холодного душа ощущение "
+            "бодрости — реальное, а не самовнушение._"
+        ),
+    },
+    {
+        "id": "wf_blink",
+        "text": (
+            "👁 *Факт дня*\n\n"
+            "Мы моргаем 15-20 раз в минуту — "
+            "и мозг «выключает» зрение при каждом моргании. "
+            "Мы этого не замечаем.\n\n"
+            "_За жизнь человек проводит около 1.2 года "
+            "с закрытыми глазами от моргания. "
+            "Мозг заполняет пробелы — как в кино._"
+        ),
+    },
+
+    # — Эволюция и поведение —
+    {
+        "id": "wf_fear_smell",
+        "text": (
+            "😰 *Факт дня*\n\n"
+            "Люди могут буквально чувствовать запах страха — "
+            "через пот другого человека. "
+            "В исследованиях это активировало миндалину — "
+            "центр тревоги.\n\n"
+            "_Мы социальные животные до мозга костей. "
+            "Эмоции заразны биохимически, не только через слова._"
+        ),
+    },
+    {
+        "id": "wf_music_pain",
+        "text": (
+            "🎵 *Факт дня*\n\n"
+            "Музыка снижает болевые ощущения — "
+            "даже при медицинских процедурах. "
+            "Это подтверждено в хирургии.\n\n"
+            "_Мозг не может полностью обрабатывать боль "
+            "и сложную музыку одновременно. "
+            "Он выбирает музыку._"
+        ),
+    },
+    {
+        "id": "wf_social_pain",
+        "text": (
+            "💔 *Факт дня*\n\n"
+            "Социальная боль — отвержение, потеря, одиночество — "
+            "активирует те же зоны мозга что и физическая боль.\n\n"
+            "_«Разбитое сердце» — не метафора. "
+            "Парацетамол в исследованиях снижал социальную боль. "
+            "Это одна система._"
+        ),
+    },
+    {
+        "id": "wf_laughter",
+        "text": (
+            "😂 *Факт дня*\n\n"
+            "Смех снижает кортизол на 39% и повышает иммунные клетки. "
+            "15 минут смеха сжигают до 40 калорий.\n\n"
+            "_Дети смеются ~400 раз в день. "
+            "Взрослые — ~15 раз. "
+            "Где-то между детством и взрослостью мы теряем что-то важное._"
+        ),
+    },
+    {
+        "id": "wf_words_pain",
+        "text": (
+            "💬 *Факт дня*\n\n"
+            "Слова имеют физический эффект на мозг. "
+            "Слова угрозы активируют миндалину — "
+            "даже написанные, даже в книге.\n\n"
+            "_Именно поэтому то что мы говорим себе внутри "
+            "имеет биологическое значение. "
+            "Внутренний критик — это реальный стресс._"
+        ),
+    },
+
+    # — Удивительная физиология —
+    {
+        "id": "wf_energy",
+        "text": (
+            "⚡️ *Факт дня*\n\n"
+            "Мозг потребляет 20% всей энергии тела — "
+            "при том что весит всего 2% от массы тела.\n\n"
+            "_И при этом работает на уровне мощности лампочки — "
+            "около 20 ватт. "
+            "Самый эффективный компьютер из известных._"
+        ),
+    },
+    {
+        "id": "wf_decision",
+        "text": (
+            "🧠 *Факт дня*\n\n"
+            "Мозг принимает решение за 7-10 секунд "
+            "до того как ты это осознаёшь. "
+            "Осознанное «решение» — это уже ратификация.\n\n"
+            "_Это не значит что воли нет. "
+            "Но это значит что интуиция часто быстрее логики._"
+        ),
+    },
+    {
+        "id": "wf_touch",
+        "text": (
+            "🤝 *Факт дня*\n\n"
+            "Тактильный контакт — прикосновение, объятие — "
+            "снижает кортизол и повышает окситоцин за 20 секунд.\n\n"
+            "_Объятие дольше 20 секунд запускает полноценный "
+            "окситоциновый ответ. Это минимальный порог «достаточно близко»._"
+        ),
+    },
+    {
+        "id": "wf_microbiome",
+        "text": (
+            "🦠 *Факт дня*\n\n"
+            "В теле человека бактерий примерно столько же "
+            "сколько собственных клеток — около 37 триллионов.\n\n"
+            "_И они влияют на настроение, тревогу, иммунитет "
+            "через ось кишечник-мозг. "
+            "Ты никогда не была одна._"
+        ),
+    },
+    {
+        "id": "wf_forest",
+        "text": (
+            "🌲 *Факт дня*\n\n"
+            "20 минут в лесу или парке снижают кортизол на 13% "
+            "и активность миндалины на 15%. "
+            "Японцы называют это «синрин-йоку» — лесные ванны.\n\n"
+            "_Это работает даже в городском парке. "
+            "Мозгу достаточно зелени и тишины._"
+        ),
+    },
+    {
+        "id": "wf_water",
+        "text": (
+            "💧 *Факт дня*\n\n"
+            "Дефицит воды в 2% от массы тела "
+            "снижает когнитивные функции на 20%.\n\n"
+            "_Мозг на 80% состоит из воды. "
+            "Лёгкое обезвоживание — это буквально меньше мозга._"
+        ),
+    },
+    {
+        "id": "wf_color_blue",
+        "text": (
+            "💙 *Факт дня*\n\n"
+            "Синий цвет неба и воды снижает кровяное давление "
+            "и вызывает состояние «мягкой увлечённости» — "
+            "мозг расслаблен но активен.\n\n"
+            "_Именно поэтому у воды и у окна думается по-другому. "
+            "Это не романтика — это нейробиология._"
+        ),
+    },
+    {
+        "id": "wf_walking_think",
+        "text": (
+            "🚶 *Факт дня*\n\n"
+            "Ходьба увеличивает творческое мышление на 81% — "
+            "исследование Stanford. "
+            "Особенно ходьба на улице.\n\n"
+            "_Стив Джобс, Дарвин, Бетховен — все думали пешком. "
+            "Это не совпадение._"
+        ),
+    },
+    {
+        "id": "wf_cold_face",
+        "text": (
+            "🧊 *Факт дня*\n\n"
+            "Умывание холодной водой активирует "
+            "«рефлекс ныряльщика» — пульс замедляется, "
+            "кровь перераспределяется к мозгу.\n\n"
+            "_Это эволюционный механизм выживания под водой. "
+            "Работает и на суше — как быстрый сброс стресса._"
+        ),
+    },
+    {
+        "id": "wf_afternoon_dip",
+        "text": (
+            "😴 *Факт дня*\n\n"
+            "Послеобеденная сонливость в 14-16 часов — "
+            "это не от обеда. Это вшитый в биологию «второй цикл сна».\n\n"
+            "_Во многих культурах это сиеста. "
+            "Даже 10-20 минут дрёмы восстанавливают когнитивные функции "
+            "лучше кофе._"
+        ),
+    },
+    {
+        "id": "wf_stars",
+        "text": (
+            "🌟 *Факт дня*\n\n"
+            "Когда смотришь на звёзды ночью — "
+            "ты смотришь в прошлое. Ближайшая звезда "
+            "находится в 4 световых годах.\n\n"
+            "_Мозг не умеет обрабатывать такие масштабы — "
+            "и переходит в состояние «благоговения». "
+            "Это снижает эго и кортизол одновременно._"
+        ),
+    },
+    {
+        "id": "wf_age_brain",
+        "text": (
+            "🎂 *Факт дня*\n\n"
+            "Мозг достигает полной зрелости только в 25-30 лет — "
+            "особенно префронтальная кора (планирование, контроль).\n\n"
+            "_После 30 мозг не деградирует — он меняется. "
+            "Теряет скорость, приобретает глубину и паттерн-распознавание. "
+            "Мудрость — это нейробиология._"
+        ),
+    },
+    {
+        "id": "wf_bilingual",
+        "text": (
+            "🗣 *Факт дня*\n\n"
+            "Знание двух и более языков задерживает деменцию "
+            "в среднем на 4-5 лет.\n\n"
+            "_Постоянное переключение между языками — "
+            "это тренировка для исполнительных функций мозга. "
+            "Каждый день._"
+        ),
+    },
+    {
+        "id": "wf_sugar_brain",
+        "text": (
+            "🍬 *Факт дня*\n\n"
+            "Сахар активирует систему вознаграждения мозга "
+            "так же как кокаин — только слабее.\n\n"
+            "_Именно поэтому «ещё одна конфета» так сложно остановить. "
+            "Это не слабость воли. "
+            "Это дофаминовая петля._"
+        ),
+    },
+    {
+        "id": "wf_art",
+        "text": (
+            "🎨 *Факт дня*\n\n"
+            "Просмотр произведений искусства активирует "
+            "те же зоны мозга что и взгляд на любимого человека.\n\n"
+            "_Музей — это буквально терапия для мозга. "
+            "Не метафорически._"
+        ),
+    },
+]
+
+DAILY_TASKS = [
+    {
+        "id": "task_left_hand",
+        "tags": ["default", "brain"],
+        "text": (
+            "🖊 *Задание на сегодня — новые нейронные связи*\n\n"
+            "Напиши себе любое пожелание на день — *левой рукой* "
+            "(или правой, если ты левша).\n\n"
+            "Медленно, криво, неудобно — это и есть суть. "
+            "Неловкость — это мозг прокладывает новые пути. "
+            "Нейробиологи называют это *вынужденной нейропластичностью*."
+        ),
+    },
+    {
+        "id": "task_walk_backwards",
+        "tags": ["default", "movement", "low_energy"],
+        "text": (
+            "🚶 *Задание на сегодня — включить мозг за 30 секунд*\n\n"
+            "Пройди *20 шагов спиной вперёд* — по коридору, по комнате.\n\n"
+            "Мозг мгновенно переходит в режим повышенного внимания: "
+            "он не знает этого движения и вынужден строить новые нейронные связи. "
+            "Это не шутка — это то, что используют в нейрореабилитации."
+        ),
+    },
+    {
+        "id": "task_count_backwards",
+        "tags": ["default", "brain", "stress"],
+        "text": (
+            "🔢 *Задание на сегодня — тест для мозга*\n\n"
+            "Посчитай вслух от *100 вниз с шагом 7* — без бумаги и телефона.\n"
+            "100 → 93 → 86 → 79...\n\n"
+            "Этот тест используют неврологи для оценки рабочей памяти "
+            "и концентрации. Если застреваешь — это нормально. "
+            "Регулярная практика буквально укрепляет префронтальную кору."
+        ),
+    },
+    {
+        "id": "task_new_route",
+        "tags": ["default", "brain", "movement"],
+        "text": (
+            "🗺 *Задание на сегодня — активировать гиппокамп*\n\n"
+            "Сегодня пройди *хотя бы один маршрут по-новому* — "
+            "другая улица домой, другой путь к кухне, другая дорога в магазин.\n\n"
+            "Исследование таксистов показало: навигация по незнакомым маршрутам "
+            "буквально увеличивает объём гиппокампа — главного центра памяти."
+        ),
+    },
+    {
+        "id": "task_smell_training",
+        "tags": ["default", "brain", "dementia"],
+        "text": (
+            "👃 *Задание на сегодня — тренировка обоняния*\n\n"
+            "Возьми 3 разные специи из шкафа — корица, перец, кофе, "
+            "что есть — и понюхай каждую, закрыв глаза. "
+            "Попробуй вспомнить что-то связанное с этим запахом.\n\n"
+            "Обонятельный нерв — прямой путь в зоны памяти и эмоций. "
+            "Это один из немногих способов стимулировать мозг через нос, "
+            "а не через глаза."
+        ),
+    },
+    {
+        "id": "task_breathing_555",
+        "tags": ["stress", "low_energy", "sleep"],
+        "text": (
+            "🫁 *Задание на сегодня — дыхание для мозга*\n\n"
+            "Прямо сейчас: *вдох 5 секунд — выдох 5 секунд*. "
+            "Поставь таймер на 5 минут и дыши только так.\n\n"
+            "Четырёхнедельное исследование показало: такая техника "
+            "улучшает показатели когнитивного здоровья и снижает риск "
+            "деменции при регулярном применении. 5 минут — это достаточно чтобы начать."
+        ),
+    },
+    {
+        "id": "task_draw_continuous",
+        "tags": ["default", "brain", "stress"],
+        "text": (
+            "✏️ *Задание на сегодня — творчество без правил*\n\n"
+            "Возьми ручку или карандаш и *нарисуй что угодно, "
+            "не отрывая ручку от бумаги* — один непрерывный контур.\n\n"
+            "Это одновременно активирует двигательные зоны, "
+            "визуальную кору и зоны воображения. "
+            "Три нейронные сети сразу — за одно маленькое действие."
+        ),
+    },
+    {
+        "id": "task_sleep_side",
+        "tags": ["sleep", "low_sleep_quality"],
+        "text": (
+            "🌙 *Задание на сегодня — для мозга ночью*\n\n"
+            "Когда ляжешь спать — попробуй заснуть *на боку* (на левом или правом).\n\n"
+            "Исследования глимфатической системы показывают: "
+            "именно в позиции на боку мозг очищается от токсинов "
+            "в 1.5–2 раза эффективнее, чем на спине. "
+            "Это происходит каждую ночь — и ты можешь этому помочь."
+        ),
+    },
+    {
+        "id": "task_blindfold_walk",
+        "tags": ["default", "brain", "movement"],
+        "text": (
+            "👁 *Задание на сегодня — отключить главный канал мозга*\n\n"
+            "Завяжи глаза (или просто закрой) и пройдись по комнате или "
+            "коридору — медленно, руки чуть вперёд для безопасности.\n\n"
+            "Когда зрение выключается, мозг экстренно подключает три системы "
+            "одновременно: вестибулярную, проприоцептивную и пространственную память. "
+            "Это одна из самых мощных тренировок для нейронных связей — "
+            "именно её используют в нейрореабилитации после инсультов.\n\n"
+            "_Важно: убери с пути острые углы и убедись что рядом никто не подставит ножку_ 😄"
+        ),
+    },
+    {
+        "id": "task_20min_move",
+        "tags": ["low_energy", "movement", "dementia"],
+        "text": (
+            "🚴 *Задание на сегодня — 20 минут для памяти*\n\n"
+            "Любое ритмичное движение 20 минут: прогулка, велосипед, "
+            "танцы, кардио дома.\n\n"
+            "Нейробиологи впервые у людей зафиксировали: после такой нагрузки "
+            "в гиппокампе резко усиливаются «рипплы» — сигналы, "
+            "которые закрепляют воспоминания и запускают обучение. "
+            "Работает не хуже кофе."
+        ),
+    },
+    {
+        "id": "task_write_memory",
+        "tags": ["default", "brain"],
+        "text": (
+            "📝 *Задание на сегодня — зафиксировать хорошее*\n\n"
+            "Напиши *от руки* (важно — именно от руки, не в телефон) "
+            "три вещи которые сегодня прошли хорошо. "
+            "Любые — большие или совсем маленькие.\n\n"
+            "Письмо от руки активирует больше зон мозга, чем печать. "
+            "Плюс фокус на позитивном снижает кортизол и помогает мозгу "
+            "лучше консолидировать память за ночь."
+        ),
+    },
+]
+
+# ───────────────────────────────────────────────────────────────────
+# ПУЛ ЗНАНИЙ — понять и изменить привычку
+# ───────────────────────────────────────────────────────────────────
+DAILY_KNOWLEDGE = [
+    {
+        "id": "know_kefir",
+        "tags": ["default", "sleep", "sugar"],
+        "text": (
+            "🥛 *Кефир вечером — это не полезно для мозга*\n\n"
+            "Стакан кефира, йогурта или пастеризованного молока после 18:00 "
+            "вызывает скачок инсулина. Инсулин блокирует мелатонин. "
+            "Мозг хуже входит в глубокий сон — и хуже очищается от токсинов.\n\n"
+            "*Попробуй эту неделю:* убери кефир/йогурт после 18:00. "
+            "Если хочется — перенеси на полдень. "
+            "Разница в качестве сна обычно ощущается уже через 3–4 дня."
+        ),
+    },
+    {
+        "id": "know_crust",
+        "tags": ["default", "food", "aging"],
+        "text": (
+            "🍗 *Хрустящая корочка — красиво, но дорого*\n\n"
+            "При сильном нагреве белков и сахаров образуются "
+            "конечные продукты гликирования (КПГ). "
+            "Именно они дают ту золотистую корочку из аэрогриля или духовки.\n\n"
+            "Исследования связывают высокий уровень КПГ с хроническим воспалением, "
+            "ускоренным старением и снижением чувствительности к инсулину.\n\n"
+            "*Не нужно отказываться от духовки.* "
+            "Просто не доводи до тёмной корки — светло-золотистая безопаснее."
+        ),
+    },
+    {
+        "id": "know_toxic_people",
+        "tags": ["stress", "social", "aging"],
+        "text": (
+            "👥 *Токсичный человек рядом = +9 месяцев биовозраста*\n\n"
+            "Исследование в PNAS: у людей с «токсиками» в ближнем окружении "
+            "биологическое старение идёт быстрее. "
+            "Каждый такой человек — плюс ~1.5% к скорости старения клеток.\n\n"
+            "Хроническое социальное напряжение усиливает воспаление "
+            "и нарушает восстановление ДНК — процессы которые мозг "
+            "выполняет ночью.\n\n"
+            "*Это не значит рвать отношения.* "
+            "Это значит — замечать и ограничивать контакт там, где это возможно."
+        ),
+    },
+    {
+        "id": "know_gums",
+        "tags": ["default", "dementia", "brain"],
+        "text": (
+            "🪥 *Дёсны и деменция — неожиданная связь*\n\n"
+            "Бактерии, вызывающие болезни пародонта, умеют проникать в кровоток. "
+            "Там они усиливают системное воспаление — один из ключевых факторов "
+            "нейродегенерации. Мета-анализ 2022 года: связь с Альцгеймером "
+            "подтверждена статистически.\n\n"
+            "*Простое действие:* чистить зубы 2 минуты + зубная нить раз в день. "
+            "Это буквально инвестиция в мозг, а не только в улыбку."
+        ),
+    },
+    {
+        "id": "know_speech",
+        "tags": ["default", "dementia", "brain"],
+        "text": (
+            "💬 *Когда слова «не идут» — это сигнал, а не усталость*\n\n"
+            "ИИ-анализ речи показал: длинные паузы и трудности с подбором слов "
+            "коррелируют со снижением когнитивных функций — независимо от возраста "
+            "и образования.\n\n"
+            "Замечаешь что стало труднее находить нужное слово? "
+            "Это не обязательно тревожный знак — но это повод "
+            "уделить мозгу больше внимания: сон, движение, новые задачи.\n\n"
+            "*Речь — зеркало мозга.* Хорошая новость: это зеркало можно улучшить."
+        ),
+    },
+    {
+        "id": "know_ultraprocessed",
+        "tags": ["default", "food", "brain"],
+        "text": (
+            "🍟 *Ультраобработанные продукты работают как сигареты*\n\n"
+            "Исследование в Milbank Quarterly: производители фастфуда и снеков "
+            "используют те же принципы, что и табачные компании — "
+            "подбор комбинаций вкусов и текстур для активации системы вознаграждения мозга.\n\n"
+            "Сахар + жир + соль в нужных пропорциях = дофаминовый отклик. "
+            "Мозг просит ещё. Это не слабость воли — это химия.\n\n"
+            "*Первый шаг:* убери один ультраобработанный продукт из еженедельного списка. "
+            "Не все сразу — один."
+        ),
+    },
+    {
+        "id": "know_sitting",
+        "tags": ["movement", "dementia", "default"],
+        "text": (
+            "💺 *10 часов сидя = +63% риск деменции*\n\n"
+            "Исследование JAMA которое разбирала Зухра Павлова: "
+            "при 10 часах сидя в день риск деменции вырастает на 63%. "
+            "При 15 часах — в 3 раза. "
+            "И вечерняя тренировка это *не компенсирует*.\n\n"
+            "Мозгу нужны регулярные микропаузы движения в течение дня — "
+            "не одна большая тренировка.\n\n"
+            "*Простое правило:* каждые 45–60 минут — встать и пройтись "
+            "хотя бы 2–3 минуты."
+        ),
+    },
+    {
+        "id": "know_food_at_40",
+        "tags": ["default", "food", "aging"],
+        "text": (
+            "🍊 *То что ты ешь сегодня — определит мозг после 70*\n\n"
+            "Анализ данных 159 000 человек из UK Biobank: "
+            "питание в 40–69 лет напрямую предсказывает когнитивное здоровье "
+            "в старости. Рацион близкий к DASH-диете (овощи, фрукты, "
+            "цельные зёрна, рыба) — значительно меньший риск снижения памяти.\n\n"
+            "Это не про «диету». Это про то, что каждый приём пищи — "
+            "это инвестиция в мозг который будет работать через 30 лет."
+        ),
+    },
+    {
+        "id": "know_sleep_side",
+        "tags": ["sleep", "low_sleep_quality", "dementia"],
+        "text": (
+            "🧠 *Почему поза во сне важна для мозга*\n\n"
+            "Глимфатическая система — система очистки мозга — "
+            "работает только во время сна. "
+            "Исследования показывают: в позиции *на боку* она работает "
+            "в 1.5–2 раза эффективнее чем на спине или животе.\n\n"
+            "За ночь мозг должен вывести амилоидные бляшки — "
+            "те самые белки, накопление которых связано с Альцгеймером. "
+            "Поза на боку помогает этому процессу."
+        ),
+    },
+    {
+        "id": "know_smell_dementia",
+        "tags": ["default", "dementia", "brain"],
+        "text": (
+            "👃 *Снижение обоняния — ранний сигнал нейродегенерации*\n\n"
+            "Journal of Alzheimer's Disease (2022): снижение обоняния "
+            "без очевидной причины повышает риск деменции на 89%.\n\n"
+            "Обонятельные нейроны — единственные нейроны в мозге "
+            "которые постоянно обновляются. Их угасание часто идёт "
+            "параллельно с другими нейродегенеративными процессами — "
+            "за годы до первых когнитивных симптомов.\n\n"
+            "*Хорошая новость:* тренировка обоняния реально работает. "
+            "Нюхать разные ароматы каждый день — это не странность, "
+            "это нейропрофилактика."
+        ),
+    },
+    {
+        "id": "know_social_dementia",
+        "tags": ["social", "default", "dementia"],
+        "text": (
+            "👩‍👧 *Социальная активность снижает риск деменции*\n\n"
+            "Крупное исследование в Китае: люди которые регулярно "
+            "общаются, заботятся о других, участвуют в групповых занятиях — "
+            "показывают значительно более низкий риск деменции.\n\n"
+            "Социальное взаимодействие нагружает сразу несколько зон мозга: "
+            "речь, эмпатию, планирование, память. "
+            "Одиночество — это не просто грустно, это фактор риска.\n\n"
+            "*Любая форма работает:* разговор, переписка, волонтёрство, "
+            "кружок по интересам."
+        ),
+    },
+]
+
+
+def _select_tip(pool: list, last_ids: set, checkin_data: dict) -> dict:
+    """
+    Выбирает совет из пула с учётом:
+    1. Не повторяет последние 10 советов (last_ids)
+    2. Предпочитает совет с тегом соответствующим данным чекина
+    3. Если ничего не подходит — берёт любой непоказанный
+    """
+    # Определяем теги по данным чекина
+    active_tags = set()
+    energy = checkin_data.get("morning_energy") or checkin_data.get("energy", 5)
+    sleep_q = checkin_data.get("sleep_quality", 5)
+    stress = checkin_data.get("stress_level", 3)
+    movement = checkin_data.get("physical_activity", 3)
+
+    if energy and int(energy) <= 3:
+        active_tags.add("low_energy")
+    if sleep_q and int(sleep_q) <= 3:
+        active_tags.add("low_sleep_quality")
+        active_tags.add("sleep")
+    if stress and int(stress) >= 4:
+        active_tags.add("stress")
+    if movement and int(movement) <= 2:
+        active_tags.add("movement")
+
+    # Сначала ищем совет с подходящим тегом которого ещё не показывали
+    for tip in pool:
+        if tip["id"] in last_ids:
+            continue
+        tip_tags = set(tip.get("tags", []))
+        if active_tags & tip_tags:  # пересечение тегов
+            return tip
+
+    # Потом любой непоказанный
+    for tip in pool:
+        if tip["id"] not in last_ids:
+            return tip
+
+    # Если все показаны — берём первый (цикл начинается заново)
+    return pool[0]
+
+
+# ───────────────────────────────────────────────────────────────────
+# ПОПРАВКА #186: Отправка сезонного совета
+# ───────────────────────────────────────────────────────────────────
+
+async def send_seasonal_tip(tid: int, month: int) -> bool:
+    """Отправляет сезонный совет если в этом месяце ещё не отправляли. Возвращает True если отправил."""
+    tip = SEASONAL_TIPS.get(month)
+    if not tip:
+        return False
+
+    year = datetime.utcnow().year
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id FROM seasonal_tips_log WHERE telegram_id=? AND month_num=? AND year_num=?",
+            (tid, month, year)
+        )
+        row = await cursor.fetchone()
+        if row:
+            return False  # уже отправляли в этом месяце
+
+    try:
+        await bot.send_message(tid, tip["text"], parse_mode="Markdown")
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO seasonal_tips_log (telegram_id, tip_id, month_num, year_num) VALUES (?,?,?,?)",
+                (tid, tip["id"], month, year)
+            )
+            await db.commit()
+        return True
+    except Exception as e:
+        logger.warning(f"send_seasonal_tip error user={tid}: {e}")
+        return False
+
+
+# ───────────────────────────────────────────────────────────────────
+# ПОПРАВКА #187: Мини-серии — получение состояния и отправка шага
+# ───────────────────────────────────────────────────────────────────
+
+MINI_SERIES_ORDER = ["memory_week", "no_sugar_5", "smell_week", "big_reset"]
+
+
+async def get_mini_series_state(tid: int) -> dict | None:
+    """Возвращает текущее состояние мини-серии пользователя или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM mini_series_state WHERE telegram_id=?", (tid,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def send_mini_series_step(tid: int) -> bool:
+    """
+    Отправляет следующий шаг активной мини-серии.
+    Если серии нет — проверяет можно ли запустить новую.
+    Возвращает True если отправил шаг.
+    """
+    state = await get_mini_series_state(tid)
+    today_str = datetime.utcnow().date().isoformat()
+
+    # Если есть активная незавершённая серия
+    if state and state["series_id"] and not state["completed_at"]:
+        # Не отправлять дважды в один день
+        if state["last_sent_date"] == today_str:
+            return False
+
+        series_id = state["series_id"]
+        series = MINI_SERIES.get(series_id)
+        if not series:
+            return False
+
+        current_day = state["current_day"]  # 0-based индекс
+        days = series["days"]
+
+        if current_day >= len(days):
+            # Серия завершена — отмечаем
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE mini_series_state SET completed_at=? WHERE telegram_id=?",
+                    (datetime.utcnow().isoformat(), tid)
+                )
+                await db.commit()
+            return False
+
+        day_data = days[current_day]
+
+        # Кнопки для мини-серий
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📋 Дела", callback_data=f"series_done_{series_id}_{current_day}"),
+                InlineKeyboardButton(text="💭 Эмоции", callback_data=f"series_feel_{series_id}_{current_day}"),
+            ]
+        ])
+
+        # Прогресс-бар
+        total = len(days)
+        done = current_day
+        bar_filled = "█" * done
+        bar_empty = "░" * (total - done)
+        progress_line = f"\n\n_Прогресс: {bar_filled}{bar_empty} {done}/{total}_"
+
+        text = day_data["text"] + progress_line
+
+        try:
+            await bot.send_message(tid, text, parse_mode="Markdown", reply_markup=keyboard)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    """UPDATE mini_series_state
+                       SET current_day=?, last_sent_date=?
+                       WHERE telegram_id=?""",
+                    (current_day + 1, today_str, tid)
+                )
+                await db.execute(
+                    "INSERT INTO mini_series_log (telegram_id, series_id, day_num) VALUES (?,?,?)",
+                    (tid, series_id, current_day + 1)
+                )
+                await db.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"send_mini_series_step error user={tid}: {e}")
+            return False
+
+    # Нет активной серии — проверяем можно ли запустить новую
+    if state and state["completed_at"]:
+        # Прошло ли 7+ дней после завершения?
+        try:
+            completed_dt = datetime.fromisoformat(state["completed_at"])
+            days_since = (datetime.utcnow() - completed_dt).days
+            if days_since < 7:
+                return False
+        except Exception:
+            return False
+
+        # Определяем следующую серию по ротации
+        last_series = state["series_id"]
+        try:
+            idx = MINI_SERIES_ORDER.index(last_series)
+            next_series_id = MINI_SERIES_ORDER[(idx + 1) % len(MINI_SERIES_ORDER)]
+        except ValueError:
+            next_series_id = MINI_SERIES_ORDER[0]
+    elif not state:
+        # Первая серия для нового пользователя
+        next_series_id = MINI_SERIES_ORDER[0]
+    else:
+        return False
+
+    # Запускаем новую серию
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO mini_series_state
+               (telegram_id, series_id, current_day, started_at, completed_at, last_sent_date)
+               VALUES (?,?,0,?,NULL,NULL)
+               ON CONFLICT(telegram_id) DO UPDATE SET
+               series_id=excluded.series_id, current_day=0,
+               started_at=excluded.started_at, completed_at=NULL, last_sent_date=NULL""",
+            (tid, next_series_id, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+
+    # Отправляем анонс серии
+    series = MINI_SERIES[next_series_id]
+    total_days = len(series["days"])
+    try:
+        await bot.send_message(
+            tid,
+            f"🌟 *Новая серия стартует!*\n\n"
+            f"{series['title']}\n"
+            f"_{total_days} дней — один фокус. Каждый вечер новый шаг._",
+            parse_mode="Markdown"
+        )
+        await asyncio.sleep(1)
+    except Exception:
+        pass
+
+    # Рекурсивно отправляем первый шаг
+    return await send_mini_series_step(tid)
+
+
+async def send_daily_brain_tip():
+    """
+    ПОПРАВКА #180: Ежедневный умный совет в 20:00 по местному времени.
+    Чётный день от онбординга → ЗАДАНИЕ.
+    Нечётный день → ЗНАНИЕ.
+    """
+    now_utc = datetime.utcnow()
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT telegram_id, name, timezone_offset, onboarding_completed_at,
+                       morning_energy, sleep_quality, stress_level, physical_activity
+                FROM users
+                WHERE onboarding_completed = 1
+                AND reminders_enabled = 1
+            """)
+            users = await cursor.fetchall()
+
+        for user in users:
+            try:
+                offset = user["timezone_offset"] or 3
+                user_now = now_utc + timedelta(hours=offset)
+
+                # Отправляем строго в 20:00 по местному
+                if user_now.strftime("%H:%M") != "20:00":
+                    continue
+
+                tid = user["telegram_id"]
+                name = user["name"] or "друг"
+
+                # Определяем тип дня: задание или знание
+                onb_date_raw = user["onboarding_completed_at"]
+                try:
+                    if onb_date_raw:
+                        onb_date = datetime.fromisoformat(str(onb_date_raw)).date()
+                    else:
+                        onb_date = user_now.date()
+                    days_since = (user_now.date() - onb_date).days
+                except Exception:
+                    days_since = user_now.timetuple().tm_yday
+
+                # ПОПРАВКА #180: советы начинаются только с 31-го дня
+                # Первый месяц пользователь получает рекомендации из тестов
+                if days_since < 31:
+                    continue
+
+                # ПОПРАВКА #186: первая суббота месяца → сезонный совет
+                # Суббота (weekday==5) и день месяца 1–7
+                if user_now.weekday() == 5 and user_now.day <= 7:
+                    sent = await send_seasonal_tip(tid, user_now.month)
+                    if sent:
+                        await asyncio.sleep(0.3)
+                        continue  # сезонный отправлен — обычный не нужен
+
+                # ПОПРАВКА #187: если есть активная мини-серия — отправляем шаг серии
+                series_sent = await send_mini_series_step(tid)
+                if series_sent:
+                    await asyncio.sleep(0.3)
+                    continue  # шаг серии отправлен — обычный совет не нужен
+
+                # ПОПРАВКА #183: четыре типа дней
+                # Воскресенье → вопрос для размышления
+                # Остальные дни по остатку от деления:
+                #   0 → задание  1 → знание  2 → задание  3 → факт-удивлялка
+                weekday = user_now.weekday()  # 6 = воскресенье
+                if weekday == 6:
+                    pool = SUNDAY_QUESTIONS
+                    day_type = "sunday"
+                else:
+                    remainder = days_since % 4
+                    if remainder in (0, 2):
+                        pool = DAILY_TASKS
+                        day_type = "task"
+                    elif remainder == 1:
+                        pool = DAILY_KNOWLEDGE
+                        day_type = "knowledge"
+                    else:
+                        pool = WONDER_FACTS
+                        day_type = "wonder"
+
+                # Получаем историю последних показанных советов
+                async with aiosqlite.connect(DB_PATH) as db:
+                    db.row_factory = aiosqlite.Row
+                    cursor = await db.execute("""
+                        SELECT tip_id FROM daily_tips_log
+                        WHERE telegram_id = ?
+                        ORDER BY sent_at DESC LIMIT 10
+                    """, (tid,))
+                    rows = await cursor.fetchall()
+                    last_ids = {r["tip_id"] for r in rows}
+
+                # Данные последнего чекина для выбора тега
+                checkin_data = {
+                    "morning_energy": user["morning_energy"],
+                    "sleep_quality":  user["sleep_quality"],
+                    "stress_level":   user["stress_level"],
+                    "physical_activity": user["physical_activity"],
+                }
+
+                tip = _select_tip(pool, last_ids, checkin_data)
+
+                full_text = tip["text"]
+
+                # Кнопка «Сделала» только для заданий
+                if day_type == "task":
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(
+                            text="✅ Сделала!",
+                            callback_data=f"tip_done_{tip['id']}"
+                        )]
+                    ])
+                    await bot.send_message(tid, full_text, parse_mode="Markdown",
+                                           reply_markup=keyboard)
+                else:
+                    await bot.send_message(tid, full_text, parse_mode="Markdown")
+
+                # Логируем
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("""
+                        INSERT INTO daily_tips_log (telegram_id, tip_id, tip_type, sent_at)
+                        VALUES (?, ?, ?, datetime('now'))
+                    """, (tid, tip["id"], day_type))
+                    await db.commit()
+
+                await asyncio.sleep(0.3)
+
+            except Exception as e:
+                logger.warning(f"send_daily_brain_tip user error: {e}")
+
+    except Exception as e:
+        logger.warning(f"send_daily_brain_tip error: {e}")
+
+
+# ───────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────
+# ПОПРАВКА #187: Обработчики кнопок мини-серии
+# ───────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("series_done_"))
+async def series_done_handler(callback: CallbackQuery):
+    """📋 Дела — пользователь отметила что сделала задание серии."""
+    await callback.answer("📋 Записала!")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    responses = [
+        "💚 Отлично. Маленький шаг — реальное изменение.",
+        "🧠 Мозг фиксирует. Продолжай.",
+        "✅ Записано. Завтра — следующий шаг.",
+        "🌱 Именно так и строятся привычки — по одному дню.",
+    ]
+    import random
+    await callback.message.answer(random.choice(responses))
+
+
+@router.callback_query(F.data.startswith("series_feel_"))
+async def series_feel_handler(callback: CallbackQuery):
+    """💭 Эмоции — пользователь хочет поделиться ощущением."""
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        "💭 Расскажи — как ощущения от сегодняшнего шага?\n\n"
+        "_Можешь написать пару слов — я слушаю._"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ПОПРАВКА #190: КРЮЧОК ВИТАМИНА Д
+# Два триггера:
+#   1. БГС стадия 3 — после reassess_bgs_stage
+#   2. Энергия ≤3 три дня подряд — после утреннего чекина
+# Показывается один раз на пользователя (флаг vitd_hook_shown).
+# ═══════════════════════════════════════════════════════════════════
+
+VITD_HOOK_BGS = (
+    "☀️ *Один момент — он важный*\n\n"
+    "При истощении надпочечников дефицит витамина Д встречается у 70–80% людей. "
+    "Это не случайность: витамин Д участвует в регуляции HPA-оси — "
+    "той самой системы, которая сейчас перегружена.\n\n"
+    "📊 Оптимальный уровень 25(OH)D: *50–80 нг/мл*\n"
+    "Большинство сдавших анализ в тёмное время года — ниже 30.\n\n"
+    "Если не сдавала в последние 6 месяцев — стоит проверить.\n"
+    "_Это один из немногих анализов, где результат почти всегда требует действия._"
+)
+
+VITD_HOOK_ENERGY = (
+    "☀️ *Кстати, про энергию*\n\n"
+    "Три дня низкой энергии подряд — это паттерн, а не случайность.\n\n"
+    "Одна из самых частых и незаметных причин: дефицит витамина Д.\n"
+    "80% людей в северных широтах с октября по апрель ниже оптимума — "
+    "и большинство даже не знает об этом.\n\n"
+    "Симптомы размытые: усталость, тяжесть, сниженный фон настроения. "
+    "Именно то, что ты описываешь.\n\n"
+    "📋 Анализ: *25(OH)D*. Оптимум: 50–80 нг/мл.\n"
+    "_Иногда самое простое объяснение — верное._"
+)
+
+
+async def maybe_send_vitd_hook(tid: int, trigger: str):
+    """
+    ПОПРАВКА #190: Отправляет крючок витамина Д если ещё не показывали.
+    trigger: 'bgs3' | 'energy_low'
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        # Проверяем флаг vitd_hook_shown
+        try:
+            cursor = await db.execute(
+                "SELECT vitd_hook_shown FROM users WHERE telegram_id=?", (tid,)
+            )
+            row = await cursor.fetchone()
+            if row and row["vitd_hook_shown"]:
+                return  # уже показывали
+        except Exception:
+            # Колонки нет — создаём через ALTER
+            try:
+                await db.execute(
+                    "ALTER TABLE users ADD COLUMN vitd_hook_shown INTEGER DEFAULT 0"
+                )
+                await db.commit()
+            except Exception:
+                pass
+
+    text = VITD_HOOK_BGS if trigger == "bgs3" else VITD_HOOK_ENERGY
+
+    try:
+        await asyncio.sleep(1.5)
+        await bot.send_message(tid, text, parse_mode="Markdown")
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET vitd_hook_shown=1 WHERE telegram_id=?", (tid,)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"maybe_send_vitd_hook error user={tid}: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ПОПРАВКА #191: КРЮЧОК СИДЯЧЕГО ОБРАЗА ЖИЗНИ
+# Два триггера:
+#   1. Опросник условий работы — movement_breaks = sitting_all_day / sedentary
+#   2. Вечерний чекин — физическая активность 'none'/'low' пять дней подряд
+# Показывается один раз на пользователя (флаг sedentary_hook_shown).
+# ═══════════════════════════════════════════════════════════════════
+
+SEDENTARY_HOOK_WORK = (
+    "🪑 *Один факт, который меняет отношение к стулу*\n\n"
+    "Судя по ответам — ты проводишь большую часть дня сидя.\n\n"
+    "Исследования когнитивных функций показывают: "
+    "8+ часов сидячего положения в день снижают объём гиппокампа — "
+    "части мозга, отвечающей за память и навигацию. "
+    "Это не метафора, это измеренный факт на МРТ.\n\n"
+    "🧠 *Что работает лучше, чем спортзал раз в неделю:*\n"
+    "• Перерыв каждые 45–60 минут — встать, пройтись 2–3 минуты\n"
+    "• «Активные переходы» — лестница вместо лифта, пешком до следующей остановки\n"
+    "• Стоя во время звонков — снижает общее сидячее время на 20–30%\n\n"
+    "📊 _Микро-движения распределённые по дню = лучше одной длинной тренировки "
+    "для когнитивных функций и сосудов._\n\n"
+    "Буду иногда напоминать — не занудно, просто по делу. 💚"
+)
+
+SEDENTARY_HOOK_CHECKIN = (
+    "🚶 *Кстати, про движение*\n\n"
+    "Несколько дней без физической активности — это паттерн, который стоит заметить.\n\n"
+    "Не для похудения. Для мозга.\n\n"
+    "20 минут ходьбы в день повышают нейротрофический фактор BDNF на 20–30% — "
+    "это буквально «удобрение» для нейронов. "
+    "Без него память и концентрация работают на износ.\n\n"
+    "🔑 *Самый низкий порог входа:*\n"
+    "Прогулка 10 минут после ужина. Без кроссовок, без плана, без подготовки.\n"
+    "Просто выйди и иди в любую сторону.\n\n"
+    "Мозг скажет спасибо уже через неделю. 💚"
+)
+
+
+async def maybe_send_sedentary_hook(tid: int, trigger: str):
+    """
+    ПОПРАВКА #191: Отправляет крючок сидячего образа жизни если ещё не показывали.
+    trigger: 'work_conditions' | 'checkin_pattern'
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        try:
+            cursor = await db.execute(
+                "SELECT sedentary_hook_shown FROM users WHERE telegram_id=?", (tid,)
+            )
+            row = await cursor.fetchone()
+            if row and row["sedentary_hook_shown"]:
+                return  # уже показывали
+        except Exception:
+            try:
+                await db.execute(
+                    "ALTER TABLE users ADD COLUMN sedentary_hook_shown INTEGER DEFAULT 0"
+                )
+                await db.commit()
+            except Exception:
+                pass
+
+    text = SEDENTARY_HOOK_WORK if trigger == "work_conditions" else SEDENTARY_HOOK_CHECKIN
+
+    try:
+        await asyncio.sleep(1.5)
+        await bot.send_message(tid, text, parse_mode="Markdown")
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET sedentary_hook_shown=1 WHERE telegram_id=?", (tid,)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"maybe_send_sedentary_hook error user={tid}: {e}")
+
+
+# ПОПРАВКА #182: Обработчик кнопки «Сделала ✅»
+# Короткий неожиданный отклик — не «молодец», а что-то что хочется
+# прочитать. Дофамин от маленькой победы.
+# ───────────────────────────────────────────────────────────────────
+
+# Отклики привязаны к конкретному заданию
+TIP_DONE_RESPONSES = {
+    "task_left_hand": [
+        "🧠 Мозг только что проложил новые пути. Немного криво — но это и есть нейропластичность.",
+        "✍️ Левое полушарие удивлено. Правое — довольно.",
+        "🎉 Где-то в префронтальной коре сейчас маленький праздник.",
+    ],
+    "task_walk_backwards": [
+        "🚶 Вестибулярная система аплодирует. Стоя. Спиной вперёд.",
+        "🧠 20 шагов назад = сотни новых нейронных соединений. Математика мозга.",
+        "🎯 Нейрореабилитологи используют это после инсультов. Ты сделала просто так — это лучше.",
+    ],
+    "task_count_backwards": [
+        "🔢 93, 86, 79... Префронтальная кора говорит спасибо. Она любит такое.",
+        "🧮 Этот тест используют неврологи на приёме. Ты только что прошла его добровольно.",
+        "💪 Рабочая память только что получила небольшую тренировку. Без абонемента.",
+    ],
+    "task_new_route": [
+        "🗺 Гиппокамп доволен. Новые маршруты — его любимая еда.",
+        "🧠 Таксисты Лондона за 4 года учёбы увеличивают гиппокамп. Ты начала сегодня.",
+        "✨ Новый путь = новые связи. Мозг буквально стал чуть больше.",
+    ],
+    "task_smell_training": [
+        "👃 Обонятельный нерв — прямой путь в зоны памяти. Ты только что им воспользовалась.",
+        "🌿 Три запаха = три активации памяти и эмоций. Недорого и эффективно.",
+        "🧠 Обоняние и память живут рядом в мозге. Тренируешь одно — укрепляешь другое.",
+    ],
+    "task_breathing_555": [
+        "🫁 Блуждающий нерв успокоен. Кортизол чуть снизился. Это заметно на клеточном уровне.",
+        "💚 5 минут дыхания = столько же пользы сколько 20 минут прогулки для нервной системы.",
+        "🧘 Парасимпатическая нервная система говорит: наконец-то.",
+    ],
+    "task_draw_continuous": [
+        "✏️ Три нейронные сети одновременно. За один рисунок. Эффективно.",
+        "🎨 Неважно как получилось. Важно что мозг работал в нестандартном режиме.",
+        "🧠 Творчество активирует зоны которые логика не трогает. Ты их только что разбудила.",
+    ],
+    "task_sleep_side": [
+        "🌙 Глимфатика будет рада. Она лучше работает именно так.",
+        "🧠 Пока ты спишь — мозг убирает амилоидные бляшки. На боку это в 1.5 раза эффективнее.",
+        "💤 Маленькое изменение позы — большая разница для ночной очистки мозга.",
+    ],
+    "task_20min_move": [
+        "🚴 Рипплы в гиппокампе активированы. Память работает лучше прямо сейчас.",
+        "🏃 20 минут движения = мозг в режиме обучения на несколько часов вперёд.",
+        "💚 Нейротрофин BDNF выработан. Это белок роста нейронов. Ты его только что запустила.",
+    ],
+    "task_write_memory": [
+        "📝 Рука + мозг + хорошее = тройная активация. Ночью это лучше закрепится в памяти.",
+        "✍️ Письмо от руки активирует больше зон чем печать. Плюс ты выбрала хорошее — это тоже работа.",
+        "🧠 Кортизол чуть снизился. Мозг готовится к хорошему сну. Всё связано.",
+    ],
+    "task_blindfold_walk": [
+        "👁 Зрение выключено — остальные три системы включились на максимум. Мозг в полной боевой.",
+        "🧠 Именно так восстанавливают баланс после неврологических нарушений. Ты сделала это просто так.",
+        "🎯 Пространственная память, вестибулярная система, проприоцепция — всё сразу. Мощная тренировка.",
+    ],
+}
+
+# Универсальные отклики если задание не в словаре
+GENERIC_DONE_RESPONSES = [
+    "✅ Сделано. Мозг это заметил.",
+    "🧠 Маленькое действие — настоящий результат. Так и работает нейропластичность.",
+    "💚 Каждое такое задание — маленький вклад в мозг который будет с тобой через 30 лет.",
+    "🎉 Готово! Где-то в нейронных сетях сейчас тихий праздник.",
+    "✨ Сделала — значит сделала. Мозг не забудет.",
+]
+
+
+# ───────────────────────────────────────────────────────────────────
+# ПОПРАВКА #182: Отклики на «Сделала ✅» — неожиданные, тёплые, с юмором
+# Каждый отклик — под конкретное задание. Мозг любит узнавание.
+# ───────────────────────────────────────────────────────────────────
+
+TIP_DONE_RESPONSES = {
+    "task_left_hand": [
+        "✍️ Мозг доволен. Особенно правое полушарие — оно только что получило новый проект.",
+        "🧠 47 новых нейронных соединений. Примерно. Мозг считать не умеет — но ценит.",
+        "✨ Почерк ужасный? Отлично. Именно так выглядит нейропластичность в действии.",
+    ],
+    "task_walk_backwards": [
+        "🚶 Твой мозжечок только что написал заявку на повышение. Заслуженно.",
+        "🧠 20 шагов назад = мозг на секунду забыл что умеет ходить. И вспомнил заново. Это и есть рост.",
+        "⚡️ Вестибулярная система говорит спасибо. Она так редко бывает нужна по-настоящему.",
+    ],
+    "task_count_backwards": [
+        "🔢 Если дошла до 58 — это уже хорошо. До 2 — повод гордиться.",
+        "🧠 Префронтальная кора только что получила лёгкую тренировку. Завтра будет чуть легче.",
+        "💡 Неврологи используют этот тест чтобы проверить мозг. Ты только что сама себя проверила. И прошла.",
+    ],
+    "task_new_route": [
+        "🗺 Гиппокамп доволен. Новый маршрут — это новая карта в базе данных памяти.",
+        "🧠 Лондонские таксисты с большим гиппокампом начинали именно с этого. Ну, примерно.",
+        "✨ Мозг запомнил этот путь. Теперь у тебя на один маршрут больше чем вчера.",
+    ],
+    "task_smell_training": [
+        "👃 Обонятельные нейроны получили стимуляцию. Они так редко бывают в центре внимания.",
+        "🌿 Три запаха — три активации зон памяти. Что вспомнилось?",
+        "🧠 Прямой путь в лимбическую систему — через нос. Сегодня ты им воспользовалась.",
+    ],
+    "task_breathing_555": [
+        "🫁 Блуждающий нерв говорит спасибо. Он давно ждал этих пяти минут.",
+        "💚 Кортизол чуть снизился. Немного — но снизился. Каждый раз немного.",
+        "🧠 Сердечно-дыхательная когерентность достигнута. Звучит сложно — ощущается как спокойствие.",
+    ],
+    "task_draw_continuous": [
+        "✏️ Три нейронные сети одновременно. За один рисунок. Неплохо.",
+        "🎨 Результат не важен. Процесс — это и есть тренировка. Мозг не смотрит на эстетику.",
+        "✨ Моторная кора, зрительная кора, воображение — всё поработало. Художник необязателен.",
+    ],
+    "task_sleep_side": [
+        "🌙 Договорились. Глимфатика ждёт тебя ночью и готова работать на полную.",
+        "🧠 На боку — мозг очищается лучше. Это один из самых простых подарков себе.",
+        "💚 Ночная уборка мозга запланирована. Осталось только лечь.",
+    ],
+    "task_20min_move": [
+        "🚴 Рипплы в гиппокампе активированы. Память сегодня работает чуть лучше — правда.",
+        "⚡️ 20 минут движения = кофе для памяти. Без кофеина и без побочных.",
+        "🧠 BDNF выработан. Это белок роста нейронов. Ты только что полила свой мозг.",
+    ],
+    "task_write_memory": [
+        "📝 Три хорошие вещи записаны. Кортизол чуть ниже. Ночная консолидация памяти — чуть лучше.",
+        "✍️ Рука + бумага + позитив = три зоны мозга активированы одновременно. Мощная комбинация.",
+        "💚 Мозг любит замечать хорошее — он просто не всегда умеет сам. Ты ему помогла.",
+    ],
+    "task_blindfold_walk": [
+        "👁 Зрение выключено — всё остальное включилось на максимум. Вестибулярка, проприоцепция, пространственная память.",
+        "🧠 Именно это используют в реабилитации после инсультов. Ты только что потренировала то что большинство людей не тренирует никогда.",
+        "✨ Мозг только что понял что умеет ориентироваться без глаз. Это не мелочь.",
+    ],
+}
+
+# Общие отклики — если задание не в словаре
+GENERIC_DONE_RESPONSES = [
+    "✅ Сделано. Мозг заметил — даже если ты не заметила как.",
+    "🧠 Маленькое действие. Но мозг складывает именно из таких.",
+    "💚 Отлично. Завтра будет ещё одно — и оно будет чуть легче.",
+    "⚡️ Нейронные связи строятся не от больших усилий. От регулярных маленьких.",
+    "✨ Сделала — значит сегодня мозг получил чуть больше чем вчера.",
+]
+
+
+@router.callback_query(F.data.startswith("tip_done_"))
+async def tip_done_handler(callback: CallbackQuery):
+    """
+    ПОПРАВКА #182: Обработчик кнопки «Сделала ✅».
+    Убирает кнопку, показывает неожиданный отклик.
+    Один раз — повторное нажатие игнорируется.
+    """
+    await callback.answer()
+    tip_id = callback.data.replace("tip_done_", "")
+
+    # Выбираем отклик
+    import random
+    responses = TIP_DONE_RESPONSES.get(tip_id, GENERIC_DONE_RESPONSES)
+    response = random.choice(responses)
+
+    # Убираем кнопку — редактируем сообщение
+    try:
+        original_text = callback.message.text or callback.message.caption or ""
+        await callback.message.edit_text(
+            original_text + f"\n\n{response}",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        # Если не удалось отредактировать — просто отвечаем
+        await callback.message.answer(response, parse_mode="Markdown")
+
+    # Логируем факт выполнения
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE daily_tips_log SET completed = 1, completed_at = datetime('now')
+                WHERE telegram_id = ? AND tip_id = ?
+                AND date(sent_at) = date('now')
+            """, (callback.from_user.id, tip_id))
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"tip_done_handler log error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ПОПРАВКА #184: ЕЖЕМЕСЯЧНЫЙ ОПРОС ПРОГРЕССА
+# Раз в месяц (в воскресенье ближайшее к дате онбординга)
+# Три вопроса → персональный отклик → сохранение в БД
+# Через полгода/год — показываем динамику
+# ═══════════════════════════════════════════════════════════════════
+
+def _get_survey_response(sleep: str, wakeup: str, light: str, name: str, month: int) -> str:
+    """
+    Генерирует персональный отклик на основе трёх ответов.
+    Не общий — а под конкретное сочетание.
+    """
+    month_str = f"{month}-й месяц" if month < 5 else f"{month} месяцев"
+
+    # Считаем «позитивные» ответы
+    positive = sum([
+        sleep in ("yes", "little"),
+        wakeup in ("yes", "little"),
+        light in ("habit", "sometimes"),
+    ])
+
+    all_yes = (
+        sleep == "yes" and
+        wakeup == "yes" and
+        light == "habit"
+    )
+    all_no = (
+        sleep == "no" and
+        wakeup == "no" and
+        light == "no"
+    )
+    not_tracked = (
+        sleep == "not_tracked" or
+        wakeup == "not_tracked"
+    )
+
+    if all_yes:
+        return (
+            f"🌟 *{name}, {month_str} — и всё три направления в порядке.*\n\n"
+            f"Сон, подъём, утренний свет — это фундамент. "
+            f"Ты его выстроила.\n\n"
+            f"Именно на таком фундаменте всё остальное держится — "
+            f"память, энергия, настроение, иммунитет.\n\n"
+            f"💚 Аврора это видит. И гордится."
+        )
+    elif all_no:
+        return (
+            f"💙 *{name}, честный ответ важнее красивого.*\n\n"
+            f"За {month_str} — пока не складывается. "
+            f"Это нормально — изменения приходят не линейно.\n\n"
+            f"Давай посмотрим вместе: что сейчас мешает больше всего — "
+            f"сон, подъём или утренний свет?\n\n"
+            f"Напиши — и Аврора подберёт один маленький шаг. "
+            f"Не три. Один."
+        )
+    elif not_tracked:
+        return (
+            f"🌿 *{name}, «не отслеживала» — это тоже ответ.*\n\n"
+            f"Значит пока это не в фокусе внимания. "
+            f"И это нормально — мозг не может держать всё сразу.\n\n"
+            f"Попробуй на следующей неделе одно: "
+            f"просто замечать — как ты проснулась сегодня. "
+            f"Не менять. Просто заметить.\n\n"
+            f"💚 Осознанность приходит раньше изменений."
+        )
+    elif positive == 2:
+        # Два из трёх — смотрим что именно хорошо
+        if sleep == "no" or sleep == "not_tracked":
+            weak = "сон"
+            strong = "подъём и утренний свет"
+        elif wakeup == "no":
+            weak = "лёгкий подъём"
+            strong = "сон и свет"
+        else:
+            weak = "утренний свет"
+            strong = "сон и подъём"
+
+        return (
+            f"🌱 *{name}, {month_str} — {strong} уже твои.*\n\n"
+            f"{weak.capitalize()} пока догоняет — и это нормально. "
+            f"Три вещи сразу не приживаются.\n\n"
+            f"Фокус на одном: именно {weak} — что мешает? "
+            f"Иногда одна маленькая перестройка решает всё.\n\n"
+            f"💚 Ты уже на двух третях пути."
+        )
+    else:
+        # Одно из трёх или смешанное
+        if sleep in ("yes", "little"):
+            win = "сон стал лучше"
+        elif wakeup in ("yes", "little"):
+            win = "подъём стал легче"
+        else:
+            win = "утренний свет входит в привычку"
+
+        return (
+            f"🌿 *{name}, {month_str} — и уже есть движение.*\n\n"
+            f"Заметила: {win}. "
+            f"Это не мелочь — это точка опоры.\n\n"
+            f"Мозг меняется медленно, но необратимо. "
+            f"Одна привычка тянет за собой следующую.\n\n"
+            f"💚 Продолжаем."
+        )
+
+
+async def _send_progress_survey(telegram_id: int, name: str, month: int) -> None:
+    """Отправляет первый вопрос опроса — про сон."""
+    await bot.send_message(
+        telegram_id,
+        f"🌙 *{name}, ты уже {month} {'месяц' if month == 1 else 'месяца' if month < 5 else 'месяцев'} с Авророй.*\n\n"
+        f"Три быстрых вопроса — чтобы увидеть как ты меняешься.\n\n"
+        f"*Вопрос 1 из 3: Сон*\n\n"
+        f"Ты замечаешь что стала засыпать легче "
+        f"или просыпаться более отдохнувшей?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌟 Да, точно заметила", callback_data="srv_sleep_yes")],
+            [InlineKeyboardButton(text="🌱 Немного, но есть", callback_data="srv_sleep_little")],
+            [InlineKeyboardButton(text="😐 Пока не очень", callback_data="srv_sleep_no")],
+            [InlineKeyboardButton(text="🤷 Не отслеживала", callback_data="srv_sleep_not_tracked")],
+        ])
+    )
+
+
+@router.callback_query(F.data.startswith("srv_sleep_"))
+async def survey_sleep_handler(callback: CallbackQuery, state: FSMContext):
+    """Вопрос 1 — сон. Переход к вопросу 2 — подъём."""
+    await callback.answer()
+    raw = callback.data.replace("srv_sleep_", "")
+    # Формат: answer|month_num
+    if "|" in raw:
+        answer, month_str = raw.split("|", 1)
+        month_num = int(month_str)
+    else:
+        answer = raw
+        month_num = 1
+
+    await state.update_data(survey_sleep=answer, survey_month=month_num)
+    await state.set_state(OnboardingStates.survey_wakeup)
+
+    await callback.message.edit_text(
+        "⏰ *Вопрос 2 из 3: Подъём*\n\n"
+        "Стало ли тебе легче вставать в нужное время — "
+        "без долгой борьбы с собой?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌟 Да, стало легче", callback_data="srv_wakeup_yes")],
+            [InlineKeyboardButton(text="🌱 Чуть-чуть", callback_data="srv_wakeup_little")],
+            [InlineKeyboardButton(text="😐 Пока нет", callback_data="srv_wakeup_no")],
+            [InlineKeyboardButton(text="🤷 Не отслеживала", callback_data="srv_wakeup_not_tracked")],
+        ])
+    )
+
+
+@router.callback_query(F.data.startswith("srv_wakeup_"))
+async def survey_wakeup_handler(callback: CallbackQuery, state: FSMContext):
+    """Вопрос 2 — подъём. Переход к вопросу 3 — свет."""
+    await callback.answer()
+    answer = callback.data.replace("srv_wakeup_", "")
+    await state.update_data(survey_wakeup=answer)
+    await state.set_state(OnboardingStates.survey_light)
+
+    await callback.message.edit_text(
+        "☀️ *Вопрос 3 из 3: Утренний свет*\n\n"
+        "Выходишь ли ты на свет в первые "
+        "30–60 минут после подъёма?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, вошло в привычку", callback_data="srv_light_habit")],
+            [InlineKeyboardButton(text="🔄 Иногда получается", callback_data="srv_light_sometimes")],
+            [InlineKeyboardButton(text="❌ Пока не получается", callback_data="srv_light_no")],
+        ])
+    )
+
+
+@router.callback_query(F.data.startswith("srv_light_"))
+async def survey_light_handler(callback: CallbackQuery, state: FSMContext):
+    """Вопрос 3 — свет. Финальный отклик + сохранение в БД."""
+    await callback.answer()
+    answer = callback.data.replace("srv_light_", "")
+
+    data = await state.get_data()
+    sleep_ans = data.get("survey_sleep", "not_tracked")
+    wakeup_ans = data.get("survey_wakeup", "not_tracked")
+    await state.clear()
+
+    # Получаем имя и номер месяца
+    user = await get_user(callback.from_user.id)
+    name = user.get("name") or "друг"
+    month = data.get("survey_month", 1)
+
+    # Генерируем персональный отклик
+    response = _get_survey_response(sleep_ans, wakeup_ans, answer, name, month)
+
+    # Сохраняем в БД
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO monthly_surveys
+                    (telegram_id, month_num, sleep_answer, wakeup_answer, light_answer)
+                VALUES (?, ?, ?, ?, ?)
+            """, (callback.from_user.id, month, sleep_ans, wakeup_ans, answer))
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"survey save error: {e}")
+
+    await callback.message.edit_text(response, parse_mode="Markdown")
+
+    # Если уже был опрос раньше — покажем динамику
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT month_num, sleep_answer, wakeup_answer, light_answer
+                FROM monthly_surveys
+                WHERE telegram_id = ?
+                ORDER BY month_num ASC
+            """, (callback.from_user.id,))
+            history = await cursor.fetchall()
+
+        if len(history) >= 2:
+            prev = dict(history[-2])
+            prev_month = prev["month_num"]
+            prev_sleep = prev["sleep_answer"]
+
+            # Показываем динамику если сон улучшился
+            if prev_sleep in ("no", "not_tracked") and sleep_ans in ("yes", "little"):
+                await asyncio.sleep(1)
+                await bot.send_message(
+                    callback.from_user.id,
+                    f"📈 *Кстати, {name}.*\n\n"
+                    f"В месяц {prev_month} про сон ты отвечала «пока нет».\n"
+                    f"Сейчас — уже лучше.\n\n"
+                    f"_Вот это и есть путь — он виден только когда оглядываешься._",
+                    parse_mode="Markdown"
+                )
+    except Exception as e:
+        logger.warning(f"survey history error: {e}")
+
+
+async def send_birthday_greetings():
+    """
+    ПОПРАВКА #185: Поздравление с днём рождения.
+    Проверяется каждый день в 9:00 по местному времени.
+    Текст — тёплый, про мозг и возраст. Не «с днём рождения» общее —
+    а что-то настоящее про этот конкретный возраст.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT telegram_id, name, timezone,
+                       birth_day, birth_month, birth_year,
+                       age_group, exact_age
+                FROM users
+                WHERE onboarding_step = 'done'
+                  AND birth_day IS NOT NULL
+                  AND birth_month IS NOT NULL
+            """)
+            users = await cursor.fetchall()
+
+        for user in users:
+            try:
+                tid        = user["telegram_id"]
+                name       = user["name"] or "друг"
+                tz_str     = user["timezone"] or "Europe/Moscow"
+                birth_day  = user["birth_day"]
+                birth_month = user["birth_month"]
+                birth_year = user["birth_year"]
+
+                tz = pytz.timezone(tz_str)
+                user_now = datetime.now(tz)
+
+                # Проверяем: сегодня день рождения?
+                if user_now.day != birth_day or user_now.month != birth_month:
+                    continue
+
+                # Только в 9:00 ± 1 минута
+                if user_now.hour != 9 or user_now.minute > 1:
+                    continue
+
+                # Не поздравляли уже сегодня?
+                async with aiosqlite.connect(DB_PATH) as db:
+                    db.row_factory = aiosqlite.Row
+                    cursor = await db.execute("""
+                        SELECT id FROM daily_tips_log
+                        WHERE telegram_id = ?
+                          AND tip_id = 'birthday_greeting'
+                          AND date(sent_at) = date('now')
+                    """, (tid,))
+                    already = await cursor.fetchone()
+                if already:
+                    continue
+
+                # Вычисляем возраст если знаем год
+                age_text = ""
+                brain_fact = ""
+                if birth_year:
+                    age = user_now.year - birth_year
+                    age_text = f" Тебе {age}."
+
+                    # Факт про мозг под конкретный возраст
+                    if age < 30:
+                        brain_fact = (
+                            "Мозг в твоём возрасте на пике скорости обработки информации. "
+                            "Наслаждайся этим — и строй привычки пока нейропластичность максимальна."
+                        )
+                    elif age < 40:
+                        brain_fact = (
+                            "Тридцатые — время когда префронтальная кора полностью созрела. "
+                            "Решения стали глубже, интуиция точнее. Мозг сейчас в своей силе."
+                        )
+                    elif age < 50:
+                        brain_fact = (
+                            "Знаешь что интересно про мозг в сорок? "
+                            "Он начинает лучше распознавать паттерны и видеть связи "
+                            "которые раньше были невидимы. Скорость снижается — глубина растёт."
+                        )
+                    elif age < 60:
+                        brain_fact = (
+                            "Пятидесятые — это время когда оба полушария начинают работать "
+                            "синхроннее. Учёные называют это «билатеральной интеграцией». "
+                            "Это и есть мудрость — буквально нейробиологически."
+                        )
+                    elif age < 70:
+                        brain_fact = (
+                            "Мозг в шестидесятые всё ещё создаёт новые нейронные связи "
+                            "каждый день — если ты даёшь ему движение, новизну и сон. "
+                            "Нейрогенез не останавливается с возрастом."
+                        )
+                    else:
+                        brain_fact = (
+                            "Исследования показывают: люди старше 70 с активным образом жизни "
+                            "имеют плотность нейронных связей как у сорокалетних. "
+                            "Мозг не знает паспортного возраста — только биологический."
+                        )
+
+                msg = (
+                    f"🎂 *{name}, с днём рождения!*\n\n"
+                    f"{age_text}\n\n"
+                    f"{brain_fact}\n\n"
+                    f"💚 Аврора рада что ты с нами — "
+                    f"и продолжает следить чтобы мозг был на высоте ещё много лет."
+                ).strip()
+
+                await bot.send_message(tid, msg, parse_mode="Markdown")
+
+                # Логируем чтобы не отправить дважды
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("""
+                        INSERT INTO daily_tips_log (telegram_id, tip_id, tip_type, sent_at)
+                        VALUES (?, 'birthday_greeting', 'birthday', datetime('now'))
+                    """, (tid,))
+                    await db.commit()
+
+                await asyncio.sleep(0.3)
+
+            except Exception as e:
+                logger.warning(f"birthday_greeting user error: {e}")
+
+    except Exception as e:
+        logger.warning(f"send_birthday_greetings error: {e}")
+
+
+async def send_monthly_progress_survey():
+    """
+    ПОПРАВКА #184: Ежемесячный опрос прогресса.
+    Запускается каждое воскресенье — проверяет у кого
+    сегодня ближайшее к дате онбординга воскресенье.
+    Только для пользователей с 31+ днём.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT telegram_id, name, timezone, onboarding_completed_at
+                FROM users
+                WHERE onboarding_step = 'done'
+                  AND onboarding_completed_at IS NOT NULL
+            """)
+            users = await cursor.fetchall()
+
+        for user in users:
+            try:
+                tid = user["telegram_id"]
+                name = user["name"] or "друг"
+                tz_str = user["timezone"] or "Europe/Moscow"
+                onb_raw = user["onboarding_completed_at"]
+
+                tz = pytz.timezone(tz_str)
+                user_now = datetime.now(tz)
+
+                # Только по воскресеньям
+                if user_now.weekday() != 6:
+                    continue
+
+                onb_date = datetime.fromisoformat(str(onb_raw)).date()
+                days_since = (user_now.date() - onb_date).days
+
+                if days_since < 31:
+                    continue
+
+                month_num = days_since // 30
+
+                # Проверяем — не было ли уже опроса в этот месяц
+                async with aiosqlite.connect(DB_PATH) as db:
+                    db.row_factory = aiosqlite.Row
+                    cursor = await db.execute("""
+                        SELECT id FROM monthly_surveys
+                        WHERE telegram_id = ? AND month_num = ?
+                    """, (tid, month_num))
+                    already_done = await cursor.fetchone()
+
+                if already_done:
+                    continue
+
+                # Запускаем опрос — сохраняем номер месяца в state
+                # через FSM не можем из планировщика — отправляем напрямую
+                # и храним в pending_survey таблице
+
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("""
+                        INSERT OR REPLACE INTO monthly_surveys
+                            (telegram_id, month_num, survey_date)
+                        VALUES (?, ?, date('now'))
+                    """, (tid, month_num))
+                    await db.commit()
+
+                # Отправляем первый вопрос напрямую
+                await bot.send_message(
+                    tid,
+                    f"🌙 *{name}, ты уже {month_num} "
+                    f"{'месяц' if month_num == 1 else 'месяца' if month_num < 5 else 'месяцев'} с Авророй.*\n\n"
+                    f"Три быстрых вопроса — чтобы увидеть как ты меняешься.\n\n"
+                    f"*Вопрос 1 из 3: Сон*\n\n"
+                    f"Ты замечаешь что стала засыпать легче "
+                    f"или просыпаться более отдохнувшей?",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🌟 Да, точно заметила", callback_data=f"srv_sleep_yes|{month_num}")],
+                        [InlineKeyboardButton(text="🌱 Немного, но есть", callback_data=f"srv_sleep_little|{month_num}")],
+                        [InlineKeyboardButton(text="😐 Пока не очень", callback_data=f"srv_sleep_no|{month_num}")],
+                        [InlineKeyboardButton(text="🤷 Не отслеживала", callback_data=f"srv_sleep_not_tracked|{month_num}")],
+                    ])
+                )
+
+                await asyncio.sleep(0.5)
+
+            except Exception as e:
+                logger.warning(f"monthly_survey user error: {e}")
+
+    except Exception as e:
+        logger.warning(f"send_monthly_progress_survey error: {e}")
+
+
+async def send_seasonal_chronotype_check():
+    """
+    ПОПРАВКА #179: Сезонное напоминание о пересмотре хронотипа.
+    Срабатывает 1 ноября и 1 апреля в 10:00 по локальному времени.
+    Отправляется только пользователям с завершённым онбордингом.
+    """
+    now_utc = datetime.utcnow()
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT telegram_id, name, chronotype, timezone_offset
+                FROM users
+                WHERE onboarding_completed = 1
+                AND reminders_enabled = 1
+            """)
+            users = await cursor.fetchall()
+
+        for user in users:
+            try:
+                offset = user["timezone_offset"] or 3
+                user_now = now_utc + timedelta(hours=offset)
+
+                # Только 1 ноября или 1 апреля, в 10:00
+                is_november = user_now.month == 11 and user_now.day == 1
+                is_april    = user_now.month == 4  and user_now.day == 1
+                if not (is_november or is_april):
+                    continue
+                if user_now.strftime("%H:%M") != "10:00":
+                    continue
+
+                season_key  = "november" if is_november else "april"
+                tid         = user["telegram_id"]
+                name        = user["name"] or "друг"
+                chronotype  = user["chronotype"] or "pigeon"
+                chrono_name = CHRONO_NAMES_RU.get(chronotype, chronotype)
+
+                text = CHRONOTYPE_SEASONAL_MESSAGES[season_key].format(
+                    name=name,
+                    chrono_name=chrono_name,
+                )
+
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="✅ Да, всё актуально",
+                        callback_data="chrono_seasonal_ok"
+                    )],
+                    [InlineKeyboardButton(
+                        text="🔄 Хочу обновить",
+                        callback_data="chrono_seasonal_retest"
+                    )],
+                    [InlineKeyboardButton(
+                        text="⚙️ Открыть настройки хронотипа",
+                        callback_data="chrono_seasonal_settings"
+                    )],
+                ])
+
+                await bot.send_message(
+                    tid,
+                    text,
+                    parse_mode="Markdown",
+                    reply_markup=keyboard
+                )
+                await asyncio.sleep(0.5)
+
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.warning(f"send_seasonal_chronotype_check error: {e}")
+
+
+@router.callback_query(F.data == "chrono_seasonal_ok")
+async def chrono_seasonal_ok_handler(callback: CallbackQuery):
+    """Пользователь подтвердил что хронотип актуален."""
+    await callback.answer()
+    await callback.message.edit_text(
+        "✅ Отлично — хронотип без изменений.\n\n"
+        "_Напомню снова через полгода. Если что-то изменится раньше — "
+        "можно обновить вручную в настройках в любое время._",
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "chrono_seasonal_retest")
+async def chrono_seasonal_retest_handler(callback: CallbackQuery, state: FSMContext):
+    """Пользователь хочет пройти тест заново."""
+    await callback.answer()
+    await callback.message.edit_text(
+        "🔄 Запускаю тест хронотипа...\n\n"
+        "_После теста рекомендации по сну и свету обновятся автоматически._",
+        parse_mode="Markdown"
+    )
+    # Направляем в стандартный вход теста циркадки
+    await state.update_data(chronotype_retest_source="seasonal")
+    # Имитируем нажатие кнопки запуска теста циркадки
+    from aiogram.types import CallbackQuery as CQ
+    await bot.send_message(
+        callback.from_user.id,
+        "👇 Нажми чтобы начать:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="➡️ Начать тест хронотипа",
+                callback_data="circadian_test_menu"
+            )]
+        ])
+    )
+
+
+@router.callback_query(F.data == "chrono_seasonal_settings")
+async def chrono_seasonal_settings_handler(callback: CallbackQuery):
+    """Открывает настройки цикла/хронотипа напрямую."""
+    await callback.answer()
+    await callback.message.edit_text(
+        "⚙️ *Настройки хронотипа и цикла*\n\n"
+        "Здесь можно вручную изменить:\n"
+        "• хронотип (жаворонок / голубь / сова / поздняя сова)\n"
+        "• статус цикла (обычный / перименопауза / менопауза)\n\n"
+        "_Изменения применяются сразу — рекомендации обновятся автоматически._",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🕐 Изменить хронотип",
+                callback_data="circadian_test_menu"
+            )],
+            [InlineKeyboardButton(
+                text="🔄 Изменить статус цикла",
+                callback_data="cycle_settings"
+            )],
+            [InlineKeyboardButton(
+                text="◀️ Назад",
+                callback_data="back_to_menu"
+            )],
+        ])
+    )
+
+
+async def send_monthly_disease_check():
+    """
+    ПОПРАВКА #176: Планировщик — запускает детектив раз в месяц.
+    Отправляет сообщения пользователям у которых есть 3+ маркера.
+    Запускается 1-го числа каждого месяца в 10:00 локального времени.
+    """
+    now_utc = datetime.utcnow()
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT telegram_id, name, timezone_offset
+                FROM users
+                WHERE onboarding_completed = 1
+                AND reminders_enabled = 1
+            """)
+            users = await cursor.fetchall()
+
+        for user in users:
+            try:
+                offset = user["timezone_offset"] or 3
+                user_now = now_utc + timedelta(hours=offset)
+
+                # Только 1-го числа в 10:00
+                if user_now.day != 1:
+                    continue
+                if user_now.strftime("%H:%M") != "10:00":
+                    continue
+
+                tid = user["telegram_id"]
+                messages = await detect_disease_risk_by_markers(tid)
+
+                for msg in messages:
+                    try:
+                        await bot.send_message(
+                            tid,
+                            msg,
+                            parse_mode="Markdown"
+                        )
+                        await asyncio.sleep(1.5)
+                    except Exception:
+                        pass
+
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.warning(f"send_monthly_disease_check error: {e}")
+
+
+
 # ─── ЭТАП 10: ВОЗВРАТ + «НЕ ХОЧУ» ─────────────────────────
 
 
+async def send_progress_anchor(tid: int, days: int, name: str):
+    """
+    ПОПРАВКА #188 + #192: Прогресс-якорь.
+    Отправляется на 7 / 30 / 60 / 90 день.
+    Показывает реальные цифры из БД + биовозраст + замеры тела.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Чекины
+        cursor = await db.execute(
+            "SELECT COUNT(*) as cnt FROM daily_checkins WHERE telegram_id=?", (tid,)
+        )
+        r = await cursor.fetchone()
+        checkins_total = r["cnt"] if r else 0
+
+        # Задания выполнены
+        cursor = await db.execute(
+            "SELECT COUNT(*) as cnt FROM daily_tips_log WHERE telegram_id=? AND completed=1", (tid,)
+        )
+        r = await cursor.fetchone()
+        tasks_done = r["cnt"] if r else 0
+
+        # Стрик
+        cursor = await db.execute(
+            "SELECT practice_streak FROM users WHERE telegram_id=?", (tid,)
+        )
+        r = await cursor.fetchone()
+        streak = r["practice_streak"] if r else 0
+
+    milestones = {
+        7:  ("🌱", "Первая неделя", "Мозг уже адаптируется."),
+        30: ("🌿", "Первый месяц", "Нейропластические изменения начались."),
+        60: ("🌳", "Два месяца", "Новые связи стали устойчивыми."),
+        90: ("🏆", "Три месяца", "Эпигенетические изменения измеримы."),
+    }
+    emoji, title, science = milestones.get(days, ("💚", f"{days} дней", ""))
+
+    text = (
+        f"{emoji} *{name}, {title} с Авророй!*\n\n"
+        f"Вот что ты сделала за это время:\n\n"
+        f"• 📊 Чекинов: *{checkins_total}*\n"
+        f"• ✅ Заданий выполнено: *{tasks_done}*\n"
+        f"• 🔥 Текущий стрик: *{streak} дней*\n"
+    )
+
+    # ПОПРАВКА #192: Биовозраст — показываем если есть прогресс
+    try:
+        bio_progress = await get_bio_age_progress(tid)
+        if bio_progress and bio_progress.get('comparison'):
+            comp = bio_progress['comparison']
+            before = comp.get('before_bio_age')
+            after = comp.get('after_bio_age')
+            if before is not None and after is not None:
+                delta = round(before - after, 1)
+                if delta > 0:
+                    text += f"• 🧬 Биовозраст: *{before:.0f} → {after:.0f} лет* (моложе на {delta} ✨)\n"
+                elif delta < 0:
+                    text += f"• 🧬 Биовозраст: *{before:.0f} → {after:.0f} лет*\n"
+                else:
+                    text += f"• 🧬 Биовозраст: *{after:.0f} лет* (держим уровень 💪)\n"
+    except Exception as e:
+        logger.warning(f"send_progress_anchor bio_age error user={tid}: {e}")
+
+    # ПОПРАВКА #192: Замеры тела — показываем если есть хотя бы 2 записи
+    try:
+        measurements = await get_user_measurements(tid)
+        if measurements:
+            weight_start = measurements.get('weight_start')
+            weight_current = measurements.get('weight_current')
+            waist_start = measurements.get('waist_start')
+            waist_current = measurements.get('waist_current')
+
+            if weight_start and weight_current and weight_start != weight_current:
+                delta_w = round(weight_current - weight_start, 1)
+                w_emoji = "📉" if delta_w < 0 else "📈"
+                text += f"• {w_emoji} Вес: *{weight_start} → {weight_current} кг* ({delta_w:+.1f})\n"
+
+            if waist_start and waist_current and waist_start != waist_current:
+                delta_wst = round(waist_current - waist_start, 1)
+                wst_emoji = "📉" if delta_wst < 0 else "📈"
+                text += f"• {wst_emoji} Талия: *{waist_start} → {waist_current} см* ({delta_wst:+.1f})\n"
+    except Exception as e:
+        logger.warning(f"send_progress_anchor measurements error user={tid}: {e}")
+
+    text += f"\n_{science}_"
+
+    try:
+        await bot.send_message(tid, text, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"send_progress_anchor error user={tid}: {e}")
+
+
 async def check_inactive_users():
-    """ЭТАП 10: Проверяет неактивных пользователей и отправляет мягкие напоминания.
+    """ПОПРАВКА #188 + ЭТАП 10: Проверяет неактивных пользователей и отправляет напоминания.
+    Также проверяет прогресс-якоря на 7/30/60/90 день.
     1 день → молчим
     2 дня → одно сообщение
     3-5 дней → ещё одно
     7+ → последнее + молчим
     """
+
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -86959,6 +91841,34 @@ async def check_inactive_users():
                 continue
 
             days_inactive = (now - last_dt).days
+
+            # ПОПРАВКА #188: прогресс-якорь на 7/30/60/90 день
+            try:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    db.row_factory = aiosqlite.Row
+                    cursor = await db.execute(
+                        "SELECT onboarding_completed_at FROM users WHERE telegram_id=?", (tid,)
+                    )
+                    row = await cursor.fetchone()
+                    if row and row["onboarding_completed_at"]:
+                        onb_dt = datetime.fromisoformat(str(row["onboarding_completed_at"]))
+                        days_since_onb = (now - onb_dt).days
+                        if days_since_onb in (7, 30, 60, 90):
+                            # Проверяем что якорь ещё не отправляли
+                            cursor = await db.execute(
+                                "SELECT id FROM daily_tips_log WHERE telegram_id=? AND tip_id=?",
+                                (tid, f"anchor_{days_since_onb}")
+                            )
+                            already = await cursor.fetchone()
+                            if not already:
+                                await send_progress_anchor(tid, days_since_onb, name)
+                                await db.execute(
+                                    "INSERT INTO daily_tips_log (telegram_id, tip_id, tip_type) VALUES (?,?,?)",
+                                    (tid, f"anchor_{days_since_onb}", "anchor")
+                                )
+                                await db.commit()
+            except Exception as e:
+                logger.warning(f"progress_anchor check error user={tid}: {e}")
 
             if days_inactive == 2 and reminder_sent < 1:
                 # Мягкое первое сообщение
